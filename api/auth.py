@@ -668,11 +668,14 @@ def get_oidc_startup_warning() -> str | None:
 
 def is_auth_enabled() -> bool:
     """True if password auth, passkeys, OIDC login, or trusted-header auth is configured."""
+    from api.user_roles import has_accounts  # local patch: users.json accounts
+
     return (
         is_password_auth_enabled()
         or are_passkeys_enabled()
         or is_oidc_auth_enabled()
         or is_trusted_auth_enabled()
+        or has_accounts()
     )
 
 
@@ -988,6 +991,10 @@ def reset_trusted_auth_request_state(handler) -> None:
             delattr(handler, name)
         except AttributeError:
             pass
+    # Local patch (api/user_roles.py): per-account restriction is per request.
+    from api.user_roles import clear_request_restriction
+
+    clear_request_restriction()
 
 
 def _apply_trusted_session_profile(handler, bound_profile: str | None, cookie_value: str) -> None:
@@ -1007,6 +1014,17 @@ def ensure_trusted_auth_session(handler) -> dict | None:
     cookie_value = parse_cookie(handler)
     info = get_session_info(cookie_value) if cookie_value and verify_session(cookie_value) else None
     if info and info.get('auth_type') != 'trusted':
+        if info.get('auth_type') == 'local':
+            # Local patch (api/user_roles.py): username/password accounts with roles.
+            from api import user_roles
+
+            valid, restriction = user_roles.resolve_session_account(info)
+            if not valid:
+                invalidate_session(cookie_value)
+                handler._trusted_auth_session_rejected = True
+                return _remember_trusted_auth_session(handler, None)
+            user_roles.set_request_restriction(restriction)
+            _apply_trusted_session_profile(handler, info.get('bound_profile') or None, cookie_value)
         return _remember_trusted_auth_session(handler, info)
     if not is_trusted_auth_enabled():
         if info:
@@ -1248,6 +1266,17 @@ def check_auth(handler, parsed) -> bool:
                 body = b'Profile access forbidden'
                 handler.send_response(403)
                 handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+            handler.send_header('Content-Length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return False
+        from api.user_roles import request_denied
+
+        denied = request_denied(handler, parsed)
+        if denied:
+            body = json.dumps({'error': denied}).encode()
+            handler.send_response(403)
+            handler.send_header('Content-Type', 'application/json')
             handler.send_header('Content-Length', str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)

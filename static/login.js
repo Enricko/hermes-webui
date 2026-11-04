@@ -5,6 +5,8 @@
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
+  // Local patch: optional username field (users.json accounts with roles).
+  var userInput = document.getElementById('user');
   var passkeyBtn = document.getElementById('passkey-login');
 
   // #7056: the password input is absent on a passwordless deployment (OIDC-only,
@@ -84,7 +86,7 @@ document.addEventListener('DOMContentLoaded', function () {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify({ password: pw, username: userInput ? userInput.value.trim() : '' }),
         credentials: 'include',
       });
       var data = {};

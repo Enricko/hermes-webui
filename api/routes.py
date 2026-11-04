@@ -516,7 +516,9 @@ def _all_profiles_query_flag(parsed_url) -> bool:
 
 def _all_profiles_enabled(parsed_url) -> bool:
     """Enable aggregate profile reads only when the request asks and mode allows it."""
-    return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode()
+    from api.user_roles import is_restricted  # local patch: role "user" never aggregates
+
+    return _all_profiles_query_flag(parsed_url) and not _is_isolated_profile_mode() and not is_restricted()
 
 
 def _query_flag(parsed_url, name: str) -> bool:
@@ -1026,6 +1028,10 @@ def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
     if not isinstance(cli_meta, dict):
         return False
     if cli_meta.get("profile"):
+        return False
+    from api.user_roles import is_restricted  # local patch: host transcripts are admin-only
+
+    if is_restricted():
         return False
     sources = {
         str(cli_meta.get("source_tag") or "").strip().lower(),
@@ -14224,7 +14230,7 @@ button:hover{background:rgba(124,185,255,.25)}
   <div class="err" id="err"></div>
 </div>
 <!-- Keep login.js relative so subpath mounts load it under the current scope. -->
-<script src="static/login.js?v={{WEBUI_VERSION}}"></script>
+<script src="static/login.js?v={{WEBUI_VERSION}}-roles1"></script>
 </body></html>"""
 
 
@@ -17309,10 +17315,24 @@ def handle_get(handler, parsed) -> bool:
             '<button type="button" id="passkey-login" class="passkey-login" '
             'style="display:none">Sign in with passkey</button>'
         )
-        if is_password_auth_enabled():
+        # Local patch (api/user_roles.py): username field when accounts exist.
+        _username_html = ""
+        try:
+            from api.user_roles import has_accounts
+
+            if has_accounts():
+                _username_html = (
+                    '<input type="text" id="user" name="username" placeholder="Username" '
+                    'autocomplete="username" autocapitalize="none" spellcheck="false" autofocus>'
+                )
+        except Exception:
+            logger.debug("login page: users.json check failed", exc_info=True)
+        if is_password_auth_enabled() or _username_html:
             _password_form_html = (
-                f'<input type="password" id="pw" '
-                f'placeholder="{_html.escape(_login_strings["placeholder"])}" autofocus>'
+                f'{_username_html}'
+                f'<input type="password" id="pw" autocomplete="current-password" '
+                f'placeholder="{_html.escape(_login_strings["placeholder"])}"'
+                f'{"" if _username_html else " autofocus"}>'
                 f'<button type="submit">{_html.escape(_login_strings["btn"])}</button>'
                 f'{_passkey_button_html}'
             )
@@ -17427,10 +17447,14 @@ def handle_get(handler, parsed) -> bool:
         }
         if is_trusted_auth_enabled() or (session_info and session_info.get("auth_type") == "trusted"):
             payload["trusted_auth_enabled"] = True
-        if session_info and session_info.get("auth_type") == "trusted":
+        if session_info and session_info.get("auth_type") in ("trusted", "local"):
             payload["auth_type"] = session_info.get("auth_type")
             payload["user"] = session_info.get("username")
             payload["bound_profile"] = session_info.get("bound_profile")
+            if session_info.get("auth_type") == "local":
+                from api.user_roles import ROLE_ADMIN, ROLE_USER
+
+                payload["role"] = ROLE_USER if session_info.get("bound_profile") else ROLE_ADMIN
         return j(handler, payload)
 
     if parsed.path.startswith("/api/share/"):
@@ -17915,7 +17939,10 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("load_settings")
             settings = load_settings()
             show_cli_sessions = bool(settings.get("show_cli_sessions"))
-            show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
+            from api.user_roles import is_restricted as _roles_is_restricted
+
+            # Local patch: host Claude Code transcripts are admin-only.
+            show_claude_code_sessions = bool(settings.get("show_claude_code_sessions")) and not _roles_is_restricted()
             show_previous_messaging_sessions = bool(
                 settings.get("show_previous_messaging_sessions")
             )
@@ -18530,12 +18557,20 @@ def handle_get(handler, parsed) -> bool:
             diag.stage("active_profile_lookup") if diag else None
             active = profiles_api.get_active_profile_name()
             diag.stage("isolated_mode_check") if diag else None
+            from api.user_roles import current_restriction
+
+            _restriction = current_restriction()  # local patch: role "user" sees only its profile
+            if _restriction is not None:
+                profiles_payload = [
+                    p for p in profiles_payload
+                    if isinstance(p, dict) and _profiles_match(p.get("name"), _restriction.profile)
+                ]
             return j(
                 handler,
                 {
                     "profiles": profiles_payload,
                     "active": active,
-                    "single_profile_mode": _is_isolated_profile_mode(),
+                    "single_profile_mode": _is_isolated_profile_mode() or _restriction is not None,
                 },
             )
         finally:
@@ -22724,11 +22759,32 @@ def handle_post(handler, parsed) -> bool:
                 status=429,
             )
         password = body.get("password", "")
-        if not verify_password(password):
-            _record_login_attempt(client_ip)
-            return bad(handler, "Invalid password", 401)
-        _clear_login_attempts(client_ip)
-        cookie_val = create_session()
+        username = str(body.get("username", "") or "").strip()
+        profile_cookie_header = None
+        if username:
+            # Local patch (api/user_roles.py): username/password accounts with roles.
+            from api import user_roles
+            from api.helpers import build_profile_cookie
+
+            account = user_roles.authenticate(username, password)
+            if account is None:
+                _record_login_attempt(client_ip)
+                return bad(handler, "Invalid username or password", 401)
+            _clear_login_attempts(client_ip)
+            bound_profile = user_roles.bound_profile_for(account)
+            cookie_val = create_session(
+                auth_type=user_roles.AUTH_TYPE,
+                username=account["username"],
+                bound_profile=bound_profile,
+            )
+            if bound_profile:
+                profile_cookie_header = build_profile_cookie(bound_profile, session_cookie_value=cookie_val)
+        else:
+            if not verify_password(password):
+                _record_login_attempt(client_ip)
+                return bad(handler, "Invalid password", 401)
+            _clear_login_attempts(client_ip)
+            cookie_val = create_session()
         body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
@@ -22736,6 +22792,8 @@ def handle_post(handler, parsed) -> bool:
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         set_auth_cookie(handler, cookie_val)
+        if profile_cookie_header:
+            handler.send_header("Set-Cookie", profile_cookie_header)
         handler.end_headers()
         handler.wfile.write(body)
         return True
@@ -35856,7 +35914,9 @@ def _handle_session_import_cli(handler, body):
     if requested_profile == "":
         return bad(handler, "invalid profile", 400)
     allow_all_profiles = _request_wants_all_profiles_import(body)
-    if allow_all_profiles and _is_isolated_profile_mode():
+    from api.user_roles import is_restricted as _roles_is_restricted
+
+    if allow_all_profiles and (_is_isolated_profile_mode() or _roles_is_restricted()):
         return bad(handler, "all_profiles import is not allowed in isolated profile mode", 403)
     if allow_all_profiles and not requested_profile:
         return bad(handler, "profile is required for all_profiles import", 400)
