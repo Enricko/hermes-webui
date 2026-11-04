@@ -2137,3 +2137,73 @@ def git_info_for_workspace(workspace: Path) -> dict:
         'behind': behind,
         'is_git': True,
     }
+
+
+# ── Local patch: per-account workspace restriction (see api/user_roles.py) ──
+# Accounts with role "user" may only use workspaces under their configured
+# roots. Wrapping the public helpers here covers every caller (routes, session
+# creation, file APIs) because they all resolve these names at call time.
+_unrestricted_resolve_trusted_workspace = resolve_trusted_workspace
+_unrestricted_validate_workspace_to_add = validate_workspace_to_add
+_unrestricted_load_workspaces = load_workspaces
+_unrestricted_get_last_workspace = get_last_workspace
+_unrestricted_list_workspace_suggestions = list_workspace_suggestions
+
+_ROLE_WORKSPACE_DENIED = "Workspace is not available for this account"
+
+
+def _is_boot_default_workspace(path) -> bool:
+    try:
+        return _safe_resolve(_expanduser_path(path)) == _safe_resolve(_expanduser_path(_BOOT_DEFAULT_WORKSPACE))
+    except Exception:
+        return False
+
+
+def resolve_trusted_workspace(path: str | Path | None = None, profile: str | Path | None = None) -> Path:
+    from api.user_roles import current_restriction, workspace_allowed
+
+    restriction = current_restriction()
+    if restriction is not None and (path in (None, "") or _is_boot_default_workspace(path)):
+        # The server-wide default workspace belongs to the admin; a restricted
+        # account's "default" is its own first workspace root.
+        path = str(restriction.workspaces[0])
+    result = _unrestricted_resolve_trusted_workspace(path, profile)
+    if restriction is not None and not workspace_allowed(result):
+        raise ValueError(_ROLE_WORKSPACE_DENIED)
+    return result
+
+
+def validate_workspace_to_add(path: str, profile: str | Path | None = None) -> Path:
+    from api.user_roles import workspace_allowed
+
+    result = _unrestricted_validate_workspace_to_add(path, profile)
+    if not workspace_allowed(result):
+        raise ValueError(_ROLE_WORKSPACE_DENIED)
+    return result
+
+
+def load_workspaces(profile: str | Path | None = None) -> list:
+    from api.user_roles import filter_workspace_rows
+
+    return filter_workspace_rows(_unrestricted_load_workspaces(profile))
+
+
+def get_last_workspace(profile: str | Path | None = None) -> str:
+    from api.user_roles import current_restriction, workspace_allowed
+
+    last = _unrestricted_get_last_workspace(profile)
+    restriction = current_restriction()
+    if restriction is not None and not workspace_allowed(last):
+        return str(restriction.workspaces[0])
+    return last
+
+
+def list_workspace_suggestions(
+    prefix: str = "", limit: int = 12, profile: str | Path | None = None
+) -> list[str]:
+    from api.user_roles import current_restriction, workspace_allowed
+
+    suggestions = _unrestricted_list_workspace_suggestions(prefix, limit, profile)
+    if current_restriction() is None:
+        return suggestions
+    return [s for s in suggestions if workspace_allowed(s)]

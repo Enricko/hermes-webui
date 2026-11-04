@@ -9000,6 +9000,10 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     listing. Tests pass ``projects_dir`` fixtures so Michael's real ~/.claude is
     never read during test runs.
     """
+    from api.user_roles import is_restricted  # local patch: host transcripts are admin-only
+
+    if is_restricted():
+        return []
     sessions = []
     # ``get_last_workspace()`` is loop-invariant (the same active workspace for
     # every Claude Code row) but internally stats config.yaml + probes terminal
