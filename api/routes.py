@@ -1295,6 +1295,24 @@ def _normalize_disabled_set(values) -> set:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
+def _skill_listing_order_key(skill: dict) -> tuple:
+    return (skill.get("category") or "", skill["name"])
+
+
+def _resolve_agent_sort_skills(skills_tool_module):
+    """Return the Agent's skill-listing order helper under whichever name it exports.
+
+    Backport of upstream hermes-webui 9a70562a: Agent 93fafc4d6ff renamed
+    ``_sort_skills`` to ``sort_skills``; resolve by attribute and fall back to
+    the same (category, name) order when neither exists.
+    """
+    for attr in ("sort_skills", "_sort_skills"):
+        candidate = getattr(skills_tool_module, attr, None)
+        if callable(candidate):
+            return candidate
+    return lambda skills: sorted(skills, key=_skill_listing_order_key)
+
+
 def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict:
     """List skills using an explicit local skills directory.
 
@@ -1307,9 +1325,11 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
         MAX_DESCRIPTION_LENGTH,
         _EXCLUDED_SKILL_DIRS,
         _parse_frontmatter,
-        _sort_skills,
         skill_matches_platform,
     )
+    import importlib
+
+    sort_skills = _resolve_agent_sort_skills(importlib.import_module("tools.skills_tool"))
 
     if not skills_dir.exists():
         skills_dir.mkdir(parents=True, exist_ok=True)
@@ -1367,7 +1387,7 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
 
     if category:
         all_skills = [s for s in all_skills if s.get("category") == category]
-    all_skills = _sort_skills(all_skills)
+    all_skills = sort_skills(all_skills)
     categories = sorted(set(s.get("category") for s in all_skills if s.get("category")))
     result = {
         "success": True,
