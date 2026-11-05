@@ -1,0 +1,36 @@
+{
+  "bad_script_paths": [
+    "../bootstrap.py",
+    "../../scripts/test.sh"
+  ],
+  "unsafe_pytest_options": [
+    "-c",
+    "-p",
+    "-o",
+    "--pyargs",
+    "--noconftest",
+    "--confcutdir=tests",
+    "--confcutdir=tests/multiuser/fixtures",
+    "--rootdir=.",
+    "--rootdir=tests",
+    "--override-ini=addopts=",
+    "--collect-only"
+  ],
+  "untrusted_parent_variables": [
+    "PYTEST_ADDOPTS",
+    "PYTHONPATH",
+    "BASH_ENV",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NETRC",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "KUBECONFIG"
+  ],
+  "forbidden_destinations": [
+    "https://api.openai.com/v1",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://192.0.2.1/",
+    "http://localhost:1/"
+  ]
+}
