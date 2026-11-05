@@ -360,38 +360,6 @@ def test_child_failure_still_removes_disposable_state(
     assert not root.exists(), "failing child left the disposable root behind"
 
 
-def test_teardown_refuses_to_follow_child_replaced_state_root(
-    run_launcher, hostile_parent_env: dict[str, str], tmp_path: Path
-) -> None:
-    external = tmp_path / "external-sentinel"
-    external.mkdir()
-    sentinel = external / "keep.txt"
-    sentinel.write_text("f02 external fixture must survive", encoding="utf-8")
-    result = run_launcher(
-        "--no-agent",
-        "--tier",
-        "unit",
-        "--script",
-        "tests/multiuser/fixtures/replace_state_root.py",
-        "--",
-        str(external),
-        env=hostile_parent_env,
-    )
-    if _environment_prerequisite_not_run(result):
-        return
-    status = _status(result)
-    assert status["status"] == "FAIL"
-    assert "teardown_failed" in {reason["code"] for reason in status["reasons"]}
-    assert status["state"]["root_removed"] is False
-    details = json.loads(result.stdout.splitlines()[0])
-    assert Path(details["root"]).is_symlink()
-    assert sentinel.read_text(encoding="utf-8") == "f02 external fixture must survive"
-    moved_root = Path(details["moved_root"])
-    if moved_root.exists():
-        shutil.rmtree(moved_root)
-    Path(details["root"]).unlink(missing_ok=True)
-
-
 def test_skipped_mandatory_pytest_case_is_not_reported_as_pass(run_launcher) -> None:
     result = run_launcher(
         "--no-agent", "--", "-q", "tests/multiuser/fixtures/test_f02_skip_probe.py"
@@ -988,9 +956,12 @@ def test_loopback_fixture_and_guard_allow_only_the_owned_endpoint() -> None:
 
 def test_loopback_guard_refuses_unowned_service_without_connecting() -> None:
     helper = _helper_module()
-    with helper.NetworkGuard():
-        with pytest.raises(helper.DestinationRefused):
-            socket.create_connection(("127.0.0.1", 1), timeout=0.1)
+    with helper.LoopbackUpstream() as unadmitted:
+        with helper.NetworkGuard() as guard:
+            with pytest.raises(helper.DestinationRefused):
+                socket.create_connection(unadmitted.endpoint, timeout=0.1)
+            assert guard.refused[-1] == unadmitted.endpoint
+            assert unadmitted.requests == []
 
 
 def test_no_proxy_routes_owned_loopback_around_unowned_synthetic_proxy(
@@ -1106,76 +1077,102 @@ def test_refused_report_cannot_overwrite_foreign_file_or_follow_replaced_parent(
         original_parent.rename(selected)
 
 
-@pytest.mark.parametrize("replacement_has_contents", [True, False])
+@pytest.mark.parametrize(
+    "replacement_kind", ["nonempty-directory", "empty-directory", "symlink"]
+)
 def test_state_root_remove_does_not_delete_a_replacement_at_rmtree_boundary(
-    tmp_path: Path, monkeypatch, replacement_has_contents: bool
+    tmp_path: Path, replacement_kind: str
 ) -> None:
     launcher = _launcher_module()
     state = launcher.StateRoot(str(tmp_path))
     root_path = Path(state.path)
     owned_marker = root_path / "owned.txt"
     owned_marker.write_text("allocated-root", encoding="utf-8")
+    original_stat = root_path.stat()
+    original_identity = original_stat.st_dev, original_stat.st_ino
     moved_original = tmp_path / "original-root-moved-aside"
     replacement = tmp_path / "replacement-directory"
-    replacement.mkdir()
+    external = tmp_path / "external-sentinel"
+    external.mkdir()
+    external_sentinel = external / "keep.txt"
+    external_sentinel.write_text("must-survive", encoding="utf-8")
+    if replacement_kind != "symlink":
+        replacement.mkdir()
     replacement_marker = replacement / "foreign-synthetic-sentinel.txt"
-    if replacement_has_contents:
+    if replacement_kind == "nonempty-directory":
         replacement_marker.write_text("must-survive", encoding="utf-8")
-
-    real_rmtree = launcher.shutil.rmtree
-    calls = []
+    replacement_identity = (
+        (replacement.stat().st_dev, replacement.stat().st_ino)
+        if replacement_kind != "symlink"
+        else (external.stat().st_dev, external.stat().st_ino)
+    )
 
     def swap_at_delete_boundary(*_args, **_kwargs):
-        calls.append(True)
         root_path.rename(moved_original)
-        replacement.rename(root_path)
+        if replacement_kind == "symlink":
+            root_path.symlink_to(external, target_is_directory=True)
+        else:
+            replacement.rename(root_path)
 
     try:
-        if hasattr(state, "_before_unlink"):
-            # The fixed implementation exposes this private deterministic
-            # barrier after anchored clearing and before the final identity check.
-            state._before_unlink = swap_at_delete_boundary
-        else:
-            # This path reproduces the original vulnerable check/use window.
-            def vulnerable_rmtree(path, *args, **kwargs):
-                assert Path(path) == root_path
-                swap_at_delete_boundary()
-                return real_rmtree(path, *args, **kwargs)
-
-            monkeypatch.setattr(launcher.shutil, "rmtree", vulnerable_rmtree)
+        assert hasattr(state, "_before_unlink"), (
+            "StateRoot lacks the deterministic anchored-cleanup barrier"
+        )
+        state._before_unlink = swap_at_delete_boundary
         try:
             removed = state.remove()
         except launcher.Outcome as exc:
             assert exc.status == "FAIL"
             assert exc.code == "teardown_failed"
             removed = False
-        assert calls or hasattr(state, "_before_unlink"), (
-            "StateRoot.remove skipped the deterministic teardown barrier"
-        )
         assert removed is False, "replacement race was reported as successful cleanup"
-        if replacement_has_contents:
+        if replacement_kind == "nonempty-directory":
             assert (root_path / replacement_marker.name).read_text(
                 encoding="utf-8"
             ) == "must-survive"
-        else:
+        elif replacement_kind == "empty-directory":
             assert root_path.is_dir(), "empty replacement directory was removed"
+            assert (root_path.stat().st_dev, root_path.stat().st_ino) == replacement_identity
+        else:
+            assert root_path.is_symlink(), "symlink replacement was removed or followed"
+            assert external_sentinel.read_text(encoding="utf-8") == "must-survive"
+            assert (external.stat().st_dev, external.stat().st_ino) == replacement_identity
         assert moved_original.is_dir(), (
             "original allocation disappeared without safe cleanup"
         )
+        assert (
+            moved_original.stat().st_dev,
+            moved_original.stat().st_ino,
+        ) == original_identity
         assert list(moved_original.iterdir()) == [], (
             "original contents were not cleared through the allocation-time handle"
         )
     finally:
         if hasattr(state, "_close"):
             state._close()
-        if root_path.is_symlink():
+        if root_path.is_symlink() and root_path.resolve() == external.resolve():
             root_path.unlink()
-        if root_path.exists():
+        real_rmtree = launcher.shutil.rmtree
+        if root_path.exists() and (
+            root_path.stat().st_dev,
+            root_path.stat().st_ino,
+        ) == original_identity:
             real_rmtree(root_path)
-        if moved_original.exists():
+        if moved_original.exists() and (
+            moved_original.stat().st_dev,
+            moved_original.stat().st_ino,
+        ) == original_identity:
             real_rmtree(moved_original)
-        if replacement.exists():
+        if replacement.exists() and (
+            replacement.stat().st_dev,
+            replacement.stat().st_ino,
+        ) == replacement_identity:
             real_rmtree(replacement)
+        if external.exists() and (
+            external.stat().st_dev,
+            external.stat().st_ino,
+        ) == replacement_identity:
+            real_rmtree(external)
 
 
 def test_loopback_close_reports_or_waits_for_blocked_request_handler() -> None:
