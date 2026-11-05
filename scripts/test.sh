@@ -10,10 +10,12 @@ EXIT_NOT_PREPARED=78
 # Optional first argument; without one, behavior is unchanged.
 #   --prepare-only  create/repair .venv and install missing test dependencies,
 #                   then exit before any post-install Python or pytest starts.
-#   --execute-only  never create, rebuild or install: exit 78 when .venv or a
-#                   test dependency is missing, otherwise run pytest as usual.
-# scripts/test_multiuser.py uses both so it can audit .venv statically between
-# provisioning and execution.
+#   --execute-only  use only the repo .venv interpreter and never create,
+#                   rebuild or install: exit 78 when .venv or a test dependency
+#                   is missing, otherwise run pytest as usual.
+# The multi-user unit image runs --prepare-only once at image build
+# (scripts/multiuser_unit.Dockerfile); proof runs inside the unit use only
+# --execute-only.
 MODE=default
 case "${1:-}" in
   --prepare-only|--execute-only)
@@ -169,8 +171,14 @@ select_python() {
   local requested_path base_py
   local desired_major_minor current_major_minor
 
-  if [[ "$MODE" == execute-only && ! -x "${VENV_PY:-}" ]]; then
-    echo "$VENV_DIR does not exist; refusing to create it under --execute-only." >&2
+  if [[ "$MODE" == execute-only ]]; then
+    # Only the repo .venv interpreter: no HERMES_WEBUI_TEST_PYTHON, PATH search
+    # or alias probing, and never a create/rebuild.
+    if [[ -x "${VENV_PY:-}" ]] && is_supported_python "$VENV_PY" && has_pip "$VENV_PY"; then
+      printf '%s\n' "$VENV_PY"
+      return 0
+    fi
+    echo "$VENV_DIR has no supported Python with pip; refusing to create or rebuild it under --execute-only." >&2
     echo "Run ./scripts/test.sh --prepare-only first." >&2
     return "$EXIT_NOT_PREPARED"
   fi
