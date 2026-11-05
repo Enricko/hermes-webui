@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Hermetic multi-user verification launcher (F02).
 
+The launcher runs only inside a disposable unit admitted by the host
+controller ``scripts/multiuser_unit.sh``; its first step, before parsing
+options, loading the helper, allocating state or touching the checkout,
+requires the controller's unit environment and otherwise reports NOT_RUN
+``unit_admission_required``. There is no host fallback. What the worker sees
+of the unit is advisory context only: the controller's own inspection of the
+container, not anything checked here, is the containment evidence.
+
 Strong entry form (initial interpreter startup hooks disabled):
 
     python3 -I -S scripts/test_multiuser.py --self-test
@@ -64,6 +72,14 @@ import xml.etree.ElementTree as ET
 SCHEMA = "hermes-webui/multiuser-launcher/1"
 RESULT_PREFIX = "MULTIUSER_RESULT "
 EXIT_CODES = {"PASS": 0, "FAIL": 1, "REFUSED": 2, "NOT_RUN": 3}
+# Set by scripts/multiuser_unit.sh on the admitted container: a controller
+# correlation id and nonce, the read-only source path and the private state dir.
+UNIT_ID_VAR = "HERMES_MU_UNIT_ID"
+UNIT_NONCE_VAR = "HERMES_MU_UNIT_NONCE"
+UNIT_SRC_VAR = "HERMES_MU_UNIT_SRC"
+UNIT_STATE_VAR = "HERMES_MU_UNIT_STATE"
+_UNIT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_UNIT_NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 TIERS = ("unit", "native", "browser", "containment", "remote")
 HOST_OS_PLATFORMS = {"linux": "linux", "macos": "darwin", "windows": "win32"}
 BACKENDS = ("docker", "docker-desktop")
@@ -202,6 +218,7 @@ class Result:
         self.child_exit_code = None
         self.tests = None
         self.state = {"allocated": False, "root_removed": None}
+        self.unit = None
         self.entry = {
             "isolated": bool(sys.flags.isolated),
             "no_site": bool(sys.flags.no_site),
@@ -242,12 +259,68 @@ class Result:
             "child_exit_code": self.child_exit_code,
             "tests": self.tests,
             "state": self.state,
+            "unit": self.unit,
             "containment": {
                 "python_network_guard": "helper-only",
-                "os_network_sandbox": "not_provided",
+                "os_network_sandbox": "controller-evidence-required",
             },
             "claims": dict(CLAIMS),
         }
+
+
+def unit_admission(environ, launcher_path, result):
+    """Require the controller's unit environment before anything else runs.
+
+    Returns the checkout root. The id and nonce only correlate this result
+    with the controller's record, and the read-only source and private state
+    checks are sanity checks: none of it is containment evidence, which only
+    the controller's inspection of the container provides.
+    """
+    unit_id = environ.get(UNIT_ID_VAR, "")
+    nonce = environ.get(UNIT_NONCE_VAR, "")
+    if not (_UNIT_ID_RE.match(unit_id) and _UNIT_NONCE_RE.match(nonce)):
+        raise not_run(
+            "unit_admission_required",
+            "F02 runs only inside a unit admitted by scripts/multiuser_unit.sh; there is no host fallback",
+        )
+    result.unit = {"id": unit_id, "nonce": nonce, "evidence": "advisory-worker-context", "context": None}
+    if os.name != "posix":
+        raise not_run("platform_route_unverified", "admitted units are POSIX containers")
+    repo_root = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(launcher_path)), os.pardir))
+    src = environ.get(UNIT_SRC_VAR, "")
+    if not os.path.isabs(src) or os.path.realpath(src) != src or src != repo_root:
+        raise not_run("unit_source_not_immutable", f"{UNIT_SRC_VAR} is not this launcher's checkout")
+    try:
+        readonly = bool(os.statvfs(src).f_flag & os.ST_RDONLY)
+    except OSError:
+        readonly = False
+    if not readonly:
+        raise not_run("unit_source_not_immutable", "the unit source is not mounted read-only")
+    state = environ.get(UNIT_STATE_VAR, "")
+    try:
+        st = os.lstat(state) if os.path.isabs(state) else None
+    except OSError:
+        st = None
+    if (
+        st is None
+        or stat.S_ISLNK(st.st_mode)
+        or not stat.S_ISDIR(st.st_mode)
+        or st.st_uid != os.getuid()
+        or st.st_mode & 0o077
+    ):
+        raise not_run("unit_state_unavailable", f"{UNIT_STATE_VAR} is not a private directory owned by this user")
+    try:
+        interfaces = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        interfaces = None
+    result.unit["context"] = {
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "src_readonly": True,
+        "net_interfaces": interfaces,
+        "dockerenv": os.path.exists("/.dockerenv"),
+    }
+    return repo_root
 
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -1483,7 +1556,6 @@ def build_parser():
     parser.add_argument("--host-os", choices=tuple(HOST_OS_PLATFORMS))
     parser.add_argument("--backend", choices=BACKENDS)
     parser.add_argument("--deployment-manifest", metavar="PATH")
-    parser.add_argument("--report", metavar="PATH")
     parser.add_argument("--child-timeout", type=int, default=DEFAULT_CHILD_TIMEOUT, metavar="SECONDS")
     return parser
 
@@ -2929,18 +3001,9 @@ def run_self_test(result, repo_root, helper):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
-def _emit(result, report):
+def _emit(result):
     payload = result.to_dict()
     text = json.dumps(payload, sort_keys=True)
-    if report is not None:
-        try:
-            report.write(text + "\n")
-        except OSError as exc:
-            result.settle("FAIL", "report_write_failed", f"report not written: {exc.__class__.__name__}")
-            payload = result.to_dict()
-            text = json.dumps(payload, sort_keys=True)
-        finally:
-            report.close()
     for reason in payload["reasons"]:
         sys.stderr.write(f"test_multiuser: {payload['status']} {reason['code']}: {reason['detail']}\n")
     sys.stdout.write(RESULT_PREFIX + text + "\n")
@@ -2951,25 +3014,20 @@ def _emit(result, report):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     result = Result()
-    report = None
     previous = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.signal(signum, _signal_handler)
     _SignalState.phase = "run"
     _SignalState.received = None
     try:
+        repo_root = unit_admission(os.environ, __file__, result)
         if "--" in argv:
             split = argv.index("--")
             launcher_argv, passthrough = argv[:split], argv[split + 1:]
         else:
             launcher_argv, passthrough = argv, []
         args = build_parser().parse_args(launcher_argv)
-        if os.name not in ("posix", "nt"):
-            raise refused("unsupported_platform", f"platform {os.name!r} has unknown path semantics")
-        repo_root = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir))
         helper, helper_source = load_helper(repo_root)
-        if args.report:
-            report = ReportTarget(args.report, helper.operator_home())
         if not 0 < args.child_timeout <= 86400:
             raise refused("usage", "--child-timeout must be between 1 and 86400 seconds")
         selection = resolve_selection(args, passthrough)
@@ -2991,7 +3049,7 @@ def main(argv=None):
             signal.signal(signum, handler)
     if _SignalState.received is not None and result.status == "PASS":
         result.settle("FAIL", "interrupted", f"signal {_SignalState.received} received")
-    return _emit(result, report)
+    return _emit(result)
 
 
 if __name__ == "__main__":
