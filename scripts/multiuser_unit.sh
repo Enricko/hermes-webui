@@ -610,8 +610,12 @@ validate_worker_result() {
                and ($r.tests.total | nonneg) and ($r.tests.passed | nonneg) and ($r.tests.failed | nonneg)
                and ($r.tests.errors | nonneg) and ($r.tests.skipped | nonneg)
                and $r.tests.total == ($r.tests.passed + $r.tests.failed + $r.tests.errors + $r.tests.skipped)))
+      and (($r.mode == null and $r.status != "PASS") or (["pytest", "script", "self-test"] | index($r.mode)) != null)
       and ($r.status != "PASS" or $r.tests == null
            or ($r.tests.total > 0 and $r.tests.skipped == 0 and $r.tests.failed == 0 and $r.tests.errors == 0))
+      and ($r.status != "PASS" or $r.mode != "pytest"
+           or (($r.tests | type) == "object" and $r.tests.total > 0))
+      and ($r.status != "PASS" or $r.mode == "pytest" or $r.tests == null)
   ' >/dev/null 2>&1
 }
 
