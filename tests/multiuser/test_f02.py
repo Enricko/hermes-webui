@@ -960,7 +960,12 @@ def test_loopback_guard_refuses_unowned_service_without_connecting() -> None:
         with helper.NetworkGuard() as guard:
             with pytest.raises(helper.DestinationRefused):
                 socket.create_connection(unadmitted.endpoint, timeout=0.1)
-            assert guard.refused[-1] == unadmitted.endpoint
+            assert guard.refused == [
+                (
+                    "connect",
+                    f"unowned loopback endpoint {unadmitted.host}:{unadmitted.port}",
+                )
+            ]
             assert unadmitted.requests == []
 
 
