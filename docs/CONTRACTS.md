@@ -13,8 +13,9 @@ contributor guidance; it does not change runtime behavior or CI gates.
 
 - [`docs/architecture/multi-user-implementation.md`](architecture/multi-user-implementation.md):
   fork-only account lifecycle, explicit grants and private ownership policy.
-  This is an incomplete foundation; member execution stays denied until isolated
-  workers and provider brokerage meet the approved multi-user design gates.
+  Tool-free chat is implemented separately in [`docs/multi-user-chat.md`](multi-user-chat.md).
+  Legacy Agent execution stays denied for members until isolated workers and
+  subscription/OAuth brokerage meet the approved full multi-user design gates.
 
 - [`AGENTS.md`](../AGENTS.md): repository entry point for AI assistants,
   public-safety rules, and the short redline checklist.

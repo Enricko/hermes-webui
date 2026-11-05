@@ -17,7 +17,7 @@ def configured_store() -> PolicyStore | None:
 
 def handle_access_admin(handler, parsed, body=None):
     """Caller uses normal auth and, on POST, the shared CSRF/body gates."""
-    if parsed.path not in {"/api/admin/access", "/api/access/me"}:
+    if parsed.path not in {"/api/admin/access", "/api/admin/users", "/api/access/me"}:
         return False
     from api.auth import ensure_trusted_auth_session
     from api.helpers import bad, j
@@ -36,6 +36,22 @@ def handle_access_admin(handler, parsed, body=None):
     try:
         if member_catalog:
             return j(handler, store.account_snapshot(actor["id"]))
+        if parsed.path == "/api/admin/users":
+            from api.account_admin import edit_account, public_accounts
+
+            # Policy administration and login administration both require an
+            # active administrator in their respective authoritative stores.
+            snapshot = store.snapshot(actor["id"])
+            if handler.command == "GET":
+                return j(handler, {"users": public_accounts(actor["id"]), "policy": snapshot})
+            if handler.command != "POST":
+                return bad(handler, "Method not allowed", 405)
+            if not isinstance(body, dict) or body.get("action") not in {"create", "update"}:
+                return bad(handler, "Account action must be create or update", 400)
+            result = edit_account(actor["id"], username=body.get("username"), role=body.get("role", "user"),
+                                  enabled=body.get("enabled", True), password=body.get("password") or None,
+                                  create=body["action"] == "create", policy=store)
+            return j(handler, {"ok": True, "user": result})
         if handler.command == "GET":
             return j(handler, store.snapshot(actor["id"]))
         if handler.command != "POST":
@@ -51,8 +67,20 @@ def handle_access_admin(handler, parsed, body=None):
                 return bad(handler, "Create the login account with webui_users.py first", 400)
             store.put_account(actor["id"], account["id"], role=account["role"], enabled=body.get("enabled", True))
         elif action == "resource":
+            credential = body.get("credential")
+            if credential:
+                from api.provider_broker import CredentialVault
+                if body.get("kind") != "connection":
+                    raise ValueError("Only connections have credentials")
+                CredentialVault.validate_credential(credential)
+            if body.get("kind") == "connection" and (credential or os.getenv("HERMES_WEBUI_MEMBER_CHAT") == "1"):
+                from api.provider_broker import validate_connection
+                validate_connection(body.get("binding") or {})
             store.put_resource(actor["id"], body.get("id"), kind=body.get("kind"),
                                label=body.get("label"), binding=body.get("binding"))
+            if credential:
+                from api.member_routes import member_root
+                CredentialVault(member_root(store) / "credentials.json").put(body["id"], credential, body["binding"])
         elif action == "grants":
             store.replace_grants(actor["id"], body.get("account_id"), body.get("grants"))
         else:

@@ -10033,6 +10033,18 @@ function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
+    try {
+      const accountStatus=await api('/api/auth/status');
+      const panel=$('panelSettings');
+      let entry=$('accountAccessAdminEntry');
+      if(panel && accountStatus.role==='admin' && accountStatus.auth_type==='local') {
+        if(!entry) {
+          entry=document.createElement('a');entry.id='accountAccessAdminEntry';
+          entry.textContent='Users & access';entry.href=new URL('admin/users',document.baseURI||location.href).href;
+          panel.prepend(entry);
+        }
+      } else if(entry) entry.remove();
+    } catch(_accountError) { const entry=$('accountAccessAdminEntry'); if(entry) entry.remove(); }
     checkWebUIVersionSkew(settings);
     // Populate the version badges from the server — keeps them in sync with git
     // tags automatically without any manual release step.

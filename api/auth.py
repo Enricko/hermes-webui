@@ -1291,6 +1291,16 @@ def check_auth(handler, parsed) -> bool:
             return False
         from api.user_roles import request_denied
 
+        from api.user_roles import is_restricted
+        if is_restricted() and not parsed.path.startswith('/api/') and parsed.path != '/member':
+            handler.send_response(302)
+            # Relative location retains a reverse proxy's stripped mount prefix.
+            handler.send_header('Location', '../' * max(0, parsed.path.count('/') - 1) + 'member')
+            handler.send_header('Cache-Control', 'no-store')
+            handler.send_header('Content-Length', '0')
+            handler.end_headers()
+            return False
+
         denied = request_denied(handler, parsed)
         if denied:
             body = json.dumps({'error': denied}).encode()

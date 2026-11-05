@@ -1,0 +1,16 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="__ACCESS_CSRF__"><title>Private workspace · Hermes</title>
+<link rel="stylesheet" href="./static/access-admin.css"><link rel="stylesheet" href="./static/member.css"><script src="./static/member.js" defer></script></head>
+<body><header><h1>Hermes · Private workspace</h1><span id="identity"></span><a id="admin-link" href="./admin/users" hidden>Users & access</a><button id="logout">Sign out</button></header>
+<main><p id="notice" role="status" aria-live="polite">Loading your workspace…</p><div class="member-grid">
+<aside><button id="new">New conversation</button><nav id="conversations" aria-label="Your conversations"></nav></aside>
+<section class="conversation"><h2 id="conversation-title">New conversation</h2><div id="messages" aria-live="polite"></div>
+<form id="composer"><label>Message<textarea id="message" rows="4" required maxlength="64000" placeholder="Write a message…"></textarea></label>
+<div class="selections"><label>Profile<select id="profile" required></select></label><label>Workspace<select id="workspace" required></select></label>
+<label>Provider<select id="connection" required></select></label><label>Model<select id="model" required></select></label></div>
+<fieldset><legend>Assigned skills</legend><div id="skills"></div></fieldset><button id="send">Send</button><p class="mode">Chat mode uses the selected instructions. Terminal, code execution and MCP tools are unavailable.</p></form></section>
+<section class="files"><h2>Private files</h2><p id="folder">/</p><button id="up" type="button">Parent folder</button><div id="files"></div>
+<form id="folder-form"><label>New folder name<input id="folder-name" required maxlength="128"></label><button>Create folder</button></form>
+<label>Upload a file (up to 2 MiB)<input id="upload" type="file"></label><button id="refresh-files" type="button">Refresh files</button>
+<div id="file-preview" hidden><h3 id="file-name"></h3><label>Text preview<textarea id="file-content" rows="10"></textarea></label><button id="download" type="button">Download file</button></div></section>
+</div></main></body></html>

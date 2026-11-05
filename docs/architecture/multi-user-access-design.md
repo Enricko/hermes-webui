@@ -1,6 +1,6 @@
 # Portable multi-user Hermes WebUI design
 
-Status: implementation in progress on `feature/user-roles`. Account lifecycle and transactional policy foundation are implemented. Isolated execution, provider brokerage and full product integration remain release gates. No production deployment has been performed. See [implementation status](multi-user-implementation.md).
+Status: full Agent implementation in progress on `feature/user-roles`. Account lifecycle, transactional policy and an opt-in [tool-free username/password chat service](../multi-user-chat.md) are implemented. That limited mode is not a substitute for the full Agent design below: isolated execution, subscription/OAuth brokerage and full product integration remain release gates. No production deployment has been performed. See [implementation status](multi-user-implementation.md).
 
 ## Goal
 

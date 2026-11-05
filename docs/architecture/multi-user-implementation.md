@@ -1,7 +1,9 @@
 # Multi-user implementation status
 
-This is a development branch, not a deployable multi-tenant release. The
-[approved design](multi-user-access-design.md) remains the release target.
+This branch now includes an opt-in [tool-free multi-user chat service](../multi-user-chat.md)
+with username/password accounts, administrator grants, private conversations and
+files. The [approved full Agent design](multi-user-access-design.md) remains a
+separate, unfinished release target; no isolated Agent execution is claimed.
 
 ## Implemented foundation
 
@@ -46,11 +48,13 @@ The old role patch executed agent tools in the shared service's privileged
 process. Endpoint/path filters cannot prevent terminal, Python or MCP tools from
 opening another user's files or host credentials.
 
-This branch therefore denies member API operations except login status, logout
-and the member's policy catalog until the isolated runtime bridge is implemented.
-There is no environment flag bypass. `runtime_ready` is explicitly false.
-Administrator routes continue through the existing upstream implementation.
-Do not deploy this branch expecting member chat to work.
+Legacy member API execution remains denied. The opt-in `/api/member/` namespace
+implements tool-free chat and private file operations without importing AIAgent
+or forwarding to legacy execution routes. `runtime_ready` stays false because
+Agent execution is unavailable; the member catalog separately reports
+`chat_available` and `tools_available`. The dedicated `serve_members.py` server
+denies legacy execution for administrators as well. See the linked operational
+guide for implemented workflows, provider limits and regression evidence.
 
 ## Disposable policy administration
 
@@ -91,14 +95,15 @@ error-recovery shortcut.
    subscription refresh, auxiliary calls and Agent compatibility proof.
 3. Wire policy and ownership into every session/project/upload/run/event/control/
    recovery/cron path while preserving the existing runtime contracts.
-4. Admin/member UI, assigned profile/skill/model choices, owner-scoped browser
-   state, logout cleanup and offline cache behavior.
+4. Full Agent admin/member UI integration beyond the implemented tool-free
+   surfaces, including Agent event/control and runtime browser state.
 5. Migration/rollback, adversarial containment, live provider evidence,
    responsive browser journeys and platform verification.
 
-Current tests prove account and policy behavior against synthetic state. They
-do not certify runtime containment, OAuth fidelity, full ownership integration
-or end-to-end multi-user functionality.
+Current tests prove account/policy behavior and tool-free member/admin browser
+journeys against synthetic state and a local synthetic provider. They do not
+certify Agent runtime containment, native subscription/OAuth fidelity, full Agent
+object ownership integration or live external-provider behavior.
 
 ## Migration and rollback
 

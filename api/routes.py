@@ -17179,7 +17179,13 @@ def _handle_session_get(handler, parsed) -> bool:
 
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
-    if parsed.path in {"/api/admin/access", "/api/access/me"}:
+    if parsed.path in {"/admin/users", "/member"}:
+        from api.member_routes import serve_access_page
+        return serve_access_page(handler, admin=parsed.path == "/admin/users")
+    if parsed.path.startswith("/api/member/"):
+        from api.member_routes import handle_member
+        return handle_member(handler, parsed)
+    if parsed.path in {"/api/admin/access", "/api/admin/users", "/api/access/me"}:
         from api.access_admin import handle_access_admin
 
         return handle_access_admin(handler, parsed)
@@ -17496,6 +17502,8 @@ def handle_get(handler, parsed) -> bool:
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )
+            from api.user_roles import accounts_configured
+            text = text.replace("__ACCOUNT_MODE__", "true" if accounts_configured() else "false")
             data = text.encode("utf-8")
             handler.send_response(200)
             handler.send_header("Content-Type", "application/javascript; charset=utf-8")
@@ -19075,10 +19083,14 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
 
-    if parsed.path == "/api/admin/access":
+    if parsed.path in {"/api/admin/access", "/api/admin/users"}:
         from api.access_admin import handle_access_admin
 
         return handle_access_admin(handler, parsed, body)
+
+    if parsed.path.startswith("/api/member/"):
+        from api.member_routes import handle_member
+        return handle_member(handler, parsed, body)
 
     if parsed.path == "/api/updates/check":
         settings = load_settings()

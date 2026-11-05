@@ -11,8 +11,8 @@ LOCAL PATCH (not upstream hermes-webui). Accounts live in
     }}
 
 role ``admin``  -> unrestricted, same as the legacy single password.
-role ``user``   -> member execution is denied pending isolated runtime admission;
-                   account status, logout and the own policy catalog are available.
+role ``user``   -> legacy Agent execution is denied pending isolated admission;
+                   the separate opt-in member API offers tool-free chat/files.
 
 Account mode requires a local account on every login path. Accountless legacy
 password, passkey, OIDC and header sessions cannot bypass account policy.
@@ -406,7 +406,7 @@ def request_denied(handler, parsed) -> str | None:
     # tools. Until the isolated-worker bridge is wired and verified, never
     # admit a member to the shared process's agent/state/file execution paths.
     # There is deliberately no environment-variable escape hatch for this gate.
-    if path.startswith("/api/") and path not in {
+    if path.startswith("/api/") and not path.startswith("/api/member/") and path not in {
         "/api/auth/status", "/api/auth/logout", "/api/access/me"
     }:
         return "Isolated multi-user runtime is not available yet"

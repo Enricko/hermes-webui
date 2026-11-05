@@ -262,3 +262,11 @@ class PolicyStore:
                               "ON r.id=g.resource_id WHERE g.account_id=? ORDER BY r.kind,r.id", (account_id,))
             return {"account_id": account_id, "runtime_ready": False,
                     "resources": [{**dict(row), "models": json.loads(row["models"])} for row in rows]}
+
+    def context_resources(self, context: AccessContext) -> tuple[Admission, dict]:
+        """Trusted call-site data only; never serialize these bindings to a member."""
+        with self._transaction() as db:
+            admission = self._authorize(db, context)
+            ids = (context.profile_id, context.workspace_id, context.connection_id, *context.skills)
+            return admission, {resource_id: json.loads(db.execute(
+                "SELECT binding FROM resources WHERE id=?", (resource_id,)).fetchone()[0]) for resource_id in ids}

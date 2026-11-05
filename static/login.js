@@ -92,6 +92,16 @@ document.addEventListener('DOMContentLoaded', function () {
       var data = {};
       try { data = await res.json(); } catch (_) {}
       if (res.ok && data.ok) {
+        if (userInput) {
+          // Account changes must not hydrate the previous account's private
+          // drafts/session choices or a cached authenticated shell.
+          for (var storage of [window.localStorage, window.sessionStorage]) {
+            try { for (var key of Object.keys(storage)) if (/^hermes[-_:]/i.test(key)) storage.removeItem(key); } catch (_) {}
+          }
+          if (window.caches) {
+            try { for (var cache of await caches.keys()) if (cache.indexOf('hermes-shell-') === 0) await caches.delete(cache); } catch (_) {}
+          }
+        }
         window.location.href = _safeNextPath();
       } else {
         showErr(data.error || invalidPw);

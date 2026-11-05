@@ -1,5 +1,10 @@
 # Hermes Web UI
 
+Fork feature: [username/password multi-user chat](docs/multi-user-chat.md) with
+administrator-assigned profiles, skills, providers/models and private files and
+conversations. This opt-in mode is tool-free; isolated full Agent execution and
+subscription/OAuth support remain separate unfinished work.
+
 [Hermes Agent](https://hermes-agent.nousresearch.com/) is a sophisticated autonomous agent that lives on your server, accessed via a terminal or messaging apps, that remembers what it learns and gets more capable the longer it runs.
 
 Hermes WebUI is a lightweight, dark-themed web app interface in your browser for [Hermes Agent](https://hermes-agent.nousresearch.com/).

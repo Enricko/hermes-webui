@@ -1,0 +1,4 @@
+# Optional developer dependencies for real multi-user browser evidence.
+# Install Chromium with: python -m playwright install chromium
+# Run through ./scripts/test.sh with HERMES_WEBUI_BROWSER_TESTS=1.
+playwright>=1.64,<2
