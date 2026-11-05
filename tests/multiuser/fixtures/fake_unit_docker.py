@@ -314,6 +314,13 @@ def emit_json_with_recorded_size(value: object, label: str) -> None:
     sys.stdout.flush()
 
 
+def requests_json_format(args: list[str]) -> bool:
+    return any(
+        args[index : index + 2] == ["--format", "{{json .}}"]
+        for index in range(len(args) - 1)
+    )
+
+
 def flood(stream, size: int) -> None:
     stream.buffer.write(b"x" * size)
     stream.buffer.flush()
@@ -553,8 +560,10 @@ def main(argv: list[str]) -> int:
         else:
             state.update({"controller_id": controller_id, "started": False, "unit_removed": False, "unit_created": True})
             state["nonce"] = next(
-                value.split("=", 1)[1] for index, value in enumerate(args[:-1])
-                if value == "--env" and args[index + 1].startswith("HERMES_MU_UNIT_NONCE=")
+                args[index + 1].split("=", 1)[1]
+                for index, value in enumerate(args[:-1])
+                if value == "--env"
+                and args[index + 1].startswith("HERMES_MU_UNIT_NONCE=")
             )
             command_start = args.index(CANDIDATE_IMAGE_ID) + 1
             state["worker_argv"] = args[command_start + 4 :]
@@ -646,7 +655,7 @@ def main(argv: list[str]) -> int:
         if removed:
             print(f"Error: No such container: {ref}", file=sys.stderr)
             return 1
-        if "{{.json .}}" in args:
+        if requests_json_format(args):
             if ref in (PREP_CONTAINER_ID, FREEZE_CONTAINER_ID):
                 if SCENARIO == "probe-inspect-stdout-overflow":
                     flood(sys.stdout, 1048577)
