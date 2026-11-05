@@ -17179,6 +17179,10 @@ def _handle_session_get(handler, parsed) -> bool:
 
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
+    if parsed.path in {"/api/admin/access", "/api/access/me"}:
+        from api.access_admin import handle_access_admin
+
+        return handle_access_admin(handler, parsed)
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
     if proxy_result is not False:
         return proxy_result
@@ -17427,13 +17431,16 @@ def handle_get(handler, parsed) -> bool:
         logged_in = False
         session_info = None
         auth_enabled = is_auth_enabled()
-        oidc_enabled = is_oidc_auth_enabled()
+        from api.user_roles import accounts_configured
+
+        account_mode = accounts_configured()
+        oidc_enabled = is_oidc_auth_enabled() and not account_mode
         if auth_enabled:
             session_info = ensure_trusted_auth_session(handler)
             logged_in = bool(session_info)
-        passkey_flag = _passkey_feature_flag_enabled()
+        passkey_flag = _passkey_feature_flag_enabled() and not account_mode
         passkeys = registered_credentials() if passkey_flag else []
-        password_auth_enabled = get_password_hash() is not None
+        password_auth_enabled = account_mode or get_password_hash() is not None
         payload = {
             "auth_enabled": auth_enabled,
             "logged_in": logged_in,
@@ -17445,7 +17452,7 @@ def handle_get(handler, parsed) -> bool:
             "passkey_feature_flag": passkey_flag,
             "auth_disabled_acknowledged": bool(load_settings().get("auth_disabled_acknowledged")) if not auth_enabled else False,
         }
-        if is_trusted_auth_enabled() or (session_info and session_info.get("auth_type") == "trusted"):
+        if not account_mode and (is_trusted_auth_enabled() or (session_info and session_info.get("auth_type") == "trusted")):
             payload["trusted_auth_enabled"] = True
         if session_info and session_info.get("auth_type") in ("trusted", "local"):
             payload["auth_type"] = session_info.get("auth_type")
@@ -19067,6 +19074,11 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
+
+    if parsed.path == "/api/admin/access":
+        from api.access_admin import handle_access_admin
+
+        return handle_access_admin(handler, parsed, body)
 
     if parsed.path == "/api/updates/check":
         settings = load_settings()
@@ -22776,10 +22788,16 @@ def handle_post(handler, parsed) -> bool:
                 auth_type=user_roles.AUTH_TYPE,
                 username=account["username"],
                 bound_profile=bound_profile,
+                account_binding=user_roles.session_binding(account),
             )
             if bound_profile:
                 profile_cookie_header = build_profile_cookie(bound_profile, session_cookie_value=cookie_val)
         else:
+            from api.user_roles import accounts_configured
+
+            if accounts_configured():
+                _record_login_attempt(client_ip)
+                return bad(handler, "Username and password are required", 401)
             if not verify_password(password):
                 _record_login_attempt(client_ip)
                 return bad(handler, "Invalid password", 401)

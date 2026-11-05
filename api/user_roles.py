@@ -11,17 +11,15 @@ LOCAL PATCH (not upstream hermes-webui). Accounts live in
     }}
 
 role ``admin``  -> unrestricted, same as the legacy single password.
-role ``user``   -> the login session is bound to ``profile`` (cannot switch),
-                   only sees that profile's conversations, may only use
-                   workspaces under ``workspaces``, and is denied the
-                   admin / host-level endpoints listed below.
+role ``user``   -> member execution is denied pending isolated runtime admission;
+                   account status, logout and the own policy catalog are available.
 
-The legacy ``HERMES_WEBUI_PASSWORD`` keeps working as an admin login when the
-username field is left empty. Manage accounts with ``scripts/webui_users.py``.
+Account mode requires a local account on every login path. Accountless legacy
+password, passkey, OIDC and header sessions cannot bypass account policy.
+Manage accounts with ``scripts/webui_users.py``.
 
-Scope note: this restricts what the WebUI serves. The agent itself still runs
-with the service's OS permissions; contain it with a sandboxed terminal backend
-on the user's profile if the account must not reach the host.
+Folder/profile checks do not contain agent tools running with service OS
+permissions. See docs/architecture/multi-user-implementation.md for release gates.
 """
 from __future__ import annotations
 
@@ -61,6 +59,28 @@ def users_file() -> Path:
     return Path(STATE_DIR) / "users.json"
 
 
+def accounts_configured() -> bool:
+    """Remember account mode durably; an empty/broken store must not disable auth.
+
+    The marker is administrator-owned, outside user workspaces. Explicitly
+    selecting a store also enables account mode before the first account exists.
+    """
+    path = users_file()
+    marker = path.with_name(path.name + ".required")
+    if os.getenv("HERMES_WEBUI_USERS_FILE", "").strip():
+        return True
+    try:
+        if marker.exists():
+            return True
+        if path.exists():
+            marker.touch(mode=0o600, exist_ok=True)
+            return True
+        return False
+    except OSError:
+        # An inaccessible configured store is never anonymous mode.
+        return True
+
+
 def normalize_username(name) -> str:
     return str(name or "").strip().lower()
 
@@ -75,17 +95,27 @@ def _normalize_record(name, rec) -> dict | None:
     if role not in ROLES or not password.startswith(_SCHEME + "$"):
         logger.warning("users.json: ignoring account %r (bad role or password hash)", username)
         return None
-    out = {"username": username, "role": role, "password": password}
+    if rec.get("disabled", False) is not False:
+        return None
+    out = {"username": username, "role": role, "password": password,
+           "id": str(rec.get("id") or ""), "disabled": False,
+           "auth_generation": rec.get("auth_generation", 0)}
     if role == ROLE_USER:
         profile = str(rec.get("profile") or "").strip()
         if not (profile == "default" or _PROFILE_RE.fullmatch(profile)):
             logger.warning("users.json: ignoring user %r (missing/invalid profile)", username)
             return None
         roots = []
-        for raw in rec.get("workspaces") or []:
-            p = Path(str(raw)).expanduser()
-            if p.is_absolute():
-                roots.append(p.resolve())
+        raw_roots = rec.get("workspaces")
+        if not isinstance(raw_roots, list):
+            return None
+        for raw in raw_roots:
+            try:
+                p = Path(str(raw)).expanduser()
+                if p.is_absolute():
+                    roots.append(p.resolve())
+            except (OSError, RuntimeError, ValueError):
+                return None
         if not roots:
             logger.warning("users.json: ignoring user %r (no workspaces)", username)
             return None
@@ -109,7 +139,7 @@ def load_users() -> dict[str, dict]:
     except OSError:
         logger.warning("users.json: cannot stat %s", path)
         return {}
-    sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+    sig = (str(path.absolute()), st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
     with _cache_lock:
         if _cache is not None and _cache[0] == sig:
             return _cache[1]
@@ -131,7 +161,7 @@ def load_users() -> dict[str, dict]:
 
 
 def has_accounts() -> bool:
-    return bool(load_users())
+    return accounts_configured()
 
 
 # ── Passwords ────────────────────────────────────────────────────────────────
@@ -143,13 +173,17 @@ def hash_password(password: str) -> str:
 
 
 def _verify_hash(password: str, stored: str) -> bool:
+    if not isinstance(stored, str):
+        return False
     try:
         scheme, iters, salt_hex, hash_hex = stored.split("$")
         if scheme != _SCHEME:
             return False
-        dk = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iters)
-        )
+        iterations = int(iters)
+        salt = bytes.fromhex(salt_hex)
+        if not 100_000 <= iterations <= 2_000_000 or len(salt) != 16 or len(hash_hex) != 64:
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return hmac.compare_digest(dk.hex(), hash_hex)
     except (ValueError, TypeError):
         return False
@@ -175,6 +209,17 @@ def authenticate(username, password) -> dict | None:
 
 def bound_profile_for(rec: dict) -> str | None:
     return rec["profile"] if rec["role"] == ROLE_USER else None
+
+
+def session_binding(rec: dict) -> str:
+    """Bind login authority to identity, password and role, never to a username alone.
+
+    This digest stays in the server-side session store and is not a cookie or
+    an API field. Legacy records are invalidated on their first password reset;
+    the account CLI assigns immutable IDs for new and updated records.
+    """
+    fields = [rec.get(k) for k in ("id", "username", "password", "role", "profile", "auth_generation")]
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
 
 
 # ── Per-request restriction context ──────────────────────────────────────────
@@ -214,6 +259,9 @@ def resolve_session_account(info: dict) -> tuple[bool, Restriction | None]:
     """
     rec = load_users().get(normalize_username(info.get("username")))
     if rec is None:
+        return False, None
+    binding = info.get("account_binding")
+    if not isinstance(binding, str) or not hmac.compare_digest(binding, session_binding(rec)):
         return False, None
     expected = bound_profile_for(rec)
     actual = str(info.get("bound_profile") or "").strip() or None
@@ -354,6 +402,14 @@ def request_denied(handler, parsed) -> str | None:
     if current_restriction() is None:
         return None
     path = getattr(parsed, "path", "") or ""
+    # A profile cookie/path allowlist does not contain terminal, Python or MCP
+    # tools. Until the isolated-worker bridge is wired and verified, never
+    # admit a member to the shared process's agent/state/file execution paths.
+    # There is deliberately no environment-variable escape hatch for this gate.
+    if path.startswith("/api/") and path not in {
+        "/api/auth/status", "/api/auth/logout", "/api/access/me"
+    }:
+        return "Isolated multi-user runtime is not available yet"
     method = str(getattr(handler, "command", "GET") or "GET").upper()
     if path in _USER_DENIED_EXACT or path.startswith(_USER_DENIED_PREFIXES):
         return "Not available for this account"

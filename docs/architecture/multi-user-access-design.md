@@ -1,6 +1,6 @@
 # Portable multi-user Hermes WebUI design
 
-Status: product and security design approved on 2026-11-05. Detailed implementation planning is authorized. Product implementation and deployment have not started.
+Status: implementation in progress on `feature/user-roles`. Account lifecycle and transactional policy foundation are implemented. Isolated execution, provider brokerage and full product integration remain release gates. No production deployment has been performed. See [implementation status](multi-user-implementation.md).
 
 ## Goal
 

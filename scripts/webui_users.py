@@ -17,6 +17,7 @@ import argparse
 import getpass
 import json
 import os
+import secrets
 import sys
 import tempfile
 from pathlib import Path
@@ -61,6 +62,7 @@ def write(path: Path, data: dict) -> None:
             json.dump(data, fh, indent=2, sort_keys=True)
             fh.write("\n")
         os.chmod(tmp, 0o600)
+        path.with_name(path.name + ".required").touch(mode=0o600, exist_ok=True)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -96,6 +98,9 @@ def main() -> None:
     pw.add_argument("username")
     rm = sub.add_parser("remove")
     rm.add_argument("username")
+    for action in ("disable", "enable"):
+        command = sub.add_parser(action)
+        command.add_argument("username")
     args = ap.parse_args()
 
     path = args.file or default_users_file()
@@ -131,8 +136,19 @@ def main() -> None:
         print(f"Password updated for {username}.")
         return
 
+    if args.cmd in ("disable", "enable"):
+        if username not in users:
+            sys.exit(f"No account {username!r}")
+        users[username]["disabled"] = args.cmd == "disable"
+        # Reactivation must not resurrect old cookies.
+        users[username]["auth_generation"] = int(users[username].get("auth_generation", 0)) + 1
+        write(path, data)
+        print(f"Account {username}: {args.cmd}d.")
+        return
+
     # add / update
     rec = dict(users.get(username) or {})
+    rec.setdefault("id", secrets.token_hex(16))
     rec["role"] = args.role
     if args.role == ROLE_USER:
         profile = (args.profile or rec.get("profile") or "").strip()

@@ -11,6 +11,11 @@ contributor guidance; it does not change runtime behavior or CI gates.
 
 ## Start here
 
+- [`docs/architecture/multi-user-implementation.md`](architecture/multi-user-implementation.md):
+  fork-only account lifecycle, explicit grants and private ownership policy.
+  This is an incomplete foundation; member execution stays denied until isolated
+  workers and provider brokerage meet the approved multi-user design gates.
+
 - [`AGENTS.md`](../AGENTS.md): repository entry point for AI assistants,
   public-safety rules, and the short redline checklist.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md): contribution style, verification,
