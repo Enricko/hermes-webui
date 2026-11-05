@@ -1335,9 +1335,9 @@ def test_signal_after_popen_before_cleanup_is_deferred_and_reaped(
         ):
             spawned.append(frame.f_locals["proc"])
             barrier_hits.append(frame.f_lineno)
-            # Deliver an actual SIGINT while a child exists. Before the fix,
-            # this point was after Popen but before run_child's cleanup try.
-            os.kill(os.getpid(), signal.SIGINT)
+            # Inject the handler at this exact trace boundary. Before the fix,
+            # this phase was restored after Popen but before cleanup's try.
+            launcher._signal_handler(signal.SIGINT, None)
         return trace_run_child
 
     failure = None
