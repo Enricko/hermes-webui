@@ -926,6 +926,48 @@ def test_loopback_guard_refuses_unowned_service_without_connecting() -> None:
             socket.create_connection(("127.0.0.1", 1), timeout=0.1)
 
 
+def test_no_proxy_routes_owned_loopback_around_unowned_synthetic_proxy(
+    monkeypatch,
+) -> None:
+    """Prove bypass routes directly; a proxy attempt is refused before contact."""
+    helper = _helper_module()
+    with helper.LoopbackUpstream() as target, helper.LoopbackUpstream() as proxy:
+        # Both listeners are synthetic and owned by this test, but only target is
+        # admitted by NetworkGuard. A proxy request must therefore be visible as
+        # a refused connect, never as a request received by the proxy listener.
+        monkeypatch.setenv("http_proxy", proxy.url)
+        monkeypatch.delenv("HTTP_PROXY", raising=False)
+        monkeypatch.setenv("no_proxy", target.host)
+        monkeypatch.setenv("NO_PROXY", target.host)
+
+        with helper.NetworkGuard() as guard:
+            guard.allow(target)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler())
+            with opener.open(target.url, timeout=3) as response:
+                assert response.status == 200
+                response.read()
+
+            assert len(target.requests) == 1
+            assert proxy.requests == []
+            assert guard.refused == [], (
+                "configured proxy was contacted instead of bypassed for the owned target"
+            )
+
+            # Remove only the bypass policy. This control request must try the
+            # configured unowned proxy, where the guard refuses it before the
+            # synthetic proxy receives anything.
+            monkeypatch.setenv("no_proxy", "")
+            monkeypatch.setenv("NO_PROXY", "")
+            proxied_opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler()
+            )
+            with pytest.raises(helper.DestinationRefused):
+                proxied_opener.open(target.url, timeout=3)
+            assert len(guard.refused) == 1
+            assert len(target.requests) == 1
+            assert proxy.requests == []
+
+
 def test_refused_report_cannot_overwrite_foreign_file_or_follow_replaced_parent(
     run_launcher, tmp_path: Path, monkeypatch, capsys
 ) -> None:
