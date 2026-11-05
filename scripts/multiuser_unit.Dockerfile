@@ -2,8 +2,11 @@
 #
 # Built by `scripts/multiuser_unit.sh ... build --base-image NAME@sha256:<digest>`
 # from a context holding only requirements.txt, requirements-dev.txt,
-# scripts/test.sh and this file, archived from a clean, recorded commit. The
-# base image must be digest-pinned and has deliberately no default.
+# scripts/test.sh and this file, written from the blobs of one recorded commit
+# whose files match the checkout. The base image must be digest-pinned and has
+# deliberately no default. The image must declare no VOLUME, ONBUILD,
+# ENTRYPOINT or HEALTHCHECK; the controller refuses one that does before any
+# container is created from it.
 #
 # The controller later copies an exact candidate commit into /src, commits it
 # as a per-run image and admits a read-only, network-less, non-root container
@@ -15,9 +18,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_INPUT=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# jq lets the controller's own regression tests run inside a unit.
+# jq and git let the controller's own regression tests run inside a unit
+# (against a tmp_path mini-checkout; /src itself never has .git).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends jq \
+ && apt-get install -y --no-install-recommends git jq \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-dev.txt /opt/mu/
