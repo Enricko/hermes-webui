@@ -305,6 +305,15 @@ def emit_json(value: object) -> None:
     print(json.dumps(value, separators=(",", ":")))
 
 
+def emit_json_with_recorded_size(value: object, label: str) -> None:
+    serialized = json.dumps(value, separators=(",", ":")) + "\n"
+    (ROOT / f"{label}-json-bytes.txt").write_text(
+        str(len(serialized.encode("utf-8"))), encoding="ascii"
+    )
+    sys.stdout.write(serialized)
+    sys.stdout.flush()
+
+
 def flood(stream, size: int) -> None:
     stream.buffer.write(b"x" * size)
     stream.buffer.flush()
@@ -383,7 +392,17 @@ def main(argv: list[str]) -> int:
             flood(sys.stdout, 1048577)
         elif SCENARIO == "info-stderr-overflow":
             emit_json({"ID": current_id, "ServerVersion": "synthetic", "OperatingSystem": "Linux"})
-            flood(sys.stderr, 1048577)
+            flood(sys.stderr, 65537)
+        elif SCENARIO == "info-large-json" and "{{.ID}}" not in args:
+            emit_json_with_recorded_size(
+                {
+                    "ID": current_id,
+                    "ServerVersion": "synthetic",
+                    "OperatingSystem": "Linux",
+                    "SyntheticPadding": "x" * 70000,
+                },
+                "info",
+            )
         elif "{{.ID}}" in args:
             print(current_id)
         else:
@@ -425,7 +444,7 @@ def main(argv: list[str]) -> int:
             if SCENARIO == "inspect-stdout-overflow":
                 flood(sys.stdout, 1048577)
             else:
-                flood(sys.stderr, 1048577)
+                flood(sys.stderr, 65537)
             return 0
         if ref == UNIT_IMAGE_ID and SCENARIO == "runtime-image-absent":
             print(f"Error: No such image: {ref}", file=sys.stderr)
@@ -501,7 +520,12 @@ def main(argv: list[str]) -> int:
                 if SCENARIO == "runtime-image-id-mismatch" and ref == UNIT_IMAGE_ID
                 else image_id
             )
-            emit_json({"Id": emitted_id, "RootFS": {"Layers": layers}, "Config": config})
+            image = {"Id": emitted_id, "RootFS": {"Layers": layers}, "Config": config}
+            if SCENARIO == "inspect-large-json" and ref == UNIT_IMAGE_ID:
+                image["SyntheticPadding"] = "x" * 70000
+                emit_json_with_recorded_size(image, "inspect")
+            else:
+                emit_json(image)
         return 0
 
     if args[:1] == ["create"]:
