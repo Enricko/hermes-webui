@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -116,6 +118,66 @@ def _launcher_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _write_shadow_probe_checkout(tmp_path: Path, shadow_name: str) -> tuple[Path, Path]:
+    """Create a disposable, statically complete checkout with a runner marker."""
+    repo = tmp_path / f"synthetic-shadow-{shadow_name.replace('/', '_')}"
+    scripts = repo / "scripts"
+    tests = repo / "tests" / "multiuser"
+    venv_root = repo / ".venv"
+    bin_dir = venv_root / "bin"
+    config_lines = (REPO_ROOT / ".venv" / "pyvenv.cfg").read_text().splitlines()
+    config = dict(line.split(" = ", 1) for line in config_lines if " = " in line)
+    base_python = Path(config["executable"]).resolve()
+    base_tag = ".".join(config["version"].split(".")[:2])
+    base_bin = base_python.parent
+    site = venv_root / "lib" / f"python{base_tag}" / "site-packages"
+    for directory in (scripts, tests, bin_dir, site):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    for module_name in (
+        "cryptography",
+        "mcp",
+        "pytest",
+        "pytest_asyncio",
+        "pytest_shard",
+        "pytest_timeout",
+        "ruff",
+        "yaml",
+        "pip",
+    ):
+        module_path = site / module_name
+        if module_name in {"cryptography", "mcp", "pytest", "pytest_asyncio", "pip"}:
+            module_path.mkdir()
+            (module_path / "__init__.py").write_text("# synthetic module\n")
+        else:
+            module_path.with_suffix(".py").write_text("# synthetic module\n")
+
+    for name in ("test_multiuser.py", "multiuser_test_fixtures.py"):
+        shutil.copy2(REPO_ROOT / "scripts" / name, scripts / name)
+    runner_marker = tmp_path / f"{shadow_name.replace('/', '_')}-runner-invoked"
+    runner = scripts / "test.sh"
+    runner.write_text(
+        "#!/bin/sh\n"
+        f"printf 'invoked' > {str(runner_marker)!r}\n"
+        'if [ "${1:-}" = --prepare-only ]; then exit 0; fi\n'
+        'if [ "${1:-}" = --execute-only ]; then exit 78; fi\n'
+        "exit 91\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    (venv_root / "pyvenv.cfg").write_text(
+        f"home = {base_bin}\nversion = {config['version']}\n"
+        "include-system-site-packages = false\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "python").symlink_to(base_python)
+    shadow_path = repo / shadow_name
+    shadow_path.parent.mkdir(parents=True, exist_ok=True)
+    shadow_path.write_bytes(b"synthetic compiled shadow; never execute\n")
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    return repo, runner_marker
 
 
 def test_standalone_self_test_is_independent_and_scrubs_hostile_environment(
@@ -596,7 +658,6 @@ def test_untrusted_synthetic_venv_hooks_are_not_executed_before_not_run(
     version_tag = ".".join(base_version)
     site = repo / ".venv" / "lib" / f"python{version_tag}" / "site-packages"
     bin_dir = repo / ".venv" / "bin"
-    base_stdlib = base_python.parent.parent / "lib" / (f"python{version_tag}")
     for directory in (scripts, tests, site, bin_dir):
         directory.mkdir(parents=True, exist_ok=True)
     for module_name in (
@@ -618,19 +679,16 @@ def test_untrusted_synthetic_venv_hooks_are_not_executed_before_not_run(
             module_path.with_suffix(".py").write_text("# synthetic module\n")
     for name in ("test_multiuser.py", "multiuser_test_fixtures.py"):
         shutil.copy2(REPO_ROOT / "scripts" / name, scripts / name)
-    # If the launcher wrongly reaches the runner, it will start the candidate
-    # interpreter and trigger the synthetic sitecustomize/.pth markers below.
+    # If the launcher wrongly reaches the runner, this marker records it. Never
+    # execute the candidate interpreter: it resolves to the host distribution.
     runner = scripts / "test.sh"
     candidate_python = bin_dir / "python"
     runner_marker = tmp_path / "runner-was-invoked"
-    interpreter_marker = tmp_path / "candidate-interpreter-was-invoked"
     runner.write_text(
         "#!/bin/sh\n"
         'if [ "${1:-}" = --prepare-only ]; then exit 0; fi\n'
         f"printf 'ran' > {str(runner_marker)!r}\n"
-        f"'{candidate_python}' -c 'pass'\ncode=$?\n"
-        f"if [ $code -eq 0 ]; then printf 'ran' > {str(interpreter_marker)!r}; fi\n"
-        "exit $code\n",
+        "exit 0\n",
         encoding="utf-8",
     )
     runner.chmod(0o700)
@@ -698,9 +756,6 @@ def test_untrusted_synthetic_venv_hooks_are_not_executed_before_not_run(
         r["code"] for r in system_site_status["reasons"]
     }
     assert not runner_marker.exists(), "system-site venv reached the test runner"
-    assert not interpreter_marker.exists(), (
-        "system-site candidate interpreter was executed"
-    )
     pyvenv_cfg.write_text(
         f"home = {base_bin}\nversion = {venv_cfg['version']}\ninclude-system-site-packages = false\n",
         encoding="utf-8",
@@ -719,26 +774,9 @@ def test_untrusted_synthetic_venv_hooks_are_not_executed_before_not_run(
     assert not runner_marker.exists(), (
         "untrusted venv reached its configured test runner"
     )
-    assert not interpreter_marker.exists(), "untrusted venv interpreter was executed"
 
     (site / "sitecustomize.py").unlink()
     (site / "f02-startup.pth").unlink()
-
-    base_hook_marker = tmp_path / "base-sitecustomize-ran"
-    base_hook = base_stdlib / "sitecustomize.py"
-    base_hook.write_text(
-        f"from pathlib import Path; Path({str(base_hook_marker)!r}).write_text('ran')\n",
-        encoding="utf-8",
-    )
-    base_hook_status = invoke()
-    assert "venv_provenance_unknown" in {r["code"] for r in base_hook_status["reasons"]}
-    assert not base_hook_marker.exists(), (
-        "base stdlib sitecustomize ran before provenance acceptance"
-    )
-    assert not runner_marker.exists(), (
-        "base-hook venv reached its configured test runner"
-    )
-    base_hook.unlink()
 
     outside_path = tmp_path / "external-python-path"
     outside_path.mkdir()
@@ -876,15 +914,44 @@ def test_untrusted_synthetic_venv_hooks_are_not_executed_before_not_run(
         "checkout_dotenv_present",
     }:
         assert not runner_marker.exists()
-        assert not interpreter_marker.exists()
         return
     assert no_junit_status["status"] == "FAIL"
     assert "junit_unparseable" in no_junit_codes
     assert no_junit_status["child_exit_code"] == 0
     assert runner_marker.exists(), "clean fake runner was not actually invoked"
-    assert interpreter_marker.exists(), (
-        "clean fake runner did not execute its candidate"
+
+
+def test_synthetic_base_startup_hook_is_refused_without_execution(
+    tmp_path: Path,
+) -> None:
+    """Exercise base-hook scanning only against a synthetic stdlib tree."""
+    launcher = _launcher_module()
+    base_root = tmp_path / "synthetic-base"
+    stdlib = base_root / "lib" / "python3.13"
+    (stdlib / "lib-dynload").mkdir(parents=True)
+    marker = tmp_path / "synthetic-base-sitecustomize-ran"
+    hook = stdlib / "sitecustomize.py"
+    hook.write_text(
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
     )
+    synthetic_base = launcher.BaseInterpreter(
+        str(base_root / "bin" / "python3.13"),
+        str(base_root / "bin" / "python3.13"),
+        str(base_root),
+        (3, 13),
+        str(stdlib),
+    )
+    try:
+        launcher.scan_interpreter_hooks(synthetic_base)
+    except launcher.Outcome as exc:
+        assert exc.status == "NOT_RUN"
+        assert exc.code == "venv_provenance_unknown"
+        assert str(hook) in exc.detail
+    else:
+        pytest.fail("synthetic base stdlib startup hook was accepted")
+    assert hook.is_file() and hook.parent.is_relative_to(tmp_path)
+    assert not marker.exists(), "synthetic base startup hook executed during inspection"
 
 
 def test_helper_reports_real_hermetic_facts_not_environment_labels() -> None:
@@ -961,9 +1028,15 @@ def test_no_proxy_routes_owned_loopback_around_unowned_synthetic_proxy(
             proxied_opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler()
             )
-            with pytest.raises(helper.DestinationRefused):
+            with pytest.raises(urllib.error.URLError) as proxy_error:
                 proxied_opener.open(target.url, timeout=3)
-            assert len(guard.refused) == 1
+            assert isinstance(proxy_error.value.reason, helper.DestinationRefused)
+            assert guard.refused == [
+                (
+                    "connect",
+                    f"unowned loopback endpoint {proxy.host}:{proxy.port}",
+                )
+            ]
             assert len(target.requests) == 1
             assert proxy.requests == []
 
@@ -1238,6 +1311,90 @@ def test_spawn_publication_interrupt_reaps_the_owned_child(tmp_path: Path) -> No
         launcher._SignalState.phase = "teardown"
 
 
+def test_signal_after_popen_before_cleanup_is_deferred_and_reaped(
+    tmp_path: Path,
+) -> None:
+    """A trace barrier hits the formerly unprotected post-Popen run phase."""
+    launcher = _launcher_module()
+    spawned = []
+    barrier_hits = []
+    old_handler = signal.getsignal(signal.SIGINT)
+    old_phase = launcher._SignalState.phase
+    old_received = launcher._SignalState.received
+    launcher._SignalState.phase = "run"
+    launcher._SignalState.received = None
+    signal.signal(signal.SIGINT, launcher._signal_handler)
+
+    def trace_run_child(frame, event, _arg):
+        if (
+            frame.f_code is launcher.run_child.__code__
+            and event == "line"
+            and not barrier_hits
+            and "proc" in frame.f_locals
+            and launcher._SignalState.phase == "run"
+        ):
+            spawned.append(frame.f_locals["proc"])
+            barrier_hits.append(frame.f_lineno)
+            # Deliver an actual SIGINT while a child exists. Before the fix,
+            # this point was after Popen but before run_child's cleanup try.
+            os.kill(os.getpid(), signal.SIGINT)
+        return trace_run_child
+
+    failure = None
+    escaped_interrupt = False
+    try:
+        sys.settrace(trace_run_child)
+        try:
+            launcher.run_child(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import time; time.sleep(60)",
+                ],
+                env={"PATH": "/usr/bin:/bin"},
+                cwd=str(tmp_path),
+                timeout=10,
+                label="synthetic post-Popen interrupt",
+            )
+        except launcher.Outcome as exc:
+            failure = exc
+        except launcher._Interrupted:
+            escaped_interrupt = True
+    finally:
+        sys.settrace(None)
+        try:
+            for proc in spawned:
+                try:
+                    if proc.poll() is None:
+                        launcher.terminate_group(
+                            proc, first_signal=signal.SIGINT
+                        )
+                except BaseException:
+                    # The test owns the Popen handle; product cleanup may be
+                    # the defect under test, so retain an independent fallback.
+                    pass
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=3)
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+            launcher._SignalState.phase = old_phase
+            launcher._SignalState.received = old_received
+
+    assert barrier_hits, "trace barrier never reached the post-Popen run phase"
+    assert not escaped_interrupt, (
+        "SIGINT escaped run_child before its guaranteed cleanup region"
+    )
+    assert failure is not None
+    assert failure.status == "FAIL" and failure.code == "interrupted"
+    assert "owned group terminated=True" in failure.detail
+    assert spawned and all(proc.poll() is not None for proc in spawned), (
+        "run_child returned an interrupt outcome with its owned child still alive"
+    )
+
+
 def test_synthetic_operator_local_agent_install_path_is_not_an_explicit_source(
     tmp_path: Path,
 ) -> None:
@@ -1361,6 +1518,90 @@ def test_import_manifest_rejects_changed_new_and_linked_synthetic_modules(
     linked = import_module("synthetic_pkg.linked")
     assert linked.returncode != 0
     assert "ImportError" in linked.stderr
+
+
+@pytest.mark.parametrize(
+    "shadow_name",
+    [
+        "pytest.pyc",
+        "pytest/__init__.pyc",
+        f"pytest{importlib.machinery.EXTENSION_SUFFIXES[0]}",
+        f"pytest/__init__{importlib.machinery.EXTENSION_SUFFIXES[0]}",
+    ],
+)
+def test_compiled_checkout_modules_cannot_shadow_pytest_before_runner(
+    tmp_path: Path, shadow_name: str
+) -> None:
+    repo, runner_marker = _write_shadow_probe_checkout(tmp_path, shadow_name)
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            str(repo / "scripts" / "test_multiuser.py"),
+            "--no-agent",
+            "--tier",
+            "unit",
+            "--",
+            "-q",
+        ],
+        cwd=repo,
+        env={"PATH": str(empty_path)},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    status = _status(result)
+    assert result.returncode == 2
+    assert status["status"] == "REFUSED"
+    assert "import_shadowing" in {item["code"] for item in status["reasons"]}
+    assert not runner_marker.exists(), (
+        f"runner executed before compiled checkout shadow was refused: {shadow_name}"
+    )
+
+
+def test_import_shadow_check_fails_closed_without_child_stdlib_inventory(
+    tmp_path: Path,
+) -> None:
+    launcher = _launcher_module()
+    repo = tmp_path / "inventory-repo"
+    site = tmp_path / "inventory-site"
+    repo.mkdir()
+    site.mkdir()
+
+    unavailable = launcher.Venv(str(tmp_path), None, (3, 13), [str(site)], None)
+    try:
+        launcher.check_import_shadowing(str(repo), unavailable)
+    except launcher.Outcome as exc:
+        assert exc.status == "NOT_RUN"
+        assert exc.code == "venv_provenance_unknown"
+    else:
+        pytest.fail("missing child base incorrectly certified import safety")
+
+    synthetic_stdlib = tmp_path / "incomplete-child-stdlib"
+    (synthetic_stdlib / "lib-dynload").mkdir(parents=True)
+    (synthetic_stdlib / "json.py").write_text("# synthetic stdlib inventory\n")
+    incomplete_base = launcher.BaseInterpreter(
+        sys.executable,
+        sys.executable,
+        str(tmp_path),
+        (3, 13),
+        str(synthetic_stdlib),
+    )
+    incomplete = launcher.Venv(
+        str(tmp_path), None, (3, 13), [str(site)], incomplete_base
+    )
+    try:
+        launcher.check_import_shadowing(str(repo), incomplete)
+    except launcher.Outcome as exc:
+        assert exc.status == "NOT_RUN"
+        assert exc.code == "venv_provenance_unknown"
+    else:
+        pytest.fail("stdlib inventory without os was accepted as complete")
 
 
 def test_report_does_not_admit_synthetic_credential_reader_or_network_script(
@@ -1507,7 +1748,6 @@ def test_prepare_phase_is_audited_before_execute_only_can_start(tmp_path: Path) 
     runner.write_text(
         "#!/bin/sh\n"
         f"SITE={str(site)!r}\n"
-        f"CANDIDATE={str(candidate)!r}\n"
         f"HOOK_MARKER={str(hook_marker)!r}\n"
         f"EXECUTE_MARKER={str(execute_marker)!r}\n"
         'if [ "${1:-}" = --prepare-only ]; then\n'
@@ -1518,10 +1758,10 @@ def test_prepare_phase_is_audited_before_execute_only_can_start(tmp_path: Path) 
         '  printf ran > "$EXECUTE_MARKER"\n'
         "  exit 0\n"
         "fi\n"
-        # Legacy install-then-exec path: create a hook, then invoke the
-        # synthetic interpreter so the old ordering has an observable marker.
+        # Legacy install-then-exec path: create a synthetic hook but never
+        # invoke the candidate, which resolves into the host Python distribution.
         'printf "import pathlib; pathlib.Path(\'%s\').write_text(\'ran\')\\n" "$HOOK_MARKER" > "$SITE/provisioned.pth"\n'
-        '"$CANDIDATE" -c pass\n',
+        "exit 0\n",
         encoding="utf-8",
     )
     runner.chmod(0o700)
