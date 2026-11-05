@@ -2187,9 +2187,9 @@ def test_result_reports_fixed_deadlines_and_bounded_capture_limits(tmp_path: Pat
     ("scenario", "stream", "cap"),
     [
         ("info-stdout-overflow", "stdout", 1048576),
-        ("info-stderr-overflow", "stderr", 1048576),
+        ("info-stderr-overflow", "stderr", 65536),
         ("inspect-stdout-overflow", "stdout", 1048576),
-        ("inspect-stderr-overflow", "stderr", 1048576),
+        ("inspect-stderr-overflow", "stderr", 65536),
     ],
 )
 def test_bounded_info_and_inspect_stream_overflow_stops_before_create(
@@ -2205,6 +2205,26 @@ def test_bounded_info_and_inspect_stream_overflow_stops_before_create(
     assert controller["limits"]["inspect_bytes"] == 1048576
     assert controller["limits"]["control_bytes"] == 65536
     _assert_cap_plus_one_stream_file(evidence, cap, f"{scenario} {stream}")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "response_label"),
+    [("info-large-json", "info"), ("inspect-large-json", "inspect")],
+)
+def test_valid_info_and_inspect_json_above_control_cap_is_accepted(
+    tmp_path: Path, scenario: str, response_label: str
+) -> None:
+    result, controller, _records = _run_simulated_candidate(tmp_path, scenario)
+    fake_root = tmp_path / f"run-engine-state-{scenario}"
+    response_size = int(
+        (fake_root / f"{response_label}-json-bytes.txt").read_text(encoding="ascii")
+    )
+    assert 65536 < response_size < 1048576
+    assert result.returncode == 0
+    assert controller["status"] == "PASS"
+    assert controller["worker"]["consistent"] is True
+    assert controller["limits"]["control_bytes"] == 65536
+    assert controller["limits"]["inspect_bytes"] == 1048576
 
 
 @pytest.mark.parametrize(
