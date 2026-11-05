@@ -25,13 +25,14 @@
 # the recipe digests, image, layers, runtime configuration and freeze digest.
 # run admits that build result (--runtime-evidence) and the live unit image
 # before anything is created, copies the exact candidate commit into a
-# per-run image, creates ONE container with fixed isolation flags, admits it
-# from `docker inspect` before `docker start`, runs the launcher
-# (`python3 -I -S scripts/test_multiuser.py <worker args>`) inside it, checks
-# exactly one worker result line against the container exit and the
-# requested mode and tier, removes the container and per-run image, and only
-# then gives a verdict. cleanup removes what an interrupted run's lease
-# recorded, and nothing else.
+# per-run image, creates ONE container with fixed isolation flags and daemon
+# logging off, admits it from `docker inspect` before start, runs the launcher
+# (`python3 -I -S scripts/test_multiuser.py <worker args>`) attached with
+# bounded capture, settles and removes the unit and per-run image through
+# separately checked engine calls, checks exactly one worker result line
+# against the container exit and the requested mode and tier, and only then
+# gives a verdict. cleanup removes what an interrupted run's lease recorded,
+# and nothing else.
 #
 # Every docker call uses an empty environment with a private HOME and
 # DOCKER_CONFIG inside DIR and the explicit --host socket: no ambient context,
@@ -42,9 +43,22 @@
 # controller created and recorded on the same engine are ever removed; an
 # unknown identity is quarantined, never looked up by name or label.
 #
-# The build evidence is trusted controller output in a private directory; a
-# same-user attacker who controls this host or controller is outside this
-# boundary, and a private JSON file does not attest itself.
+# Every docker, git and tar step runs as a bounded job of this shell (see
+# bjob): its own process group, a per-call limit clipped to a fixed operation
+# deadline, hard-capped stdout and stderr, and SIGKILL as the only
+# cancellation. Cleanup has its own fixed budget that is not reset. Before
+# every engine mutation the socket (device, inode, mode, owner and its
+# parent directory) and the engine ID are checked again. jq, sha256, stat and
+# the like run inline on bounded, controller-owned local files.
+#
+# Trust and limits: the host tools, this controller and the local engine
+# endpoint are trusted, and no other same-user process mutates the engine or
+# DIR concurrently. A check-then-use window remains between each binding
+# check and its mutation, and between a tag check and its removal. A SIGKILL
+# of this controller, a host crash, engine loss or an uninterruptible process
+# can leave a started unit running; its lease and quarantine say so and no
+# disposal is claimed. The build evidence is trusted controller output in a
+# private directory; it does not attest itself.
 #
 # The last stdout line is `MULTIUSER_UNIT_RESULT {json}`; the same JSON is
 # written to DIR/result.json. Exit: 0 PASS, 1 FAIL, 2 REFUSED, 3 NOT_RUN.
@@ -98,7 +112,6 @@ PIDS_LIMIT=256
 MEMORY_BYTES=2147483648
 NANO_CPUS=2000000000
 DEFAULT_TIMEOUT=1800
-MAX_WORKER_STDOUT=4194304
 MAX_EVIDENCE_BYTES=1048576
 GIT_BIN=/usr/bin/git
 RECIPE_PATHS="requirements.txt requirements-dev.txt scripts/test.sh scripts/multiuser_unit.Dockerfile"
@@ -107,6 +120,30 @@ RECIPE_KEYS_JSON='["commit","tree","base_image","inputs","unit_image_tag","unit_
 RUNTIME_KEYS_JSON='["User","WorkingDir","Env","Entrypoint","Cmd","Volumes","OnBuild","Healthcheck","StopSignal","Shell","ExposedPorts"]'
 DEFAULT_DOCKER_BINS="/usr/local/bin/docker /usr/bin/docker"
 DEFAULT_JQ_BIN=/usr/bin/jq
+
+# Time (seconds). Each bounded call's own limit is clipped to the phase
+# deadline: build or run first, then a fixed cleanup budget that starts once
+# and is never reset. KILL_GRACE bounds each confirmation that a killed job
+# group is gone.
+CTL_LIMIT=60
+CP_LIMIT=600
+BUILD_LIMIT=3000
+LOCAL_LIMIT=900
+BUILD_BUDGET=3600
+RUN_OVERHEAD=1800
+CLEANUP_BUDGET=300
+KILL_GRACE=5
+# Bytes kept per stream (a file one byte longer marks overflow). The
+# candidate snapshot (about one git cat-file per tracked file; this checkout
+# has roughly 2.2k) runs as one local job within LOCAL_LIMIT.
+CTL_CAP=65536
+INSPECT_CAP=1048576
+BUILD_CAP=8388608
+FREEZE_CAP=1048576
+WORKER_STDOUT_CAP=4194304
+WORKER_STDERR_CAP=1048576
+MAX_SNAPSHOT_BYTES=268435456
+MAX_SNAPSHOT_ENTRIES=100000
 
 HEX40_RE='^[0-9a-f]{40}$'
 HEX64_RE='^[0-9a-f]{64}$'
@@ -127,13 +164,20 @@ DRY_RUN=false
 CONTROLLER_ID=""
 DIR=""
 DIR_CREATED=0
+JOBS=""
 SOCK=""
+SOCK_PARENT=""
+SOCK_FID=""
+PARENT_FID=""
+STAT_STYLE=""
 DOCKER_BIN=""
 DOCKER_SUBSTITUTED=false
 JQ_BIN=""
 JQ_READY=0
 ENGINE_ID=""
+BOUND_ENGINE=""
 ENGINE_JSON=null
+BINDING_JSON=null
 REQUEST_JSON=null
 REQ_MODE=""
 REQ_TIER=""
@@ -141,15 +185,25 @@ RUNTIME_EVIDENCE_JSON=null
 RECIPE_JSON=null
 CANDIDATE_JSON=null
 CONTAINER_JSON=null
-ATTESTED_JSON='{"network_none":false,"read_only_rootfs":false,"non_root":false,"no_mounts":false,"caps_dropped":false,"no_new_privileges":false,"private_pid":false,"resource_limits":false}'
+ATTESTED_JSON='{"network_none":false,"read_only_rootfs":false,"non_root":false,"no_mounts":false,"caps_dropped":false,"no_new_privileges":false,"private_pid":false,"resource_limits":false,"daemon_logging_disabled":false}'
 WORKER_JSON='{"result":null,"consistent":false}'
 CLEANUP_JSON='{"container_removed":false,"candidate_image_removed":false,"verified":false,"quarantine":[]}'
 CLAIMS_JSON='{"agent_source_pin":false,"native_clients":false,"browser_privacy":false,"os_containment":false,"external_provider":false}'
+OPERATION_SECONDS=null
+ARCHIVE_CAP=null
 UNIT_CID=""
+UNIT_STARTED=false
+UNIT_SETTLED=false
 CREATED_ID=""
 INTERRUPTED=""
 ERR_LINE=""
 QUARANTINE=""
+PHASE=main
+MAIN_DEADLINE=0
+CLEANUP_DEADLINE=0
+JOB_SEQ=0
+BJ_STATE=""
+BJ_RC=""
 
 # A JSON string from controller-generated text. Characters outside a plain
 # set become '?', so no escaping is needed; structured data goes through jq.
@@ -191,6 +245,15 @@ stop() {
   exit 0
 }
 
+limits_json() {
+  printf '{"operation_seconds":%s,"cleanup_seconds":%s,"kill_grace_seconds":%s,"control_seconds":%s' \
+    "$OPERATION_SECONDS" "$CLEANUP_BUDGET" "$KILL_GRACE" "$CTL_LIMIT"
+  printf ',"control_bytes":%s,"inspect_bytes":%s,"build_output_bytes":%s,"worker_stdout_bytes":%s' \
+    "$CTL_CAP" "$INSPECT_CAP" "$BUILD_CAP" "$WORKER_STDOUT_CAP"
+  printf ',"worker_stderr_bytes":%s,"snapshot_bytes_max":%s,"archive_bytes":%s}' \
+    "$WORKER_STDERR_CAP" "$MAX_SNAPSHOT_BYTES" "$ARCHIVE_CAP"
+}
+
 result_json() {
   local status=${STATUS:-FAIL} json
   json="{\"schema\":\"$SCHEMA\",\"command\":$(json_string "${COMMAND:-}"),\"status\":\"$status\""
@@ -198,7 +261,8 @@ result_json() {
   json="$json,\"controller_id\":$(json_string "$CONTROLLER_ID"),\"dry_run\":$DRY_RUN"
   json="$json,\"docker_bin\":$(json_string "$DOCKER_BIN"),\"docker_bin_substituted\":$DOCKER_SUBSTITUTED"
   json="$json,\"protocol_simulation\":$DOCKER_SUBSTITUTED,\"request\":$REQUEST_JSON"
-  json="$json,\"jq_bin\":$(json_string "$JQ_BIN"),\"engine\":$ENGINE_JSON"
+  json="$json,\"jq_bin\":$(json_string "$JQ_BIN"),\"engine\":$ENGINE_JSON,\"binding\":$BINDING_JSON"
+  json="$json,\"limits\":$(limits_json)"
   json="$json,\"runtime_evidence\":$RUNTIME_EVIDENCE_JSON,\"recipe\":$RECIPE_JSON"
   json="$json,\"candidate\":$CANDIDATE_JSON,\"container\":$CONTAINER_JSON,\"attested\":$ATTESTED_JSON"
   json="$json,\"worker\":$WORKER_JSON,\"cleanup\":$CLEANUP_JSON,\"claims\":$CLAIMS_JSON}"
@@ -237,18 +301,30 @@ private_dir() {
   [ -z "$(find "$d" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) -print)" ]
 }
 
+# file_identity PATH: device:inode:mode:owner, without following a link.
+file_identity() {
+  case "$STAT_STYLE" in
+    gnu) /usr/bin/stat -c '%d:%i:%f:%u' -- "$1" ;;
+    bsd) /usr/bin/stat -f '%d:%i:%p:%u' "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Pin the socket and its directory; every later mutation checks both again.
 validate_socket() {
-  local parent
   is_abs "$SOCK" || stop NOT_RUN unit_engine_unavailable "--engine-socket must be an absolute path"
   if [ -L "$SOCK" ] || [ ! -S "$SOCK" ] || [ ! -O "$SOCK" ]; then
     stop NOT_RUN unit_engine_unavailable "engine socket is missing, a link, not a socket or not owned by this user"
   fi
-  parent=$(dirname "$SOCK")
-  private_dir "$parent" || stop NOT_RUN unit_engine_unavailable "engine socket directory is not a private canonical directory"
+  SOCK_PARENT=$(dirname "$SOCK")
+  private_dir "$SOCK_PARENT" || stop NOT_RUN unit_engine_unavailable "engine socket directory is not a private canonical directory"
+  SOCK_FID=$(file_identity "$SOCK" 2>/dev/null) || SOCK_FID=""
+  PARENT_FID=$(file_identity "$SOCK_PARENT" 2>/dev/null) || PARENT_FID=""
+  [ -n "$SOCK_FID" ] && [ -n "$PARENT_FID" ] || stop NOT_RUN unit_engine_unavailable "the engine socket identity cannot be read"
 }
 
 select_binaries() {
-  local candidate
+  local candidate tool
   if [ -n "$DOCKER_BIN" ]; then
     DOCKER_SUBSTITUTED=true
   else
@@ -264,9 +340,32 @@ select_binaries() {
     stop NOT_RUN prerequisite_missing "jq is required at an explicit absolute path"
   fi
   JQ_READY=1
-  if [ ! -x "$GIT_BIN" ]; then
-    stop NOT_RUN prerequisite_missing "git is required at $GIT_BIN"
+  for tool in "$GIT_BIN" /usr/bin/mkfifo /usr/bin/head /usr/bin/stat /bin/sleep; do
+    [ -x "$tool" ] || stop NOT_RUN prerequisite_missing "$tool is required"
+  done
+  if /usr/bin/stat -c '%i' / >/dev/null 2>&1; then
+    STAT_STYLE=gnu
+  elif /usr/bin/stat -f '%i' / >/dev/null 2>&1; then
+    STAT_STYLE=bsd
+  else
+    stop NOT_RUN prerequisite_missing "stat cannot report file identities"
   fi
+  job_control_probe
+}
+
+# Bounded jobs need bash job control to give each job its own process group.
+job_control_probe() {
+  local probe
+  set -m
+  /bin/sleep 30 &
+  probe=$!
+  set +m
+  if kill -0 -- "-$probe" 2>/dev/null; then
+    bj_end "$probe" && wait "$probe" 2>/dev/null || true
+    return 0
+  fi
+  kill -s KILL "$probe" 2>/dev/null || true
+  stop NOT_RUN prerequisite_missing "bash job control cannot give a job its own process group"
 }
 
 prepare_new_evidence_dir() {
@@ -290,6 +389,12 @@ existing_lease_dir() {
   [ -f "$DIR/lease.json" ] && [ ! -L "$DIR/lease.json" ] || stop REFUSED evidence_dir_refused "--evidence-dir holds no lease.json"
 }
 
+# One private job directory per invocation: FIFOs, markers and reused slots.
+prepare_jobs_dir() {
+  JOBS="$DIR/jobs.$$"
+  mkdir -m 700 "$JOBS" 2>/dev/null || stop NOT_RUN prerequisite_missing "a private job directory could not be created"
+}
+
 random_hex() {
   od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'
 }
@@ -311,6 +416,199 @@ sha256_file() {
 
 json_equal() {
   "$JQ_BIN" -en --argjson a "$1" --argjson b "$2" '$a == $b' >/dev/null 2>&1
+}
+
+# first_line FILE: the first line of a small slot file ("" when unreadable).
+first_line() {
+  local line=""
+  IFS= read -r line 2>/dev/null < "$1" || true
+  printf '%s' "$line"
+}
+
+# ── Bounded jobs ─────────────────────────────────────────────────────────────
+#
+# bjob LIMIT OUT OUTCAP ERR ERRCAP IN -- CMD...: run CMD (a command or shell
+# function) as a background job of this shell in its own process group. It is
+# always called directly, never under $(...) or in a pipeline, so this shell
+# owns the group, the cancellation and the outcome. CMD's stdout and stderr
+# are FIFOs read by two collector jobs (each in its own group) that keep at
+# most CAP+1 bytes in OUT or ERR, a CAP+1-byte file marking overflow, then
+# drain and discard. This shell holds a read end of each FIFO until the call
+# is over, so CMD never meets a closed or full-and-abandoned pipe and no
+# file-size limit applies to it. The call ends when CMD finishes, when LIMIT
+# or the phase deadline passes, on overflow or a failed write, or (outside
+# cleanup) on a signal; every early end is SIGKILL to CMD's group, never a
+# catchable signal, so an attached client cannot forward anything. A group is
+# signalled only while it is observed to exist and before its leader is
+# waited for; a group not confirmed gone within KILL_GRACE is quarantined.
+# Sets BJ_STATE (done, timeout, deadline, overflow, capture_failed,
+# cancelled, unconfirmed) and BJ_RC (CMD's status when done); returns 0 only
+# for done with status 0.
+bjob() {
+  local limit=$1 out=$2 outcap=$3 err=$4 errcap=$5 in=$6 hard end base pid="" opid epid
+  local state="" step steps="0.01 0.02 0.05 0.1" c opened_by
+  shift 7
+  BJ_STATE=""
+  BJ_RC=""
+  if [ "$PHASE" = cleanup ]; then hard=$CLEANUP_DEADLINE; else hard=$MAIN_DEADLINE; fi
+  if [ "$PHASE" != cleanup ] && [ -n "$INTERRUPTED" ]; then BJ_STATE=cancelled; return 1; fi
+  if [ "$SECONDS" -ge "$hard" ]; then BJ_STATE=deadline; return 1; fi
+  end=$((SECONDS + limit))
+  [ "$end" -le "$hard" ] || end=$hard
+  JOB_SEQ=$((JOB_SEQ + 1))
+  base="$JOBS/$JOB_SEQ"
+  if ! /usr/bin/mkfifo -m 600 "$base.out" "$base.err" 2>/dev/null; then BJ_STATE=capture_failed; return 1; fi
+  # Temporary write ends let the collectors and anchors open without blocking.
+  if ! exec 5<>"$base.out" 6<>"$base.err"; then
+    rm -f "$base.out" "$base.err"
+    BJ_STATE=capture_failed
+    return 1
+  fi
+  # Job control is on only while launching, so no foreground command runs with it.
+  set -m
+  bj_collect "$base.out" "$out" "$outcap" "$base.oopen" "$base.oflow" "$base.ofail" &
+  opid=$!
+  bj_collect "$base.err" "$err" "$errcap" "$base.eopen" "$base.eflow" "$base.efail" &
+  epid=$!
+  set +m
+  # Both collectors hold their FIFO open before the client may write or exit.
+  opened_by=$((SECONDS + KILL_GRACE))
+  until [ -e "$base.oopen" ] && [ -e "$base.eopen" ]; do
+    if [ "$SECONDS" -ge "$opened_by" ]; then state=capture_failed; break; fi
+    /bin/sleep 0.01
+  done
+  if [ -z "$state" ] && exec 7<"$base.out" 8<"$base.err"; then
+    set -m
+    bj_client "$base.rc" "$in" "$base.out" "$base.err" "$@" &
+    pid=$!
+    set +m
+  else
+    state=capture_failed
+  fi
+  exec 5>&- 6>&-
+  while [ -z "$state" ]; do
+    if [ -s "$base.rc" ]; then state=done; break; fi
+    if [ -e "$base.oflow" ] || [ -e "$base.eflow" ]; then state=overflow; break; fi
+    if [ -e "$base.ofail" ] || [ -e "$base.efail" ]; then state=capture_failed; break; fi
+    if [ "$PHASE" != cleanup ] && [ -n "$INTERRUPTED" ]; then state=cancelled; break; fi
+    if [ "$SECONDS" -ge "$end" ]; then
+      if [ "$end" -ge "$hard" ]; then state=deadline; else state=timeout; fi
+      break
+    fi
+    case "$steps" in *" "*) step=${steps%% *}; steps=${steps#* } ;; *) step=$steps ;; esac
+    /bin/sleep "$step"
+  done
+  # The client group goes first; its collectors drain until it is gone.
+  if [ -n "$pid" ]; then
+    if bj_end "$pid"; then
+      wait "$pid" 2>/dev/null || true
+    else
+      quarantine client "pgid:$pid" client_unconfirmed
+      state=unconfirmed
+    fi
+  fi
+  for c in "$opid" "$epid"; do
+    if bj_join "$c" "$KILL_GRACE" || bj_end "$c"; then
+      wait "$c" 2>/dev/null || true
+    else
+      quarantine client "pgid:$c" client_unconfirmed
+      state=unconfirmed
+    fi
+  done
+  exec 7<&- 8<&-
+  if [ "$state" != unconfirmed ]; then
+    if [ -e "$base.ofail" ] || [ -e "$base.efail" ]; then
+      state=capture_failed
+    elif [ -e "$base.oflow" ] || [ -e "$base.eflow" ]; then
+      state=overflow
+    fi
+  fi
+  if [ "$state" = done ]; then BJ_RC=$(first_line "$base.rc"); fi
+  rm -f "$base.out" "$base.err" "$base.rc" "$base.oopen" "$base.oflow" "$base.ofail" \
+    "$base.eopen" "$base.eflow" "$base.efail"
+  BJ_STATE=$state
+  [ "$state" = done ] && [ "$BJ_RC" = 0 ]
+}
+
+bj_client() {
+  local rc_file=$1 in=$2 out=$3 err=$4
+  shift 4
+  exec 5>&- 6>&- 7<&- 8<&-
+  set +e
+  "$@" < "$in" > "$out" 2> "$err"
+  printf '%s\n' "$?" > "$rc_file"
+}
+
+# A hard-bounded writer: OPENED marks the FIFO open, at most CAP+1 bytes
+# reach DATA, then the rest is read and discarded until every writer has
+# closed the FIFO.
+bj_collect() {
+  local fifo=$1 data=$2 n=$(($3 + 1)) opened=$4 flow=$5 fail=$6 size
+  exec 5>&- 6>&- 7<&- 8<&-
+  set +e
+  {
+    : > "$opened"
+    /usr/bin/head -c "$n" > "$data" || : > "$fail"
+    size=$(wc -c < "$data" 2>/dev/null) || size=0
+    size=${size// /}
+    [ "${size:-0}" -lt "$n" ] || : > "$flow"
+    cat > /dev/null
+  } < "$fifo"
+}
+
+# bj_join PGID SECONDS: 0 once the group has no members, 1 if it outlives SECONDS.
+bj_join() {
+  local until=$((SECONDS + $2))
+  while kill -0 -- "-$1" 2>/dev/null; do
+    [ "$SECONDS" -lt "$until" ] || return 1
+    /bin/sleep 0.01
+  done
+}
+
+# bj_end PGID: SIGKILL the group if it still exists, then confirm it is gone.
+bj_end() {
+  if kill -0 -- "-$1" 2>/dev/null; then kill -s KILL -- "-$1" 2>/dev/null || true; fi
+  bj_join "$1" "$KILL_GRACE"
+}
+
+# bj_code [STATE]: the reason code for a bounded-call state (default BJ_STATE).
+bj_code() {
+  case "${1:-$BJ_STATE}" in
+    timeout) echo client_timeout ;;
+    deadline) echo operation_deadline ;;
+    overflow) echo output_overflow ;;
+    capture_failed) echo capture_failed ;;
+    cancelled) echo interrupted ;;
+    unconfirmed) echo client_unconfirmed ;;
+    *) echo controller_error ;;
+  esac
+}
+
+# require_done WHAT: a bounded call that did not finish fails with its own code.
+require_done() {
+  if [ "$BJ_STATE" != done ]; then
+    cat "$JOBS/stderr" > "$DIR/failed-call.stderr" 2>/dev/null || true
+    stop FAIL "$(bj_code)" "$1 did not complete ($BJ_STATE)"
+  fi
+}
+
+# fail_call CODE DETAIL: stop after a failed bounded call.
+fail_call() {
+  require_done "$2"
+  cat "$JOBS/stderr" > "$DIR/failed-call.stderr" 2>/dev/null || true
+  stop FAIL "$1" "$2"
+}
+
+# local_job FN ARGS...: a local helper phase (git, tar, hashing) as one bounded job.
+local_job() {
+  bjob "$LOCAL_LIMIT" "$JOBS/out" "$CTL_CAP" "$JOBS/stderr" "$CTL_CAP" /dev/null -- "$@"
+}
+
+begin_cleanup() {
+  if [ "$PHASE" != cleanup ]; then
+    PHASE=cleanup
+    CLEANUP_DEADLINE=$((SECONDS + CLEANUP_BUDGET))
+  fi
 }
 
 # ── Git: plumbing on recorded objects only ───────────────────────────────────
@@ -340,21 +638,34 @@ safe_rel_path() {
 }
 
 # materialize_tree COMMIT DEST [PATH...]: write the committed tree, or only
-# the named paths, from raw blobs into the new directory DEST. Directories
-# end 0755 and files 0644 or 0755; links are created last, each under a
-# canonical parent, so nothing is written through a link. A gitlink, an
-# unsupported mode, an unsafe, duplicate or case-colliding path, or a link
-# target that does not round-trip makes it fail.
+# the named paths, from raw blobs into the new directory DEST. The listing is
+# bounded (MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_ENTRIES) before anything is
+# written, and DEST.bound receives the archive bound for that tree.
+# Directories end 0755 and files 0644 or 0755; links are created last, each
+# under a canonical parent, so nothing is written through a link. Returns 2
+# when the tree exceeds the bound and 1 for a gitlink, an unsupported mode, an
+# unsafe, duplicate or case-colliding path, or a link target that does not
+# round-trip.
 materialize_tree() {
-  local commit=$1 dest=$2 canon entry meta rest mode type oid path parent target size i
-  local links link_oids execs
+  local commit=$1 dest=$2 canon entry meta rest mode type oid size path parent target i
+  local total=0 count=0 bound=1048576 links link_oids execs
   links=()
   link_oids=()
   execs=()
   shift 2
   mkdir -m 700 "$dest" || return 1
   canon=$(cd "$dest" && pwd -P) || return 1
-  git_plumb ls-tree -r -z --full-tree "$commit" -- "$@" > "$dest.lst" 2>/dev/null || return 1
+  git_plumb ls-tree -r -z -l --full-tree "$commit" -- ${1+"$@"} > "$dest.lst" 2>/dev/null || return 1
+  while IFS= read -r -d '' entry; do
+    meta=${entry%%$'\t'*}
+    size=${meta##* }
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    total=$((total + size))
+    count=$((count + 1))
+    bound=$((bound + 3072 + (size + 511) / 512 * 512))
+  done < "$dest.lst"
+  [ "$total" -le "$MAX_SNAPSHOT_BYTES" ] && [ "$count" -le "$MAX_SNAPSHOT_ENTRIES" ] || return 2
+  printf '%s\n' "$bound" > "$dest.bound" || return 1
   : > "$dest.paths"
   while IFS= read -r -d '' entry; do
     meta=${entry%%$'\t'*}
@@ -362,7 +673,8 @@ materialize_tree() {
     mode=${meta%% *}
     rest=${meta#* }
     type=${rest%% *}
-    oid=${rest#* }
+    rest=${rest#* }
+    oid=${rest%% *}
     matches "$oid" "$HEX40_RE" || return 1
     safe_rel_path "$path" || return 1
     printf './%s\n' "$path" >> "$dest.paths"
@@ -409,7 +721,7 @@ recipe_inputs() {
   set --
   for p in $RECIPE_PATHS; do
     [ -f "$root/$p" ] && [ ! -L "$root/$p" ] || return 1
-    set -- "$@" "$p" "$(sha256_file "$root/$p")"
+    set -- ${1+"$@"} "$p" "$(sha256_file "$root/$p")"
   done
   "$JQ_BIN" -cn 'reduce range(0; $ARGS.positional | length; 2) as $i
     ({}; . + {($ARGS.positional[$i]): $ARGS.positional[$i + 1]})' --args -- "$@"
@@ -424,11 +736,112 @@ tar_create() {
   ( cd "$1" && env -i PATH=/usr/bin:/bin COPYFILE_DISABLE=1 tar ${opts[@]+"${opts[@]}"} -cf "$2" . )
 }
 
+# Tree manifest that never follows links: one line per directory, link
+# (with its target text) and regular file (with its SHA-256). The unit's
+# /src/.venv link is the only expected extra entry and is left out.
+tree_manifest() {
+  local root=$1 hasher=/usr/bin/sha256sum
+  if [ -x /usr/bin/shasum ]; then hasher="/usr/bin/shasum -a 256"; fi
+  (
+    cd "$root"
+    find . -mindepth 1 ! -path './.venv' -type d -print | sed 's/^/D /'
+    find . -mindepth 1 ! -path './.venv' -type l -print | while IFS= read -r p; do
+      printf 'L %s %s\n' "$p" "$(readlink "$p")"
+    done
+    # shellcheck disable=SC2086
+    find . -mindepth 1 -type f -exec $hasher {} + | awk '{ h = $1; sub(/^[0-9a-f]+  /, ""); print "F " $0 " " h }'
+  ) | sort
+}
+
+# ── Local jobs: run under bjob, report through files and their status ──────
+
+# 0 ok; 40 no HEAD; 41 no tree; 42 recipe unreadable; 43 recipe file missing
+# or not regular; 44 dirty; 45 result unwritable.
+job_build_recipe() {
+  local recipe tree inputs current
+  recipe=$(git_plumb rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || return 40
+  matches "$recipe" "$HEX40_RE" || return 40
+  tree=$(git_plumb rev-parse --verify "$recipe^{tree}" 2>/dev/null) || return 41
+  matches "$tree" "$HEX40_RE" || return 41
+  # shellcheck disable=SC2086
+  materialize_tree "$recipe" "$DIR/context" $RECIPE_PATHS || return 42
+  inputs=$(recipe_inputs "$DIR/context") || return 43
+  current=$(recipe_inputs "$REPO") || return 43
+  json_equal "$inputs" "$current" || return 44
+  printf '%s\n' "$recipe" > "$DIR/recipe.commit" || return 45
+  printf '%s\n' "$tree" > "$DIR/recipe.tree" || return 45
+  printf '%s\n' "$inputs" > "$DIR/recipe.inputs.json" || return 45
+}
+
+# 0 ok; 20 candidate not a commit; 21 no tree; 22 invalid tree; 23 over the
+# snapshot bound; 24 archive failed; 30-34 evidence recipe binding failures.
+job_run_static() {
+  local tree ev_commit inputs current rc=0 bound size
+  [ "$(git_plumb cat-file -t "$CANDIDATE" 2>/dev/null)" = commit ] || return 20
+  tree=$(git_plumb rev-parse --verify "$CANDIDATE^{tree}" 2>/dev/null) || return 21
+  matches "$tree" "$HEX40_RE" || return 21
+  printf '%s\n' "$tree" > "$DIR/candidate.tree" || return 24
+  ev_commit=$(ev_raw .recipe.commit) || return 30
+  [ "$(git_plumb cat-file -t "$ev_commit" 2>/dev/null)" = commit ] || return 30
+  [ "$(git_plumb rev-parse --verify "$ev_commit^{tree}" 2>/dev/null)" = "$(ev_raw .recipe.tree)" ] || return 31
+  # shellcheck disable=SC2086
+  materialize_tree "$ev_commit" "$DIR/recipe" $RECIPE_PATHS || return 32
+  inputs=$(recipe_inputs "$DIR/recipe") || return 32
+  json_equal "$inputs" "$(ev .recipe.inputs)" || return 33
+  current=$(recipe_inputs "$REPO") || return 34
+  json_equal "$current" "$(ev .recipe.inputs)" || return 34
+  materialize_tree "$CANDIDATE" "$DIR/src-expected" || rc=$?
+  case "$rc" in 0) ;; 2) return 23 ;; *) return 22 ;; esac
+  tar_create "$DIR/src-expected" "$DIR/candidate.tar" || return 24
+  bound=$(first_line "$DIR/src-expected.bound")
+  size=$(wc -c < "$DIR/candidate.tar" | tr -d ' ') || return 24
+  [ -n "$bound" ] && [ "$size" -le "$bound" ] || return 24
+  sha256_file "$DIR/candidate.tar" > "$DIR/candidate.sha" || return 24
+  tree_manifest "$DIR/src-expected" > "$DIR/src-expected.manifest" || return 24
+}
+
+# job_freeze_digest TAR DEST OUT: 0 when TAR holds a regular freeze.txt.
+job_freeze_digest() {
+  mkdir -m 700 "$2" || return 1
+  tar -xf "$1" -C "$2" 2>/dev/null || return 1
+  [ -f "$2/freeze.txt" ] && [ ! -L "$2/freeze.txt" ] || return 1
+  sha256_file "$2/freeze.txt" > "$3"
+}
+
+# 0 same tree; 1 differs; 2 unreadable.
+job_verify_readback() {
+  mkdir -m 700 "$DIR/src-actual" || return 2
+  tar -xf "$DIR/src-actual.tar" -C "$DIR/src-actual" 2>/dev/null || return 2
+  [ -d "$DIR/src-actual/src" ] || return 2
+  tree_manifest "$DIR/src-actual/src" > "$DIR/src-actual.manifest" || return 2
+  cmp -s "$DIR/src-expected.manifest" "$DIR/src-actual.manifest" || return 1
+}
+
 # ── Engine access ─────────────────────────────────────────────────────────────
 
 dk() {
   env -i PATH=/usr/bin:/bin HOME="$DIR/home" DOCKER_CONFIG="$DIR/docker-config" TMPDIR="$DIR/tmp" \
     "$DOCKER_BIN" --host "unix://$SOCK" "$@"
+}
+
+# dkb LIMIT OUT OUTCAP IN -- ARGS: one bounded docker call; stderr goes to the
+# reused $JOBS/stderr slot with the control cap.
+dkb() {
+  local limit=$1 out=$2 cap=$3 in=$4
+  shift 5
+  bjob "$limit" "$out" "$cap" "$JOBS/stderr" "$CTL_CAP" "$in" -- dk "$@"
+}
+
+# dk_ctl ARGS: a small control call; its stdout lands in the $JOBS/out slot.
+dk_ctl() {
+  dkb "$CTL_LIMIT" "$JOBS/out" "$CTL_CAP" /dev/null -- "$@"
+}
+
+# inspect_to FILE ARGS: a bounded read-only call with the inspect cap.
+inspect_to() {
+  local out=$1
+  shift
+  dkb "$CTL_LIMIT" "$out" "$INSPECT_CAP" /dev/null -- "$@"
 }
 
 plan() {
@@ -440,31 +853,41 @@ plan() {
 }
 
 engine_identity() {
-  local info
-  if ! info=$(dk info --format '{{json .}}' 2>"$DIR/engine.stderr"); then
+  if ! inspect_to "$JOBS/info.json" info --format '{{json .}}'; then
+    require_done "docker info"
     stop NOT_RUN unit_engine_unavailable "the engine at --engine-socket did not answer docker info"
   fi
-  ENGINE_ID=$(printf '%s' "$info" | "$JQ_BIN" -r 'if type == "object" then (.ID // "") else "" end' 2>/dev/null || true)
+  ENGINE_ID=$("$JQ_BIN" -r 'if type == "object" then (.ID // "") else "" end' "$JOBS/info.json" 2>/dev/null || true)
   [ -n "$ENGINE_ID" ] || stop NOT_RUN unit_engine_unavailable "docker info returned no engine identity"
-  ENGINE_JSON=$(printf '%s' "$info" | "$JQ_BIN" -c '{id: .ID, server_version: .ServerVersion, operating_system: .OperatingSystem}')
+  ENGINE_JSON=$("$JQ_BIN" -c '{id: .ID, server_version: .ServerVersion, operating_system: .OperatingSystem}' "$JOBS/info.json")
+  [ -n "$BOUND_ENGINE" ] || BOUND_ENGINE=$ENGINE_ID
+  BINDING_JSON="{\"socket_identity\":$(json_string "$SOCK_FID"),\"parent_identity\":$(json_string "$PARENT_FID")"
+  BINDING_JSON="$BINDING_JSON,\"engine_id\":$(json_string "$BOUND_ENGINE")}"
 }
 
-# True only while the live engine is the one the lease was taken on.
-engine_unchanged() {
-  local info now leased
-  leased=$("$JQ_BIN" -r '.engine_id // ""' "$DIR/lease.json" 2>/dev/null) || return 1
-  info=$(dk info --format '{{json .}}' 2>/dev/null) || return 1
-  now=$(printf '%s' "$info" | "$JQ_BIN" -r '.ID // ""' 2>/dev/null) || return 1
-  [ -n "$now" ] && [ -n "$leased" ] && [ "$now" = "$leased" ]
+# binding_ok: the socket and its directory are still the pinned objects and
+# the engine behind them reports the bound identity. Never stops.
+binding_ok() {
+  [ -S "$SOCK" ] && [ ! -L "$SOCK" ] && [ -O "$SOCK" ] || return 1
+  [ "$(file_identity "$SOCK" 2>/dev/null)" = "$SOCK_FID" ] || return 1
+  [ "$(file_identity "$SOCK_PARENT" 2>/dev/null)" = "$PARENT_FID" ] || return 1
+  [ -n "$BOUND_ENGINE" ] || return 1
+  dk_ctl info --format '{{.ID}}' || return 1
+  [ "$(first_line "$JOBS/out")" = "$BOUND_ENGINE" ]
+}
+
+# bound_or_stop WHAT: no mutation without the pinned socket and engine.
+bound_or_stop() {
+  binding_ok || stop FAIL engine_binding_lost "the engine socket or identity could not be confirmed before $1; nothing more was changed"
 }
 
 # absent KIND REF: 0 when the engine explicitly reports no such object,
 # 1 when it exists, 2 when the answer is anything else (unknown is not absent).
 absent() {
-  if dk "$1" inspect --format '{{.Id}}' "$2" >/dev/null 2>"$DIR/absent.err"; then
-    return 1
-  fi
-  if grep -qi 'no such' "$DIR/absent.err"; then
+  dk_ctl "$1" inspect --format '{{.Id}}' "$2" || true
+  [ "$BJ_STATE" = done ] || return 2
+  [ "$BJ_RC" != 0 ] || return 1
+  if grep -qi 'no such' "$JOBS/stderr"; then
     return 0
   fi
   return 2
@@ -477,7 +900,10 @@ reserve() {
   case "$rc" in
     0) ;;
     1) stop FAIL resource_conflict "a $1 named $2 already exists and was left untouched" ;;
-    *) stop FAIL engine_state_unknown "the engine did not confirm that $2 is free; nothing was created" ;;
+    *)
+      require_done "the reservation check for $2"
+      stop FAIL engine_state_unknown "the engine did not confirm that $2 is free; nothing was created"
+      ;;
   esac
 }
 
@@ -498,11 +924,11 @@ IMAGE_CONFIG_FAILURES_JQ='[
   (if .WorkingDir == "/src" then empty else "workdir" end)
 ]'
 
-# image_runtime IMAGE_JSON: prints the normalized config; fails (with the
+# image_runtime IMAGE_JSON_FILE: prints the normalized config; fails (with the
 # reasons on stderr) when it holds implicit volumes or unapproved settings.
 image_runtime() {
   local config failures
-  config=$(printf '%s' "$1" | "$JQ_BIN" -c "$RUNTIME_CONFIG_JQ") || return 1
+  config=$("$JQ_BIN" -c "$RUNTIME_CONFIG_JQ" "$1") || return 1
   failures=$(printf '%s' "$config" | "$JQ_BIN" -c "$IMAGE_CONFIG_FAILURES_JQ") || return 1
   if [ "$failures" != "[]" ]; then
     printf '%s\n' "$failures" >&2
@@ -511,7 +937,8 @@ image_runtime() {
   printf '%s\n' "$config"
 }
 
-# A never-started probe container: created, not running, no network or mounts.
+# A never-started probe container: created, not running, no network, daemon
+# logging or mounts.
 probe_failures() {
   "$JQ_BIN" -c --arg image "$1" '
     def none: . == null or . == [] or . == {};
@@ -522,12 +949,22 @@ probe_failures() {
       (if $c.Config.Cmd == ["/bin/true"] then empty else "cmd" end),
       (if ($c.Config.Entrypoint | none) then empty else "entrypoint" end),
       (if $c.HostConfig.NetworkMode == "none" then empty else "network" end),
+      (if ($c.HostConfig.LogConfig.Type // "") == "none" then empty else "log_driver" end),
       (if $c.HostConfig.Privileged == false then empty else "privileged" end),
       (if ($c.Mounts | none) and ($c.HostConfig.Binds | none) and ($c.HostConfig.Mounts | none)
           and ($c.HostConfig.VolumesFrom | none) and ($c.Config.Volumes | none)
          then empty else "mounts" end),
       (if ($c.HostConfig.Devices | none) then empty else "devices" end)
-    ]'
+    ]' "$2"
+}
+
+# admit_probe ID IMAGE WHAT: inspect a just-created probe before it is used.
+admit_probe() {
+  local failures
+  inspect_to "$JOBS/probe.json" container inspect --format '{{json .}}' "$1" \
+    || fail_call probe_admission_failed "the $3 container cannot be inspected"
+  failures=$(probe_failures "$2" "$JOBS/probe.json") || failures='["inspect_unreadable"]'
+  [ "$failures" = "[]" ] || stop FAIL probe_admission_failed "the $3 container is not a never-started, network-less container"
 }
 
 # ── Lease: the only authority for removal ────────────────────────────────────
@@ -535,7 +972,7 @@ probe_failures() {
 # Every update is written to lease.json.next, validated whole and only then
 # renamed over lease.json, so a failed write keeps the previous valid lease.
 # Callers check each write: no create follows a failed intent, and nothing
-# starts after a failed identity record.
+# starts after a failed identity or start record.
 
 LEASE_SHAPE='
   type == "object" and .schema == $schema and .controller_id == $lcid
@@ -546,7 +983,7 @@ LEASE_SHAPE='
       and (.name | type) == "string"
       and (.name | test("\\Ahermes-f02-(freeze|prep|unit)-" + $lcid + "\\z"))
       and (.id == null or ((.id | type) == "string" and (.id | test("\\A[0-9a-f]{64}\\z"))))
-      and (.removed | type) == "boolean")
+      and (.removed | type) == "boolean" and (.started | type) == "boolean")
   and all(.images[]; type == "object"
       and (.tag | type) == "string"
       and (.tag | test("\\Ahermes-f02-(unit|cand):" + $lcid + "\\z"))
@@ -559,7 +996,7 @@ LEASE_SHAPE='
 lease_valid() {
   local file=$1 check=$2
   shift 2
-  "$JQ_BIN" -e -s "$@" --arg schema "$LEASE_SCHEMA" --arg lcid "$CONTROLLER_ID" \
+  "$JQ_BIN" -e -s ${1+"$@"} --arg schema "$LEASE_SCHEMA" --arg lcid "$CONTROLLER_ID" \
     "length == 1 and (.[0] | (($LEASE_SHAPE) and ($check)))" "$file" >/dev/null 2>&1
 }
 
@@ -589,7 +1026,7 @@ lease_init() {
 }
 
 lease_container_intent() {
-  lease_write '.containers += [{name: $name, id: null, removed: false}]' \
+  lease_write '.containers += [{name: $name, id: null, removed: false, started: false}]' \
     '[.containers[] | select(.name == $name and .id == null and .removed == false)] | length == 1' \
     --arg name "$1"
 }
@@ -598,6 +1035,12 @@ lease_container_id() {
   lease_write '(.containers[] | select(.name == $name and .id == null) | .id) = $id' \
     '[.containers[] | select(.name == $name and .id == $id)] | length == 1' \
     --arg name "$1" --arg id "$2"
+}
+
+lease_container_started() {
+  lease_write '(.containers[] | select(.name == $name) | .started) = true' \
+    '[.containers[] | select(.name == $name and .started)] | length == 1' \
+    --arg name "$1"
 }
 
 lease_image_intent() {
@@ -628,8 +1071,9 @@ lease_mark_removed() {
   fi
 }
 
-# quarantine KIND REF REASON: KIND container, image or lease; REASON
-# unrecorded_identity, unverified_removal, engine_changed or lease_unreadable.
+# quarantine KIND REF REASON: KIND container, image, client or lease; REASON
+# unrecorded_identity, unverified_removal, engine_changed, client_unconfirmed
+# or lease_unreadable.
 quarantine() {
   local obj
   obj="{\"kind\":$(json_string "$1"),\"ref\":$(json_string "$2"),\"reason\":$(json_string "$3")}"
@@ -637,19 +1081,23 @@ quarantine() {
   if [ -n "$QUARANTINE" ]; then QUARANTINE="$QUARANTINE,$obj"; else QUARANTINE=$obj; fi
 }
 
-# create_container NAME ARGS...: reserve the name, publish the intent, create,
-# then publish the exact id the engine returned. Sets CREATED_ID. An unknown
-# reply leaves the intent quarantined; an id that cannot be recorded is
-# quarantined by its exact value and never started or removed.
+# create_container NAME ARGS...: reserve the name, publish the intent, check
+# the binding, create, then publish the exact id the engine returned. Sets
+# CREATED_ID. An unknown or lost reply leaves the intent quarantined; an id
+# that cannot be recorded is quarantined by its exact value and never
+# started or removed.
 create_container() {
-  local name=$1 out id=""
+  local name=$1 id=""
   shift
   CREATED_ID=""
   reserve container "$name"
   lease_container_intent "$name" \
     || stop FAIL journal_unwritable "the container creation intent could not be recorded; nothing was created"
-  if out=$(dk create --name "$name" --label "hermes.f02.controller=$CONTROLLER_ID" "$@" 2>>"$DIR/engine.stderr"); then
-    id=$(printf '%s\n' "$out" | tail -n 1)
+  bound_or_stop "creating $name"
+  if dk_ctl create --name "$name" --label "hermes.f02.controller=$CONTROLLER_ID" "$@"; then
+    id=$(tail -n 1 "$JOBS/out")
+  elif [ "$BJ_STATE" != done ]; then
+    settle FAIL "$(bj_code)" "the create call for $name did not complete ($BJ_STATE)"
   fi
   matches "$id" "$HEX64_RE" \
     || stop FAIL creation_identity_unknown "the engine returned no container id for $name; the intent is quarantined"
@@ -670,22 +1118,25 @@ record_image_identity() {
   fi
 }
 
-# Remove one container by its recorded id; 0 only when the engine confirms it is gone.
+# remove_container ID: 0 removed and confirmed gone, 3 binding lost, 1 otherwise.
 remove_container() {
-  dk container rm -f "$1" >/dev/null 2>>"$DIR/engine.stderr" || true
+  binding_ok || return 3
+  dk_ctl container rm -f "$1" || true
   absent container "$1"
 }
 
-# Remove one recorded tag while it still names the recorded id (never parent
-# images: --no-prune), then confirm the tag and that id are gone. An image
-# that is shared or retagged elsewhere stays and is reported.
+# remove_image_tag TAG ID: remove the tag while it still names the recorded
+# id (never parent images: --no-prune), then confirm the tag and that id are
+# gone. A shared or retagged image stays and is reported. Returns as
+# remove_container.
 remove_image_tag() {
-  local tag=$1 id=$2 now rc=0
+  local tag=$1 id=$2 rc=0
   absent image "$tag" || rc=$?
   if [ "$rc" -eq 1 ]; then
-    now=$(dk image inspect --format '{{.Id}}' "$tag" 2>/dev/null) || return 1
-    [ "$now" = "$id" ] || return 1
-    dk image rm --no-prune "$tag" >/dev/null 2>>"$DIR/engine.stderr" || true
+    inspect_to "$JOBS/out" image inspect --format '{{.Id}}' "$tag" || return 1
+    [ "$(first_line "$JOBS/out")" = "$id" ] || return 1
+    binding_ok || return 3
+    dk_ctl image rm --no-prune "$tag" || true
     absent image "$tag" || return 1
   elif [ "$rc" -ne 0 ]; then
     return 1
@@ -695,8 +1146,30 @@ remove_image_tag() {
 
 # dispose_container NAME ID WHAT: remove a probe now; the lease retries at exit.
 dispose_container() {
-  remove_container "$2" || stop FAIL unit_cleanup_unverified "the $3 container could not be verified removed"
+  local rc=0
+  remove_container "$2" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) stop FAIL engine_binding_lost "the engine binding was lost before removing the $3 container" ;;
+    *) stop FAIL unit_cleanup_unverified "the $3 container could not be verified removed" ;;
+  esac
   lease_mark_removed container "$1" || stop FAIL journal_unwritable "a verified removal could not be recorded in the lease"
+}
+
+# settle_unit: a finished or killed attach client proves nothing about the
+# daemon. Inspect the unit; if it may still run, re-check the binding, kill
+# it and inspect again. 0 only when a fresh inspection shows it not running.
+# Never stops.
+settle_unit() {
+  [ -n "$UNIT_CID" ] || return 0
+  if inspect_to "$DIR/inspect-exited.json" container inspect --format '{{json .}}' "$UNIT_CID" \
+      && "$JQ_BIN" -e '.State.Running == false' "$DIR/inspect-exited.json" >/dev/null 2>&1; then
+    return 0
+  fi
+  binding_ok || return 1
+  dk_ctl container kill "$UNIT_CID" || true
+  inspect_to "$DIR/inspect-exited.json" container inspect --format '{{json .}}' "$UNIT_CID" || return 1
+  "$JQ_BIN" -e '.State.Running == false' "$DIR/inspect-exited.json" >/dev/null 2>&1
 }
 
 finish_cleanup() {
@@ -706,40 +1179,43 @@ finish_cleanup() {
   [ "$verified" = true ] || settle FAIL unit_cleanup_unverified "recorded resources could not be verified removed; see quarantine"
 }
 
+# Remove what the lease recorded, within the fixed cleanup budget. Every
+# removal re-checks the binding; once it is lost nothing more is touched.
+# Never stops and never starts another cleanup.
 CLEANED=0
 cleanup_lease() {
   [ "$CLEANED" -eq 0 ] || return 0
   CLEANED=1
   [ -f "$DIR/lease.json" ] || return 0
-  local containers_ok=true images_ok=true entries kind name id
+  begin_cleanup
+  local containers_ok=true images_ok=true lost=false entries name id started rc
   if ! lease_valid "$DIR/lease.json" true; then
     quarantine lease lease.json lease_unreadable
     finish_cleanup false false
     return 0
   fi
-  if ! engine_unchanged; then
-    entries=$("$JQ_BIN" -r '(.containers[] | select(.removed | not) | "container \(.id // .name)"),
-      (.images[] | select((.removed or .keep) | not) | "image \(.tag)")' "$DIR/lease.json")
-    while read -r kind name; do
-      if [ -n "$kind" ]; then quarantine "$kind" "$name" engine_changed; fi
-    done <<EOF
-$entries
-EOF
-    finish_cleanup false false
-    settle FAIL engine_identity_changed "the engine identity changed or is unreachable; nothing was removed"
-    return 0
-  fi
-  entries=$("$JQ_BIN" -r '.containers[] | select(.removed | not) | "\(.name) \(.id // "null")"' "$DIR/lease.json")
-  while read -r name id; do
+  entries=$("$JQ_BIN" -r '.containers[] | select(.removed | not) | "\(.name) \(.id // "null") \(.started)"' "$DIR/lease.json")
+  while read -r name id started; do
     [ -n "$name" ] || continue
+    rc=1
     if ! matches "$id" "$HEX64_RE"; then
       quarantine container "$name" unrecorded_identity
-      containers_ok=false
-    elif remove_container "$id"; then
-      lease_mark_removed container "$name" || settle FAIL journal_unwritable "a verified removal could not be recorded in the lease"
+    elif [ "$lost" = true ]; then
+      quarantine container "$id" engine_changed
     else
-      quarantine container "$id" unverified_removal
+      rc=0
+      remove_container "$id" || rc=$?
+      case "$rc" in
+        0) lease_mark_removed container "$name" || settle FAIL journal_unwritable "a verified removal could not be recorded in the lease" ;;
+        3) lost=true; quarantine container "$id" engine_changed ;;
+        *) quarantine container "$id" unverified_removal ;;
+      esac
+    fi
+    if [ "$rc" -ne 0 ]; then
       containers_ok=false
+      if [ "$started" = true ]; then
+        settle FAIL unit_disposal_unverified "a started unit could not be confirmed stopped and removed; it stays quarantined"
+      fi
     fi
   done <<EOF
 $entries
@@ -750,34 +1226,43 @@ EOF
     if ! matches "$id" "$IMAGE_ID_RE"; then
       quarantine image "$name" unrecorded_identity
       images_ok=false
-    elif remove_image_tag "$name" "$id"; then
-      lease_mark_removed image "$name" || settle FAIL journal_unwritable "a verified removal could not be recorded in the lease"
-    else
-      quarantine image "$name" unverified_removal
+    elif [ "$lost" = true ]; then
+      quarantine image "$name" engine_changed
       images_ok=false
+    else
+      rc=0
+      remove_image_tag "$name" "$id" || rc=$?
+      case "$rc" in
+        0) lease_mark_removed image "$name" || settle FAIL journal_unwritable "a verified removal could not be recorded in the lease" ;;
+        3) lost=true; quarantine image "$name" engine_changed; images_ok=false ;;
+        *) quarantine image "$name" unverified_removal; images_ok=false ;;
+      esac
     fi
   done <<EOF
 $entries
 EOF
+  if [ "$lost" = true ]; then
+    settle FAIL engine_binding_lost "the engine socket or identity changed during cleanup; the rest was left untouched"
+  fi
   finish_cleanup "$containers_ok" "$images_ok"
 }
 
+# Signal handlers only record; the bounded loops act on it.
 on_signal() {
-  INTERRUPTED=$1
-  if [ -n "$UNIT_CID" ]; then
-    dk container kill "$UNIT_CID" >/dev/null 2>&1 || true
-  fi
+  INTERRUPTED=${INTERRUPTED:-$1}
 }
 
 check_interrupt() {
   [ -z "$INTERRUPTED" ] || stop FAIL interrupted "signal $INTERRUPTED received"
 }
 
-# Every exit: settle unexpected failures, remove what the lease recorded (only
-# once an engine identity is known), then emit exactly one result.
+# Every exit: settle unexpected failures, then within the fixed cleanup
+# budget settle a started unit and remove what the lease recorded (only once
+# an engine identity is known), then emit exactly one result.
 on_exit() {
   local rc=$?
-  trap - EXIT INT TERM
+  set +e
+  trap - EXIT
   if [ "$EMITTED" -eq 0 ]; then
     if [ "$rc" -ne 0 ]; then
       settle FAIL controller_error "the controller stopped unexpectedly near line ${ERR_LINE:-unknown}"
@@ -785,8 +1270,12 @@ on_exit() {
     if [ -n "$INTERRUPTED" ]; then
       settle FAIL interrupted "signal $INTERRUPTED received"
     fi
-    if [ "$JQ_READY" -eq 1 ] && [ -n "$ENGINE_ID" ] && [ -f "${DIR:-/nonexistent}/lease.json" ]; then
-      cleanup_lease || true
+    if [ "$JQ_READY" -eq 1 ] && [ -n "$ENGINE_ID" ] && [ -n "$JOBS" ] && [ -f "${DIR:-/nonexistent}/lease.json" ]; then
+      begin_cleanup
+      if [ "$UNIT_STARTED" = true ] && [ "$UNIT_SETTLED" = false ] && [ "$CLEANED" -eq 0 ]; then
+        if settle_unit; then UNIT_SETTLED=true; fi
+      fi
+      cleanup_lease
     fi
     emit_result
   fi
@@ -796,64 +1285,74 @@ on_exit() {
 # ── build ─────────────────────────────────────────────────────────────────────
 
 do_build() {
-  local recipe recipe_tree inputs current tag image_id image_json layers runtime failures
-  local freeze_name freeze_cid probe freeze_sha
+  local recipe recipe_tree inputs tag image_id="" layers runtime freeze_name freeze_cid freeze_sha
   matches "$BASE_IMAGE" "$BASE_IMAGE_RE" || stop REFUSED base_image_unpinned "--base-image must be NAME@sha256:<64hex>"
   # The recipe commit is captured once; every later read uses it, never HEAD.
-  recipe=$(git_plumb rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || recipe=""
-  matches "$recipe" "$HEX40_RE" || stop REFUSED recipe_dirty "the controller checkout has no HEAD commit"
-  recipe_tree=$(git_plumb rev-parse --verify "$recipe^{tree}" 2>/dev/null) || recipe_tree=""
-  matches "$recipe_tree" "$HEX40_RE" || stop REFUSED recipe_dirty "the recipe commit has no readable tree"
-  # shellcheck disable=SC2086
-  materialize_tree "$recipe" "$DIR/context" $RECIPE_PATHS \
-    || stop REFUSED recipe_dirty "the recipe files cannot be read from the recipe commit"
-  inputs=$(recipe_inputs "$DIR/context") || stop REFUSED recipe_dirty "the recipe commit lacks a regular recipe file"
-  current=$(recipe_inputs "$REPO") || stop REFUSED recipe_dirty "a recipe file in the checkout is missing or not a regular file"
-  json_equal "$inputs" "$current" || stop REFUSED recipe_dirty "recipe files differ from the recipe commit"
+  local_job job_build_recipe || true
+  require_done "the recipe snapshot"
+  case "$BJ_RC" in
+    0) ;;
+    40) stop REFUSED recipe_dirty "the controller checkout has no HEAD commit" ;;
+    41) stop REFUSED recipe_dirty "the recipe commit has no readable tree" ;;
+    42) stop REFUSED recipe_dirty "the recipe files cannot be read from the recipe commit" ;;
+    43) stop REFUSED recipe_dirty "a recipe file is missing or not a regular file" ;;
+    44) stop REFUSED recipe_dirty "recipe files differ from the recipe commit" ;;
+    *) stop FAIL controller_error "the recipe snapshot ended with status $BJ_RC" ;;
+  esac
+  recipe=$(first_line "$DIR/recipe.commit")
+  recipe_tree=$(first_line "$DIR/recipe.tree")
+  inputs=$("$JQ_BIN" -c . "$DIR/recipe.inputs.json")
   tag="hermes-f02-unit:$CONTROLLER_ID"
   freeze_name="hermes-f02-freeze-$CONTROLLER_ID"
   if [ "$DRY_RUN" = true ]; then
     plan info --format '{{json .}}'
     plan image inspect --format '{{.Id}}' "$tag"
+    plan info --format '{{.ID}}'
     plan build --iidfile "$DIR/build.iid" --file "$DIR/context/scripts/multiuser_unit.Dockerfile" \
       --build-arg "MU_BASE_IMAGE=$BASE_IMAGE" --tag "$tag" --label "hermes.f02.controller=$CONTROLLER_ID" "$DIR/context"
     plan image inspect --format '{{json .}}' "$tag"
     plan container inspect --format '{{.Id}}' "$freeze_name"
+    plan info --format '{{.ID}}'
     plan create --name "$freeze_name" --label "hermes.f02.controller=$CONTROLLER_ID" \
-      --network none "<unit-image-id>" /bin/true
+      --network none --log-driver none "<unit-image-id>" /bin/true
     plan container inspect --format '{{json .}}' "<freeze-id>"
     plan cp "<freeze-id>:/opt/mu/freeze.txt" -
+    plan info --format '{{.ID}}'
     plan container rm -f "<freeze-id>"
+    plan container inspect --format '{{.Id}}' "<freeze-id>"
     stop NOT_RUN dry_run "validated; no engine contacted"
   fi
   engine_identity
   lease_init || stop FAIL journal_unwritable "the lease could not be created; nothing was created"
   reserve image "$tag"
   lease_image_intent "$tag" || stop FAIL journal_unwritable "the image creation intent could not be recorded; nothing was built"
-  if ! dk build --iidfile "$DIR/build.iid" --file "$DIR/context/scripts/multiuser_unit.Dockerfile" \
+  bound_or_stop "the build"
+  if ! bjob "$BUILD_LIMIT" "$DIR/build.out" "$BUILD_CAP" "$DIR/build.err" "$BUILD_CAP" /dev/null \
+      -- dk build --iidfile "$DIR/build.iid" --file "$DIR/context/scripts/multiuser_unit.Dockerfile" \
       --build-arg "MU_BASE_IMAGE=$BASE_IMAGE" --tag "$tag" --label "hermes.f02.controller=$CONTROLLER_ID" \
-      "$DIR/context" > "$DIR/build.log" 2>&1; then
-    stop FAIL build_failed "docker build failed; see build.log"
+      "$DIR/context"; then
+    if [ "$BJ_STATE" != done ]; then
+      settle FAIL "$(bj_code)" "docker build did not complete ($BJ_STATE)"
+      stop FAIL creation_identity_unknown "the build outcome is unknown; the tag is quarantined"
+    fi
+    stop FAIL build_failed "docker build failed; see build.out and build.err"
   fi
-  image_id=$(cat "$DIR/build.iid" 2>/dev/null) || image_id=""
+  if [ -f "$DIR/build.iid" ] && [ ! -L "$DIR/build.iid" ]; then image_id=$(first_line "$DIR/build.iid"); fi
   record_image_identity "$tag" "$image_id"
-  image_json=$(dk image inspect --format '{{json .}}' "$tag" 2>/dev/null) || stop FAIL build_failed "the built image cannot be inspected"
-  [ "$(printf '%s' "$image_json" | "$JQ_BIN" -r '.Id')" = "$image_id" ] || stop FAIL build_failed "the unit image tag does not name the built image"
-  layers=$(printf '%s' "$image_json" | "$JQ_BIN" -c '.RootFS.Layers')
+  inspect_to "$DIR/unit-image.json" image inspect --format '{{json .}}' "$tag" \
+    || fail_call build_failed "the built image cannot be inspected"
+  [ "$("$JQ_BIN" -r '.Id' "$DIR/unit-image.json")" = "$image_id" ] || stop FAIL build_failed "the unit image tag does not name the built image"
+  layers=$("$JQ_BIN" -c '.RootFS.Layers' "$DIR/unit-image.json")
   # Implicit volumes or an unapproved configuration refuse before any create.
-  runtime=$(image_runtime "$image_json" 2>"$DIR/image-config.err") \
+  runtime=$(image_runtime "$DIR/unit-image.json" 2>"$DIR/image-config.err") \
     || stop FAIL unit_image_config_refused "the unit image declares volumes or an unapproved runtime configuration"
-  create_container "$freeze_name" --network none "$image_id" /bin/true
+  create_container "$freeze_name" --network none --log-driver none "$image_id" /bin/true
   freeze_cid=$CREATED_ID
-  probe=$(dk container inspect --format '{{json .}}' "$freeze_cid" 2>/dev/null) \
-    || stop FAIL probe_admission_failed "the freeze probe cannot be inspected"
-  failures=$(printf '%s' "$probe" | probe_failures "$image_id") || failures='["inspect_unreadable"]'
-  [ "$failures" = "[]" ] || stop FAIL probe_admission_failed "the freeze probe is not a never-started, network-less container"
-  dk cp "$freeze_cid:/opt/mu/freeze.txt" - > "$DIR/freeze.tar" 2>>"$DIR/engine.stderr" \
-    || stop FAIL build_failed "freeze.txt could not be read"
-  mkdir -m 700 "$DIR/freeze"
-  tar -xf "$DIR/freeze.tar" -C "$DIR/freeze"
-  freeze_sha=$(sha256_file "$DIR/freeze/freeze.txt")
+  admit_probe "$freeze_cid" "$image_id" "freeze probe"
+  dkb "$CP_LIMIT" "$DIR/freeze.tar" "$FREEZE_CAP" /dev/null -- cp "$freeze_cid:/opt/mu/freeze.txt" - \
+    || fail_call build_failed "freeze.txt could not be read"
+  local_job job_freeze_digest "$DIR/freeze.tar" "$DIR/freeze" "$DIR/freeze.sha" || fail_call build_failed "freeze.txt could not be read"
+  freeze_sha=$(first_line "$DIR/freeze.sha")
   dispose_container "$freeze_name" "$freeze_cid" "freeze probe"
   lease_image_keep "$tag" || stop FAIL journal_unwritable "the unit image could not be recorded as kept"
   RECIPE_JSON=$("$JQ_BIN" -cn --arg commit "$recipe" --arg tree "$recipe_tree" --arg base "$BASE_IMAGE" \
@@ -950,11 +1449,10 @@ ev_raw() {
 }
 
 # The prior successful build result: trusted controller output in a private
-# directory, copied once and validated without the engine. It must bind this
-# --image-id, a recipe commit in this checkout whose blobs give the recorded
-# digests, and the recipe files this controller would build from now.
+# directory, copied once and validated without the engine. Its recipe
+# binding to this checkout is checked by job_run_static.
 admit_runtime_evidence() {
-  local f=$RUNTIME_EVIDENCE parent size inputs current
+  local f=$RUNTIME_EVIDENCE parent size
   case "$f" in *$'\n'*) stop REFUSED runtime_evidence_refused "--runtime-evidence must not contain a newline" ;; esac
   is_abs "$f" || stop REFUSED runtime_evidence_refused "--runtime-evidence must be an absolute path"
   if [ -L "$f" ] || [ ! -f "$f" ] || [ ! -O "$f" ]; then
@@ -967,7 +1465,8 @@ admit_runtime_evidence() {
   fi
   size=$(wc -c < "$f" | tr -d ' ')
   [ "$size" -le "$MAX_EVIDENCE_BYTES" ] || stop REFUSED runtime_evidence_refused "--runtime-evidence exceeds 1 MiB"
-  cat "$f" > "$DIR/runtime-evidence.json" 2>/dev/null || stop REFUSED runtime_evidence_refused "--runtime-evidence cannot be read"
+  /usr/bin/head -c $((MAX_EVIDENCE_BYTES + 1)) "$f" > "$DIR/runtime-evidence.json" 2>/dev/null \
+    || stop REFUSED runtime_evidence_refused "--runtime-evidence cannot be read"
   size=$(wc -c < "$DIR/runtime-evidence.json" | tr -d ' ')
   [ "$size" -le "$MAX_EVIDENCE_BYTES" ] || stop REFUSED runtime_evidence_refused "--runtime-evidence exceeds 1 MiB"
   if ! "$JQ_BIN" -e -s --arg schema "$SCHEMA" --arg image "$IMAGE_ID" --argjson sim "$DOCKER_SUBSTITUTED" \
@@ -975,41 +1474,11 @@ admit_runtime_evidence() {
       "length == 1 and (.[0] | $EVIDENCE_JQ)" "$DIR/runtime-evidence.json" >/dev/null 2>&1; then
     stop REFUSED runtime_evidence_invalid "--runtime-evidence is not a successful, verified build result for --image-id"
   fi
-  [ "$(git_plumb cat-file -t "$(ev_raw .recipe.commit)" 2>/dev/null || true)" = commit ] \
-    || stop REFUSED runtime_evidence_invalid "the evidence recipe commit is not a commit in this checkout"
-  [ "$(git_plumb rev-parse --verify "$(ev_raw .recipe.commit)^{tree}" 2>/dev/null || true)" = "$(ev_raw .recipe.tree)" ] \
-    || stop REFUSED runtime_evidence_invalid "the evidence recipe tree does not match its commit"
-  # shellcheck disable=SC2086
-  materialize_tree "$(ev_raw .recipe.commit)" "$DIR/recipe" $RECIPE_PATHS \
-    || stop REFUSED runtime_evidence_invalid "the evidence recipe files cannot be read from its commit"
-  inputs=$(recipe_inputs "$DIR/recipe") || stop REFUSED runtime_evidence_invalid "the evidence recipe commit lacks a recipe file"
-  json_equal "$inputs" "$(ev .recipe.inputs)" \
-    || stop REFUSED runtime_evidence_invalid "the evidence recipe digests do not match its commit"
-  current=$(recipe_inputs "$REPO") || stop REFUSED runtime_evidence_invalid "a recipe file in the checkout is missing"
-  json_equal "$current" "$(ev .recipe.inputs)" \
-    || stop REFUSED runtime_evidence_invalid "the evidence is stale: the checkout recipe differs from the built recipe"
   RUNTIME_EVIDENCE_JSON=$("$JQ_BIN" -c --arg path "$f" --arg sha "$(sha256_file "$DIR/runtime-evidence.json")" \
     '{path: $path, sha256: $sha, build_controller_id: .controller_id, recipe_commit: .recipe.commit,
       recipe_tree: .recipe.tree, base_image: .recipe.base_image, unit_image_id: .recipe.unit_image_id,
       freeze_sha256: .recipe.freeze_sha256}' "$DIR/runtime-evidence.json")
   RECIPE_JSON=$(ev '{unit_image_id: .recipe.unit_image_id, unit_layers: .recipe.unit_layers}')
-}
-
-# Tree manifest that never follows links: one line per directory, link
-# (with its target text) and regular file (with its SHA-256). The unit's
-# /src/.venv link is the only expected extra entry and is left out.
-tree_manifest() {
-  local root=$1 hasher=/usr/bin/sha256sum
-  [ -x /usr/bin/shasum ] && hasher="/usr/bin/shasum -a 256"
-  (
-    cd "$root"
-    find . -mindepth 1 ! -path './.venv' -type d -print | sed 's/^/D /'
-    find . -mindepth 1 ! -path './.venv' -type l -print | while IFS= read -r p; do
-      printf 'L %s %s\n' "$p" "$(readlink "$p")"
-    done
-    # shellcheck disable=SC2086
-    find . -mindepth 1 -type f -exec $hasher {} + | awk '{ h = $1; sub(/^[0-9a-f]+  /, ""); print "F " $0 " " h }'
-  ) | sort
 }
 
 admission_failures() {
@@ -1029,6 +1498,7 @@ admission_failures() {
       (if ($c.Config.Volumes | none) then empty else "volumes" end),
       (if $c.HostConfig.ReadonlyRootfs == true then empty else "read_only_rootfs" end),
       (if $c.HostConfig.NetworkMode == "none" then empty else "network" end),
+      (if ($c.HostConfig.LogConfig.Type // "") == "none" then empty else "log_driver" end),
       (if $c.HostConfig.Privileged == false then empty else "privileged" end),
       (if (($c.HostConfig.CapDrop // []) | index("ALL")) != null then empty else "cap_drop" end),
       (if ($c.HostConfig.CapAdd | none) then empty else "cap_add" end),
@@ -1055,7 +1525,7 @@ admission_failures() {
       (if ($c.HostConfig.RestartPolicy.Name // "") == "no" then empty else "restart" end),
       (if ($c.HostConfig.AutoRemove // false) == false then empty else "auto_remove" end),
       (if ($c.HostConfig.Init // false) == false then empty else "init" end)
-    ]'
+    ]' "$5"
 }
 
 attested_from() {
@@ -1066,7 +1536,8 @@ attested_from() {
      caps_dropped: (ok("cap_drop") and ok("cap_add") and ok("privileged")),
      no_new_privileges: ok("no_new_privileges"),
      private_pid: (ok("pid_mode") and ok("ipc_mode") and ok("uts_mode") and ok("userns_mode")),
-     resource_limits: (ok("pids_limit") and ok("memory") and ok("cpus") and ok("restart"))}'
+     resource_limits: (ok("pids_limit") and ok("memory") and ok("cpus") and ok("restart")),
+     daemon_logging_disabled: ok("log_driver")}'
 }
 
 # The worker result must match the unit exit, identity and requested work. A
@@ -1108,20 +1579,35 @@ validate_worker_result() {
 }
 
 do_run() {
-  local unit_json unit_id unit_layers live_runtime ev_runtime cand_tag cand_id cand_json cand_layers img_env
-  local candidate_tree archive_sha prep_name prep_cid probe out unit_name argv_json unit_env_json inspect failures
-  local attested started=false exit_code="" timed_out=false oom=false post_ok=false watchdog wait_pid
-  local stdout_size count last worker_line worker_status
+  local live_runtime ev_runtime cand_tag cand_id="" cand_layers unit_layers img_env candidate_tree archive_sha
+  local prep_name prep_cid unit_name argv_json unit_env_json failures attach_state attach_rc
+  local exit_code="" oom=false post_ok=false stdout_size count last worker_line worker_status reason
   matches "$IMAGE_ID" "$IMAGE_ID_RE" || stop REFUSED usage "--image-id must be sha256:<64hex>"
   matches "$CANDIDATE" "$HEX40_RE" || stop REFUSED candidate_invalid "--candidate must be a full 40-hex commit"
-  case "$TIMEOUT" in ''|*[!0-9]*) stop REFUSED usage "--timeout must be an integer" ;; esac
-  [ "$TIMEOUT" -ge 1 ] && [ "$TIMEOUT" -le 86400 ] || stop REFUSED usage "--timeout must be between 1 and 86400"
   derive_request
-  [ "$(git_plumb cat-file -t "$CANDIDATE" 2>/dev/null || true)" = commit ] \
-    || stop REFUSED candidate_invalid "--candidate is not a commit in the controller checkout"
-  candidate_tree=$(git_plumb rev-parse --verify "$CANDIDATE^{tree}" 2>/dev/null) || candidate_tree=""
-  matches "$candidate_tree" "$HEX40_RE" || stop REFUSED candidate_invalid "--candidate has no readable tree"
   admit_runtime_evidence
+  # Git binding of the evidence recipe, then the candidate snapshot: one
+  # bounded local job (about one git cat-file per tracked file).
+  local_job job_run_static || true
+  require_done "the candidate and recipe checks"
+  case "$BJ_RC" in
+    0) ;;
+    20) stop REFUSED candidate_invalid "--candidate is not a commit in the controller checkout" ;;
+    21) stop REFUSED candidate_invalid "--candidate has no readable tree" ;;
+    22) stop REFUSED candidate_invalid "the candidate tree holds a gitlink, an unsafe path or an unsupported entry" ;;
+    23) stop REFUSED candidate_invalid "the candidate tree exceeds the snapshot bound" ;;
+    24) stop FAIL snapshot_mismatch "the candidate snapshot could not be archived within its bound" ;;
+    30) stop REFUSED runtime_evidence_invalid "the evidence recipe commit is not a commit in this checkout" ;;
+    31) stop REFUSED runtime_evidence_invalid "the evidence recipe tree does not match its commit" ;;
+    32) stop REFUSED runtime_evidence_invalid "the evidence recipe files cannot be read from its commit" ;;
+    33) stop REFUSED runtime_evidence_invalid "the evidence recipe digests do not match its commit" ;;
+    34) stop REFUSED runtime_evidence_invalid "the evidence is stale: the checkout recipe differs from the built recipe" ;;
+    *) stop FAIL controller_error "the candidate and recipe checks ended with status $BJ_RC" ;;
+  esac
+  candidate_tree=$(first_line "$DIR/candidate.tree")
+  archive_sha=$(first_line "$DIR/candidate.sha")
+  ARCHIVE_CAP=$(first_line "$DIR/src-expected.bound")
+  matches "$ARCHIVE_CAP" '^[0-9]+$' || stop FAIL controller_error "the snapshot archive bound is missing"
   cand_tag="hermes-f02-cand:$CONTROLLER_ID"
   prep_name="hermes-f02-prep-$CONTROLLER_ID"
   unit_name="hermes-f02-unit-$CONTROLLER_ID"
@@ -1129,16 +1615,9 @@ do_run() {
   unit_env_json=$("$JQ_BIN" -cn '$ARGS.positional' --args -- "HERMES_MU_UNIT_ID=$CONTROLLER_ID" \
     "HERMES_MU_UNIT_NONCE=$UNIT_NONCE" "HERMES_MU_UNIT_SRC=$UNIT_SRC" "HERMES_MU_UNIT_STATE=$UNIT_STATE")
   img_env=$(ev '.recipe.runtime_config.Env // []')
+  ev_runtime=$(ev .recipe.runtime_config)
 
-  # Immutable source: the exact commit's blobs, materialized once, archived,
-  # hashed and later compared against what the unit sees.
-  materialize_tree "$CANDIDATE" "$DIR/src-expected" \
-    || stop REFUSED candidate_invalid "the candidate tree holds a gitlink, an unsafe path or an unsupported entry"
-  tar_create "$DIR/src-expected" "$DIR/candidate.tar" || stop FAIL snapshot_mismatch "the candidate snapshot could not be archived"
-  archive_sha=$(sha256_file "$DIR/candidate.tar")
-  mkdir -m 700 "$DIR/src-actual"
-
-  set -- --user "$UNIT_USER" --read-only --network none --ipc private --cap-drop ALL \
+  set -- --user "$UNIT_USER" --read-only --network none --log-driver none --ipc private --cap-drop ALL \
     --security-opt no-new-privileges --pids-limit "$PIDS_LIMIT" --memory 2g --memory-swap 2g --cpus 2 \
     --restart no --tmpfs "$TMPFS_TMP" --tmpfs "$TMPFS_STATE" \
     --env "HERMES_MU_UNIT_ID=$CONTROLLER_ID" --env "HERMES_MU_UNIT_NONCE=$UNIT_NONCE" \
@@ -1148,24 +1627,34 @@ do_run() {
     plan info --format '{{json .}}'
     plan image inspect --format '{{json .}}' "$IMAGE_ID"
     plan container inspect --format '{{.Id}}' "$prep_name"
-    plan create --name "$prep_name" --label "hermes.f02.controller=$CONTROLLER_ID" --network none "$IMAGE_ID" /bin/true
+    plan info --format '{{.ID}}'
+    plan create --name "$prep_name" --label "hermes.f02.controller=$CONTROLLER_ID" \
+      --network none --log-driver none "$IMAGE_ID" /bin/true
     plan container inspect --format '{{json .}}' "<prep-id>"
     plan cp "<prep-id>:/opt/mu/freeze.txt" -
+    plan info --format '{{.ID}}'
     plan cp - "<prep-id>:$UNIT_SRC"
     plan image inspect --format '{{.Id}}' "$cand_tag"
+    plan info --format '{{.ID}}'
     plan commit --change "USER $UNIT_USER" --change "WORKDIR $UNIT_SRC" "<prep-id>" "$cand_tag"
+    plan info --format '{{.ID}}'
     plan container rm -f "<prep-id>"
+    plan container inspect --format '{{.Id}}' "<prep-id>"
     plan image inspect --format '{{json .}}' "$cand_tag"
     plan container inspect --format '{{.Id}}' "$unit_name"
+    plan info --format '{{.ID}}'
     plan create --name "$unit_name" --label "hermes.f02.controller=$CONTROLLER_ID" "$@" "<cand-id>" \
       python3 -I -S scripts/test_multiuser.py ${WORKER_ARGS[@]+"${WORKER_ARGS[@]}"}
     plan container inspect --format '{{json .}}' "<unit-id>"
     plan cp "<unit-id>:$UNIT_SRC" -
-    plan container start "<unit-id>"
-    plan container wait "<unit-id>"
-    plan container logs "<unit-id>"
+    plan info --format '{{.ID}}'
+    plan container start --attach "<unit-id>"
     plan container inspect --format '{{json .}}' "<unit-id>"
+    plan info --format '{{.ID}}'
     plan container rm -f "<unit-id>"
+    plan container inspect --format '{{.Id}}' "<unit-id>"
+    plan image inspect --format '{{.Id}}' "$cand_tag"
+    plan info --format '{{.ID}}'
     plan image rm --no-prune "$cand_tag"
     stop NOT_RUN dry_run "validated; no engine contacted"
   fi
@@ -1176,56 +1665,55 @@ do_run() {
   lease_init || stop FAIL journal_unwritable "the lease could not be created; nothing was created"
 
   # The live unit image must be the recorded one before anything is created.
-  unit_json=$(dk image inspect --format '{{json .}}' "$IMAGE_ID" 2>/dev/null) \
-    || stop NOT_RUN unit_image_mismatch "--image-id is not present on this engine"
-  unit_id=$(printf '%s' "$unit_json" | "$JQ_BIN" -r '.Id') || unit_id=""
-  [ "$unit_id" = "$IMAGE_ID" ] || stop FAIL runtime_evidence_mismatch "the engine reported a different image id"
-  unit_layers=$(printf '%s' "$unit_json" | "$JQ_BIN" -c '.RootFS.Layers') || unit_layers=null
+  if ! inspect_to "$DIR/unit-image.json" image inspect --format '{{json .}}' "$IMAGE_ID"; then
+    require_done "the unit image inspection"
+    stop NOT_RUN unit_image_mismatch "--image-id is not present on this engine"
+  fi
+  [ "$("$JQ_BIN" -r '.Id' "$DIR/unit-image.json" 2>/dev/null)" = "$IMAGE_ID" ] \
+    || stop FAIL runtime_evidence_mismatch "the engine reported a different image id"
+  unit_layers=$("$JQ_BIN" -c '.RootFS.Layers' "$DIR/unit-image.json" 2>/dev/null) || unit_layers=null
   json_equal "$unit_layers" "$(ev .recipe.unit_layers)" \
     || stop FAIL runtime_evidence_mismatch "the unit image layers differ from the build evidence"
-  live_runtime=$(image_runtime "$unit_json" 2>"$DIR/image-config.err") \
+  live_runtime=$(image_runtime "$DIR/unit-image.json" 2>"$DIR/image-config.err") \
     || stop FAIL unit_image_config_refused "the unit image declares volumes or an unapproved runtime configuration"
-  ev_runtime=$(ev .recipe.runtime_config)
   json_equal "$live_runtime" "$ev_runtime" \
     || stop FAIL runtime_evidence_mismatch "the unit image runtime configuration differs from the build evidence"
 
   # One never-started probe reads the actual freeze record before the
   # snapshot goes in; a mismatch stops here and only the probe is disposed.
-  create_container "$prep_name" --network none "$IMAGE_ID" /bin/true
+  create_container "$prep_name" --network none --log-driver none "$IMAGE_ID" /bin/true
   prep_cid=$CREATED_ID
-  probe=$(dk container inspect --format '{{json .}}' "$prep_cid" 2>/dev/null) \
-    || stop FAIL probe_admission_failed "the prep container cannot be inspected"
-  failures=$(printf '%s' "$probe" | probe_failures "$IMAGE_ID") || failures='["inspect_unreadable"]'
-  [ "$failures" = "[]" ] || stop FAIL probe_admission_failed "the prep container is not a never-started, network-less container"
-  dk cp "$prep_cid:/opt/mu/freeze.txt" - > "$DIR/prep-freeze.tar" 2>>"$DIR/engine.stderr" \
-    || stop FAIL runtime_evidence_mismatch "the unit image freeze record cannot be read"
-  mkdir -m 700 "$DIR/prep-freeze"
-  tar -xf "$DIR/prep-freeze.tar" -C "$DIR/prep-freeze" 2>/dev/null \
-    || stop FAIL runtime_evidence_mismatch "the unit image freeze record cannot be read"
-  [ -f "$DIR/prep-freeze/freeze.txt" ] && [ ! -L "$DIR/prep-freeze/freeze.txt" ] \
-    && [ "$(sha256_file "$DIR/prep-freeze/freeze.txt")" = "$(ev_raw .recipe.freeze_sha256)" ] \
+  admit_probe "$prep_cid" "$IMAGE_ID" "prep"
+  dkb "$CP_LIMIT" "$DIR/prep-freeze.tar" "$FREEZE_CAP" /dev/null -- cp "$prep_cid:/opt/mu/freeze.txt" - \
+    || fail_call runtime_evidence_mismatch "the unit image freeze record cannot be read"
+  local_job job_freeze_digest "$DIR/prep-freeze.tar" "$DIR/prep-freeze" "$DIR/prep-freeze.sha" \
+    || fail_call runtime_evidence_mismatch "the unit image freeze record cannot be read"
+  [ "$(first_line "$DIR/prep-freeze.sha")" = "$(ev_raw .recipe.freeze_sha256)" ] \
     || stop FAIL runtime_evidence_mismatch "the unit image freeze record differs from the build evidence"
 
-  dk cp - "$prep_cid:$UNIT_SRC" < "$DIR/candidate.tar" 2>>"$DIR/engine.stderr" \
-    || stop FAIL snapshot_mismatch "the candidate snapshot could not be copied in"
+  bound_or_stop "the snapshot copy"
+  dkb "$CP_LIMIT" "$JOBS/out" "$CTL_CAP" "$DIR/candidate.tar" -- cp - "$prep_cid:$UNIT_SRC" \
+    || fail_call snapshot_mismatch "the candidate snapshot could not be copied in"
   reserve image "$cand_tag"
   lease_image_intent "$cand_tag" || stop FAIL journal_unwritable "the image creation intent could not be recorded; nothing was committed"
-  cand_id=""
-  if out=$(dk commit --change "USER $UNIT_USER" --change "WORKDIR $UNIT_SRC" "$prep_cid" "$cand_tag" 2>>"$DIR/engine.stderr"); then
-    cand_id=$(printf '%s\n' "$out" | tail -n 1)
+  bound_or_stop "the candidate commit"
+  if dk_ctl commit --change "USER $UNIT_USER" --change "WORKDIR $UNIT_SRC" "$prep_cid" "$cand_tag"; then
+    cand_id=$(tail -n 1 "$JOBS/out")
+  elif [ "$BJ_STATE" != done ]; then
+    settle FAIL "$(bj_code)" "the commit call did not complete ($BJ_STATE)"
   fi
   record_image_identity "$cand_tag" "$cand_id"
   dispose_container "$prep_name" "$prep_cid" "prep"
-  cand_json=$(dk image inspect --format '{{json .}}' "$cand_tag" 2>/dev/null) \
-    || stop FAIL snapshot_mismatch "the candidate image cannot be inspected"
-  [ "$(printf '%s' "$cand_json" | "$JQ_BIN" -r '.Id')" = "$cand_id" ] || stop FAIL snapshot_mismatch "the candidate tag moved"
-  cand_layers=$(printf '%s' "$cand_json" | "$JQ_BIN" -c '.RootFS.Layers')
+  inspect_to "$DIR/candidate-image.json" image inspect --format '{{json .}}' "$cand_tag" \
+    || fail_call snapshot_mismatch "the candidate image cannot be inspected"
+  [ "$("$JQ_BIN" -r '.Id' "$DIR/candidate-image.json")" = "$cand_id" ] || stop FAIL snapshot_mismatch "the candidate tag moved"
+  cand_layers=$("$JQ_BIN" -c '.RootFS.Layers' "$DIR/candidate-image.json")
   if ! "$JQ_BIN" -en --argjson unit "$unit_layers" --argjson cand "$cand_layers" \
       '($cand | length) > ($unit | length) and $cand[0:($unit | length)] == $unit' >/dev/null; then
     stop FAIL snapshot_mismatch "the candidate image does not extend the unit image"
   fi
   # Commit keeps the never-run probe command as Cmd; the unit sets its own.
-  json_equal "$(printf '%s' "$cand_json" | "$JQ_BIN" -c "$RUNTIME_CONFIG_JQ | del(.Cmd)")" \
+  json_equal "$("$JQ_BIN" -c "$RUNTIME_CONFIG_JQ | del(.Cmd)" "$DIR/candidate-image.json")" \
       "$(printf '%s' "$ev_runtime" | "$JQ_BIN" -c 'del(.Cmd)')" \
     || stop FAIL snapshot_mismatch "the candidate image runtime configuration differs from the build evidence"
   CANDIDATE_JSON=$("$JQ_BIN" -cn --arg commit "$CANDIDATE" --arg tree "$candidate_tree" --arg sha "$archive_sha" \
@@ -1236,75 +1724,74 @@ do_run() {
   # Create, then admit from inspect before anything inside can run.
   create_container "$unit_name" "$@" "$cand_id" python3 -I -S scripts/test_multiuser.py ${WORKER_ARGS[@]+"${WORKER_ARGS[@]}"}
   UNIT_CID=$CREATED_ID
-  inspect=$(dk container inspect --format '{{json .}}' "$UNIT_CID") || stop FAIL unit_admission_failed "the unit container cannot be inspected"
-  printf '%s\n' "$inspect" > "$DIR/inspect-created.json"
-  failures=$(printf '%s' "$inspect" | admission_failures "$cand_id" "$argv_json" "$img_env" "$unit_env_json") \
+  inspect_to "$DIR/inspect-created.json" container inspect --format '{{json .}}' "$UNIT_CID" \
+    || fail_call unit_admission_failed "the unit container cannot be inspected"
+  failures=$(admission_failures "$cand_id" "$argv_json" "$img_env" "$unit_env_json" "$DIR/inspect-created.json") \
     || failures='["inspect_unreadable"]'
-  attested=$(attested_from "$failures")
-  ATTESTED_JSON=$attested
+  ATTESTED_JSON=$(attested_from "$failures")
   CONTAINER_JSON=$("$JQ_BIN" -cn --arg name "$unit_name" --arg id "$UNIT_CID" --argjson f "$failures" \
     '{name: $name, id: $id, admitted: ($f | length == 0), admission_failures: $f, started: false,
-      exit_code: null, oom_killed: null, timed_out: false, post_exit_verified: false}')
+      attach_state: null, exit_code: null, oom_killed: null, timed_out: false, output_overflow: false,
+      post_exit_verified: false}')
   if [ "$failures" != "[]" ]; then
     stop FAIL unit_admission_failed "the created container does not match the admitted configuration"
   fi
-  dk cp "$UNIT_CID:$UNIT_SRC" - > "$DIR/src-actual.tar" 2>>"$DIR/engine.stderr" \
-    || stop FAIL snapshot_mismatch "the unit source tree cannot be read back"
-  tar -xf "$DIR/src-actual.tar" -C "$DIR/src-actual"
-  tree_manifest "$DIR/src-expected" > "$DIR/src-expected.manifest"
-  tree_manifest "$DIR/src-actual/src" > "$DIR/src-actual.manifest"
-  cmp -s "$DIR/src-expected.manifest" "$DIR/src-actual.manifest" \
-    || stop FAIL snapshot_mismatch "the unit source tree differs from the candidate commit"
+  # The readback has its own fixed bound from the expected tree.
+  dkb "$CP_LIMIT" "$DIR/src-actual.tar" "$ARCHIVE_CAP" /dev/null -- cp "$UNIT_CID:$UNIT_SRC" - \
+    || fail_call snapshot_mismatch "the unit source tree cannot be read back"
+  local_job job_verify_readback || true
+  require_done "the source tree comparison"
+  case "$BJ_RC" in
+    0) ;;
+    1) stop FAIL snapshot_mismatch "the unit source tree differs from the candidate commit" ;;
+    *) stop FAIL snapshot_mismatch "the unit source tree readback is unreadable" ;;
+  esac
   CANDIDATE_JSON=$(printf '%s' "$CANDIDATE_JSON" | "$JQ_BIN" -c '.source_tree_verified = true')
 
-  # Start; the controller owns the whole-unit timeout.
+  # Start attached: daemon logging is off and the client's output is the only
+  # capture, hard-capped per stream; its limit is --timeout.
   check_interrupt
-  dk container start "$UNIT_CID" >/dev/null 2>>"$DIR/engine.stderr" || stop FAIL unit_start_failed "the unit container did not start"
-  started=true
-  (
-    sleep "$TIMEOUT"
-    if [ "$(dk container inspect --format '{{.State.Running}}' "$UNIT_CID" 2>/dev/null)" = true ]; then
-      : > "$DIR/timed-out"
-      dk container kill "$UNIT_CID" >/dev/null 2>&1
-    fi
-  ) &
-  watchdog=$!
-  dk container wait "$UNIT_CID" > "$DIR/wait.out" 2>>"$DIR/engine.stderr" &
-  wait_pid=$!
-  while ! wait "$wait_pid"; do
-    kill -0 "$wait_pid" 2>/dev/null || break
-  done
-  pkill -P "$watchdog" >/dev/null 2>&1 || true
-  kill "$watchdog" >/dev/null 2>&1 || true
-  wait "$watchdog" 2>/dev/null || true
-  [ -f "$DIR/timed-out" ] && timed_out=true
-  exit_code=$(tr -dc '0-9' < "$DIR/wait.out")
-  dk container logs "$UNIT_CID" 2>"$DIR/worker.stderr" | head -c $((MAX_WORKER_STDOUT + 1)) > "$DIR/worker.stdout" || true
-  inspect=$(dk container inspect --format '{{json .}}' "$UNIT_CID" 2>/dev/null) || inspect=""
-  printf '%s\n' "$inspect" > "$DIR/inspect-exited.json"
-  if [ -n "$inspect" ] && [ -n "$exit_code" ]; then
-    failures=$(printf '%s' "$inspect" | admission_failures "$cand_id" "$argv_json" "$img_env" "$unit_env_json" 2>/dev/null) \
+  bound_or_stop "starting the unit"
+  lease_container_started "$unit_name" || stop FAIL journal_unwritable "the unit start could not be recorded; it was not started"
+  UNIT_STARTED=true
+  bjob "$TIMEOUT" "$DIR/worker.stdout" "$WORKER_STDOUT_CAP" "$DIR/worker.stderr" "$WORKER_STDERR_CAP" /dev/null \
+    -- dk container start --attach "$UNIT_CID" || true
+  attach_state=$BJ_STATE
+  attach_rc=$BJ_RC
+  # Settle the daemon unit through separately checked calls, within the fixed
+  # cleanup budget, then remove what the lease recorded.
+  begin_cleanup
+  if settle_unit; then UNIT_SETTLED=true; fi
+  if [ "$attach_state" = done ] && [ "$UNIT_SETTLED" = true ] && matches "$attach_rc" '^[0-9]+$'; then
+    exit_code=$attach_rc
+    failures=$(admission_failures "$cand_id" "$argv_json" "$img_env" "$unit_env_json" "$DIR/inspect-exited.json" 2>/dev/null) \
       || failures='["inspect_unreadable"]'
-    oom=$(printf '%s' "$inspect" | "$JQ_BIN" -r '.State.OOMKilled == true')
-    if [ "$failures" = "[]" ] && printf '%s' "$inspect" | "$JQ_BIN" -e --argjson code "$exit_code" \
-        '.State.Status == "exited" and .State.ExitCode == $code' >/dev/null 2>&1; then
+    oom=$("$JQ_BIN" -r '.State.OOMKilled == true' "$DIR/inspect-exited.json" 2>/dev/null) || oom=false
+    if [ "$failures" = "[]" ] && "$JQ_BIN" -e --argjson code "$exit_code" \
+        '.State.Status == "exited" and .State.ExitCode == $code' "$DIR/inspect-exited.json" >/dev/null 2>&1; then
       post_ok=true
     fi
   fi
-  CONTAINER_JSON=$(printf '%s' "$CONTAINER_JSON" | "$JQ_BIN" -c --argjson started "$started" \
-    --arg code "$exit_code" --argjson oom "$oom" --argjson timed "$timed_out" --argjson post "$post_ok" \
-    '.started = $started | .exit_code = (if $code == "" then null else ($code | tonumber) end)
-     | .oom_killed = $oom | .timed_out = $timed | .post_exit_verified = $post')
-
-  # The unit is gone before any verdict.
+  CONTAINER_JSON=$(printf '%s' "$CONTAINER_JSON" | "$JQ_BIN" -c --arg state "$attach_state" \
+    --arg code "$exit_code" --argjson oom "$oom" --argjson post "$post_ok" \
+    '.started = true | .attach_state = $state
+     | .exit_code = (if $code == "" then null else ($code | tonumber) end)
+     | .oom_killed = $oom | .timed_out = ($state == "timeout") | .output_overflow = ($state == "overflow")
+     | .post_exit_verified = $post')
+  # A started unit that is not confirmed removed is reported by cleanup_lease.
   cleanup_lease
-  [ -z "$INTERRUPTED" ] || stop FAIL interrupted "signal $INTERRUPTED received"
-  [ "$timed_out" = false ] || stop FAIL unit_timeout "the unit exceeded --timeout and was killed"
+
+  # Verdict, only after the unit is gone.
+  case "$attach_state" in
+    done) ;;
+    timeout) stop FAIL unit_timeout "the unit exceeded --timeout; its attach client was killed and the unit settled separately" ;;
+    *) stop FAIL "$(bj_code "$attach_state")" "the attached unit run did not complete ($attach_state)" ;;
+  esac
   [ "$oom" = false ] || stop FAIL unit_oom "the unit was killed for memory"
   [ "$post_ok" = true ] || stop FAIL unit_post_exit_unverified "the exited unit could not be verified"
 
   stdout_size=$(wc -c < "$DIR/worker.stdout" | tr -d ' ')
-  [ "$stdout_size" -le "$MAX_WORKER_STDOUT" ] || stop FAIL worker_result_unparseable "worker stdout exceeds the bound"
+  [ "$stdout_size" -le "$WORKER_STDOUT_CAP" ] || stop FAIL output_overflow "worker stdout exceeds the bound"
   count=$(grep -c "^$WORKER_PREFIX" "$DIR/worker.stdout" || true)
   last=$(awk 'NF { line = $0 } END { print line }' "$DIR/worker.stdout")
   case "$last" in "$WORKER_PREFIX"*) ;; *) count=0 ;; esac
@@ -1333,12 +1820,14 @@ do_cleanup() {
   lease_id=$("$JQ_BIN" -r --arg schema "$LEASE_SCHEMA" 'if .schema == $schema then .controller_id else "" end' "$DIR/lease.json" 2>/dev/null || true)
   [ "$lease_id" = "$UNIT_ID" ] || stop REFUSED lease_mismatch "the lease in --evidence-dir does not belong to --unit-id"
   CONTROLLER_ID=$UNIT_ID
+  BOUND_ENGINE=$("$JQ_BIN" -r '.engine_id // ""' "$DIR/lease.json" 2>/dev/null || true)
   if [ "$DRY_RUN" = true ]; then
     plan info --format '{{json .}}'
     stop NOT_RUN dry_run "validated; no engine contacted"
   fi
+  # Removes only exact recorded ids on the lease's engine, within the fixed
+  # cleanup budget; anything else is quarantined.
   engine_identity
-  # Removes only exact recorded ids on the lease's engine; anything else is quarantined.
   cleanup_lease
   settle PASS
 }
@@ -1351,6 +1840,7 @@ main() {
   trap 'on_exit' EXIT
   trap 'on_signal INT' INT
   trap 'on_signal TERM' TERM
+  trap 'on_signal HUP' HUP
   BASE_IMAGE=""
   IMAGE_ID=""
   CANDIDATE=""
@@ -1390,6 +1880,8 @@ main() {
     run)
       [ -n "$RUNTIME_EVIDENCE" ] && [ -n "$IMAGE_ID" ] && [ -n "$CANDIDATE" ] \
         || usage_refused "run needs --runtime-evidence, --image-id and --candidate"
+      case "$TIMEOUT" in ''|*[!0-9]*) usage_refused "--timeout must be an integer" ;; esac
+      [ "$TIMEOUT" -ge 1 ] && [ "$TIMEOUT" -le 86400 ] || usage_refused "--timeout must be between 1 and 86400"
       ;;
     cleanup) [ -n "$UNIT_ID" ] || usage_refused "cleanup needs --unit-id" ;;
   esac
@@ -1397,14 +1889,23 @@ main() {
     case "$arg" in *$'\n'*|*$'\r'*) usage_refused "worker arguments cannot contain newlines" ;; esac
   done
 
+  # Fixed deadlines, set once: the operation, then a separate cleanup budget.
+  case "$COMMAND" in
+    build) OPERATION_SECONDS=$BUILD_BUDGET ;;
+    run) OPERATION_SECONDS=$((TIMEOUT + RUN_OVERHEAD)) ;;
+    cleanup) OPERATION_SECONDS=0 ;;
+  esac
+  MAIN_DEADLINE=$((SECONDS + OPERATION_SECONDS))
   if [ "$COMMAND" = cleanup ]; then
     existing_lease_dir
+    begin_cleanup
   else
     prepare_new_evidence_dir
     new_controller_id
   fi
   select_binaries
   validate_socket
+  prepare_jobs_dir
   case "$COMMAND" in
     build) do_build ;;
     run) do_run ;;
@@ -1412,4 +1913,4 @@ main() {
   esac
 }
 
-main "$@"
+main ${1+"$@"}
