@@ -20,25 +20,34 @@ prerequisite is unavailable). NOT_RUN is never a pass.
 
 What the launcher does, before any product import:
 
-* refuses unsafe paths, links, pytest options and option combinations;
-* statically checks the repo ``.venv`` and base interpreter for startup hooks
-  and editable or Agent sources, without executing them;
+* refuses unsafe paths, links (anywhere in collected test trees and explicit
+  Agent checkouts), pytest options, pytest.ini keys and option combinations;
+* statically checks the repo ``.venv`` and its base interpreter, which must be
+  a verified distribution build, for startup hooks, import-path extensions and
+  editable or Agent sources, without executing them;
 * denies implicit installed-Agent discovery and checkout ``.env`` files
   (metadata only, never read);
 * allocates a private disposable state root and a freshly built allowlisted
   child environment; nothing is copied wholesale from the parent;
-* runs pytest only through ``./scripts/test.sh`` with ``--confcutdir`` pinned
-  to ``tests/multiuser``, and derives PASS from the JUnit counts.
+* provisions a missing ``.venv`` only through ``scripts/test.sh --prepare-only``
+  (which exits before any post-install Python starts), re-audits it, and runs
+  pytest only through ``scripts/test.sh --execute-only`` with ``--confcutdir``
+  pinned to ``tests/multiuser`` and a private generated ini; PASS comes from
+  the JUnit counts;
+* runs ``--script`` only from reviewed F02-aware locations, from an immutable
+  snapshot, under a deny-by-default Python ``NetworkGuard``.
 
-Python-level fixture guards (see ``multiuser_test_fixtures.NetworkGuard``) are
-not OS network containment; containment and remote tiers stay NOT_RUN here.
+Scopes F02 cannot make safe report NOT_RUN: explicit-Agent runs (no synthetic
+credential compartment isolates OS keychains), browser transport, containment
+and remote tiers. Python-level guards are not OS network containment.
 This launcher stays stdlib-only and imports no product module.
 """
 from __future__ import annotations
 
 import argparse
+import configparser
+import errno
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -49,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import xml.etree.ElementTree as ET
 
 SCHEMA = "hermes-webui/multiuser-launcher/1"
@@ -62,7 +72,14 @@ DEFAULT_CHILD_TIMEOUT = 3600
 INTERRUPT_GRACE_SECONDS = 10.0
 TERMINATE_GRACE_SECONDS = 5.0
 SCRIPT_NOT_RUN_EXIT = 77
+RUNNER_NOT_PREPARED_EXIT = 78  # scripts/test.sh --execute-only refused to provision
 PYTEST_PLUGINS = ("pytest_timeout", "pytest_asyncio.plugin")
+# Modules scripts/test.sh checks before it would install anything (plus pip,
+# whose absence makes it rebuild). Static presence decides whether to prepare.
+RUNNER_MODULES = (
+    "cryptography", "mcp", "pytest", "pytest_asyncio", "pytest_shard",
+    "pytest_timeout", "ruff", "yaml", "pip",
+)
 INSTALLED_AGENT_ROOTS = (
     "/usr/local/lib/hermes-agent",
     "/opt/hermes-agent",
@@ -70,6 +87,37 @@ INSTALLED_AGENT_ROOTS = (
     "/usr/local/share/hermes-agent",
 )
 SITE_AGENT_NAMES = ("run_agent.py", "run_agent", "hermes_cli", "cron", "hermes", "hermes_agent")
+# Directories inside an explicit Agent checkout that the link walk skips.
+CHECKOUT_WALK_SKIP = frozenset({".git", "venv", ".venv", "__pycache__", "node_modules"})
+# --script admission: reviewed F02-aware locations only (repo-relative, POSIX).
+ADMITTED_SCRIPT_PATTERNS = (
+    re.compile(r"^tests/multiuser/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.py$"),
+    re.compile(r"^tests/browser_multiuser_[a-z0-9_]+\.py$"),
+)
+# Base interpreters accepted as verified distribution builds (resolved paths).
+_DISTRIBUTION_EXE_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^/opt/homebrew/Cellar/python@3\.(1[1-3])/[^/]+/Frameworks/Python\.framework/"
+        r"Versions/3\.\1/bin/python3\.\1$",
+        r"^/usr/local/Cellar/python@3\.(1[1-3])/[^/]+/Frameworks/Python\.framework/"
+        r"Versions/3\.\1/bin/python3\.\1$",
+        r"^/Library/Frameworks/Python\.framework/Versions/3\.(1[1-3])/bin/python3\.\1$",
+        r"^/usr/bin/python3\.(1[1-3])$",
+        r"^/usr/local/bin/python3\.(1[1-3])$",
+        r"^/opt/hostedtoolcache/Python/3\.(1[1-3])\.\d+/(?:x64|arm64)/bin/python3\.\1$",
+    )
+)
+_NATIVE_EXECUTABLE_MAGIC = (
+    b"\x7fELF",
+    b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+)
+WELL_KNOWN_PYTHON_DIRS = (
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin",
+    "/Library/Frameworks/Python.framework/Versions/Current/bin",
+)
+_MARKER_LINE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\([^()\n]*\))?\s*:[^\n]*$")
 PASSTHROUGH_VARS = ("LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR")
 WINDOWS_PASSTHROUGH_VARS = ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
 _PASSTHROUGH_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{0,64}$")
@@ -124,6 +172,12 @@ class _Interrupted(BaseException):
 
 
 class _SignalState:
+    """``run`` raises on a signal; ``spawn`` and ``teardown`` only record it.
+
+    ``spawn`` covers process creation until ownership of the child is
+    published, so a signal can never strand an unowned process group.
+    """
+
     phase = "run"
     received = None
 
@@ -246,6 +300,93 @@ def _resolve_in_repo(raw, repo_root):
     return os.path.normpath(candidate)
 
 
+def _read_validated_file(path, expected, label, limit=8 * 1024 * 1024):
+    """Read ``path`` through one no-follow descriptor that matches the validated lstat."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise refused("unsafe_symlink", f"{label} could not be opened without following links") from None
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise refused("unsafe_symlink", f"{label} changed during validation")
+        if opened.st_size > limit:
+            raise refused("script_invalid", f"{label} is larger than {limit} bytes")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def ensure_tree_without_links(root, skip=frozenset(), refuse=None):
+    """Refuse links or junctions below ``root`` (never followed).
+
+    ``refuse(entry)`` limits refusal to matching links; by default every link
+    is refused. Directories are never entered through a link.
+    """
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise refused("path_missing", f"{directory} cannot be listed: {exc.__class__.__name__}") from None
+        for entry in entries:
+            if entry.name in skip:
+                continue
+            st = entry.stat(follow_symlinks=False)
+            if _is_link_like(st):
+                if refuse is None or refuse(entry):
+                    raise refused("unsafe_symlink", f"{entry.path} is a symbolic link or junction")
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                pending.append(entry.path)
+
+
+def _collectable_link(entry):
+    """Links pytest could follow while collecting: directories, conftests, packages, tests.
+
+    Other linked files are left to the import guard, which refuses importing
+    anything through a link.
+    """
+    name = entry.name
+    try:
+        if entry.is_dir(follow_symlinks=True):
+            return True
+    except OSError:
+        return True
+    return name in ("conftest.py", "__init__.py") or (
+        name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+    )
+
+
+def ensure_collection_safe(repo_root, path):
+    """Refuse links pytest could import for ``path``: package and conftest chains and the tree."""
+    st = _walk_components(repo_root, path)
+    top = path if stat.S_ISDIR(st.st_mode) else os.path.dirname(path)
+    rel = os.path.relpath(top, repo_root)
+    current = repo_root
+    for part in rel.split(os.sep):
+        current = os.path.join(current, part)
+        for name in ("__init__.py", "conftest.py"):
+            candidate = os.path.join(current, name)
+            if os.path.lexists(candidate) and _is_link_like(os.lstat(candidate)):
+                raise refused("unsafe_symlink", f"{candidate} is a symbolic link or junction")
+    if stat.S_ISDIR(st.st_mode):
+        ensure_tree_without_links(path, skip=frozenset({"__pycache__"}), refuse=_collectable_link)
+
+
+def script_admitted(path, repo_root):
+    rel = os.path.relpath(path, repo_root).replace(os.sep, "/")
+    return any(pattern.match(rel) for pattern in ADMITTED_SCRIPT_PATTERNS)
+
+
 def validate_repo_script(raw, repo_root):
     """Validate ``--script`` and return (path, snapshot_bytes)."""
     path = _resolve_in_repo(raw, repo_root)
@@ -257,23 +398,7 @@ def validate_repo_script(raw, repo_root):
     st = _walk_components(repo_root, path)
     if not stat.S_ISREG(st.st_mode) or not path.endswith(".py"):
         raise refused("script_invalid", f"script {raw!r} is not a regular .py file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    fd = os.open(path, flags)
-    try:
-        opened = os.fstat(fd)
-        if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
-            raise refused("unsafe_symlink", f"script {raw!r} changed during validation")
-        if opened.st_size > 8 * 1024 * 1024:
-            raise refused("script_invalid", f"script {raw!r} is larger than 8 MiB")
-        chunks = []
-        while True:
-            chunk = os.read(fd, 1 << 16)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    finally:
-        os.close(fd)
-    return path, b"".join(chunks)
+    return path, _read_validated_file(path, st, f"script {raw!r}")
 
 
 def validate_test_path(arg, repo_root):
@@ -286,7 +411,7 @@ def validate_test_path(arg, repo_root):
         raise refused("path_outside_checkout", f"test path {path_part!r} is outside the checkout")
     if not _is_within(path, tests_root):
         raise refused("pytest_arg_disallowed", f"test path {path_part!r} is outside tests/multiuser")
-    _walk_components(repo_root, path)
+    ensure_collection_safe(repo_root, path)
 
 
 _NOARG_PYTEST_FLAGS = frozenset(
@@ -343,18 +468,35 @@ def validate_pytest_args(args, repo_root):
         i += 1
     if not positional:
         tests_root = os.path.join(repo_root, "tests", "multiuser")
-        _walk_components(repo_root, tests_root)
+        ensure_collection_safe(repo_root, tests_root)
         out.append(os.path.join("tests", "multiuser"))
     return out
 
 
-def validate_agent_checkout(raw, repo_root, operator_home):
+def installed_agent_roots(operator_home, parent_env):
+    """Operator and system locations an installed Agent occupies (never an explicit source)."""
+    roots = [
+        os.path.join(operator_home, ".hermes"),
+        os.path.join(operator_home, "hermes-agent"),
+        os.path.join(operator_home, ".local", "share", "hermes-agent"),
+    ]
+    xdg_data = parent_env.get("XDG_DATA_HOME", "")
+    if os.path.isabs(xdg_data):
+        roots.append(os.path.join(xdg_data, "hermes-agent"))
+    for name in ("LOCALAPPDATA", "APPDATA"):
+        value = parent_env.get(name, "")
+        if os.path.isabs(value):
+            roots.append(os.path.join(value, "hermes"))
+    roots.extend(INSTALLED_AGENT_ROOTS)
+    return roots
+
+
+def validate_agent_checkout(raw, repo_root, operator_home, parent_env=None):
     """Validate an explicit Agent checkout and return (path, (dev, ino))."""
     if "\0" in raw:
         raise refused("usage", "agent checkout contains a NUL byte")
     path = os.path.normpath(os.path.abspath(raw))
-    installed = [os.path.join(operator_home, ".hermes"), os.path.join(operator_home, "hermes-agent")]
-    installed.extend(INSTALLED_AGENT_ROOTS)
+    installed = installed_agent_roots(operator_home, os.environ if parent_env is None else parent_env)
     if any(_is_within(path, root) for root in installed):
         raise refused("installed_agent_location", f"{path} is an installed or operator Agent location")
     if os.path.normcase(path) == os.path.normcase(
@@ -378,23 +520,93 @@ def validate_agent_checkout(raw, repo_root, operator_home):
         raise refused("agent_checkout_invalid", f"{path} has no run_agent.py") from None
     if not stat.S_ISREG(entry_st.st_mode):
         raise refused("agent_checkout_invalid", f"{entry} is not a regular file")
+    ensure_tree_without_links(path, skip=CHECKOUT_WALK_SKIP)
     return path, (st.st_dev, st.st_ino)
 
 
-def validate_output_file(raw, label):
-    """Return an absolute path for a file the launcher writes (final component never followed)."""
-    if "\0" in raw:
-        raise refused("usage", f"{label} contains a NUL byte")
-    path = os.path.abspath(raw)
-    parent = os.path.realpath(os.path.dirname(path))
-    if not os.path.isdir(parent):
-        raise refused("path_missing", f"{label} directory does not exist")
-    path = os.path.join(parent, os.path.basename(path))
-    if os.path.lexists(path):
-        st = os.lstat(path)
-        if _is_link_like(st) or not stat.S_ISREG(st.st_mode):
-            raise refused("unsafe_symlink", f"{label} exists and is not a regular file")
-    return path
+_DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_private_dir_chain(base, target):
+    """Open ``target`` below ``base`` one component at a time, never following links.
+
+    Each directory below ``base`` must be owned by the current user and not
+    writable by group or others. Returns a descriptor for ``target``.
+    """
+    fd = os.open(base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        rel = os.path.relpath(target, base)
+        if rel != os.curdir:
+            for part in rel.split(os.sep):
+                try:
+                    child = os.open(part, _DIR_OPEN_FLAGS, dir_fd=fd)
+                except OSError as exc:
+                    reason = errno.errorcode.get(exc.errno, str(exc.errno))
+                    raise refused("report_path_disallowed", f"{part!r} is not a real directory ({reason})") from None
+                os.close(fd)
+                fd = child
+                st = os.fstat(fd)
+                if st.st_uid != os.getuid() or st.st_mode & 0o022:
+                    raise refused("report_path_disallowed", f"{part!r} is not private to the current user")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class ReportTarget:
+    """A new report file under the trusted per-user temp base, written via an anchored parent.
+
+    Existing files are never opened or truncated; the parent directory is
+    held by descriptor from validation to write, and the write is refused if
+    the parent path no longer names that same directory.
+    """
+
+    def __init__(self, raw, operator_home):
+        if "\0" in raw:
+            raise refused("usage", "--report contains a NUL byte")
+        if os.name != "posix":
+            raise refused("unsupported_platform", "--report needs descriptor-anchored writes")
+        base = trusted_temp_base(operator_home)
+        path = os.path.abspath(raw)
+        self.name = os.path.basename(path)
+        if self.name in ("", os.curdir, os.pardir):
+            raise refused("report_path_disallowed", "--report must name a file")
+        parent = os.path.realpath(os.path.dirname(path))
+        if not _is_within(parent, base):
+            raise refused("report_path_disallowed", f"--report must be inside the per-user temp area {base}")
+        self._fd = _open_private_dir_chain(base, parent)
+        try:
+            os.stat(self.name, dir_fd=self._fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            self.close()
+            raise refused("report_path_disallowed", "--report names an existing file; it is never overwritten")
+        self.parent = parent
+        self.path = os.path.join(parent, self.name)
+
+    def write(self, text):
+        anchor = os.fstat(self._fd)
+        try:
+            current = os.lstat(self.parent)
+        except OSError:
+            current = None
+        if current is None or _is_link_like(current) or (
+            (current.st_dev, current.st_ino) != (anchor.st_dev, anchor.st_ino)
+        ):
+            raise OSError(errno.ESTALE, "the report directory was replaced after validation; nothing was written")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.name, flags, 0o600, dir_fd=self._fd)
+        try:
+            os.write(fd, text.encode())
+        finally:
+            os.close(fd)
+
+    def close(self):
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
 
 
 def validate_manifest(raw):
@@ -516,7 +728,41 @@ def inspect_base_interpreter(exe, operator_home):
     version, stdlib = found[0]
     if version not in SUPPORTED_PYTHON:
         raise not_run("unsupported_python", f"{exe} is Python {_version_text(version)}, not 3.11-3.13")
+    verify_distribution(real, stdlib, version)
     return BaseInterpreter(exe, real, prefix, version, stdlib)
+
+
+def verify_distribution(real, stdlib, version):
+    """Require a native interpreter binary at a known distribution location.
+
+    A name plus an adjacent ``os.py`` proves nothing, so the resolved path
+    must match a reviewed distribution layout for the same version, the file
+    must start with ELF or Mach-O magic, and the binary and stdlib must be
+    owned by root or the current user and not writable by group or others.
+    Nothing is executed.
+    """
+    matched = None
+    for pattern in _DISTRIBUTION_EXE_PATTERNS:
+        match = pattern.match(real)
+        if match:
+            matched = match
+            break
+    if matched is None or matched.group(1) != str(version[1]):
+        raise not_run("venv_provenance_unknown", f"{real} is not a verified Python distribution build")
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise not_run("venv_provenance_unknown", f"{real} cannot be opened without following links") from None
+    try:
+        magic = os.read(fd, 4)
+    finally:
+        os.close(fd)
+    if magic not in _NATIVE_EXECUTABLE_MAGIC:
+        raise not_run("venv_provenance_unknown", f"{real} is not a native executable")
+    for path in (real, stdlib):
+        st = os.stat(path)
+        if st.st_uid not in (0, os.getuid()) or st.st_mode & 0o022:
+            raise not_run("venv_provenance_unknown", f"{path} is writable by other users")
 
 
 def scan_interpreter_hooks(base, result=None):
@@ -552,8 +798,12 @@ def scan_interpreter_hooks(base, result=None):
         raise not_run("venv_provenance_unknown", "; ".join(problems))
 
 
-def scan_site_packages(site_dir, allowed_root):
-    """Refuse site-packages content that runs code at startup or exposes an Agent."""
+def scan_site_packages(site_dir):
+    """Refuse site-packages content that runs code at startup or exposes an Agent.
+
+    ``.pth`` path entries are refused outright, even inside the venv: an added
+    directory could carry its own sitecustomize or Agent sources unaudited.
+    """
     problems = []
     agent_hits = []
     try:
@@ -590,10 +840,8 @@ def scan_site_packages(site_dir, allowed_root):
                 if text.startswith(("import ", "import\t")):
                     executable = True
                     continue
-                entry = text if os.path.isabs(text) else os.path.join(site_dir, text)
-                if not _is_within(os.path.realpath(entry), allowed_root):
-                    problems.append(f"{path} adds a path outside {allowed_root}")
-                    break
+                problems.append(f"{path} extends the import path ({text[:80]!r})")
+                break
             if executable:
                 digest = hashlib.sha256(raw).hexdigest()
                 if REVIEWED_PTH_FILES.get(name) != digest:
@@ -675,22 +923,38 @@ def inspect_venv(repo_root, operator_home, result=None):
     if not site_dirs:
         raise not_run("venv_provenance_unknown", "repo .venv has no site-packages")
     for site in site_dirs:
-        scan_site_packages(site, real_root)
+        scan_site_packages(site)
     for name in ("hermes", "hermes.exe"):
         if os.path.lexists(os.path.join(root, "bin", name)):
             raise not_run("implicit_agent_discoverable", "repo .venv exposes a 'hermes' launcher")
     return Venv(root, python, version, site_dirs, base)
 
 
+def missing_runner_modules(venv):
+    """Modules scripts/test.sh needs that no audited site-packages dir provides."""
+    missing = []
+    for module in RUNNER_MODULES:
+        present = False
+        for site in venv.site_dirs:
+            if os.path.isfile(os.path.join(site, module, "__init__.py")) or os.path.isfile(
+                os.path.join(site, module + ".py")
+            ):
+                present = True
+                break
+        if not present:
+            missing.append(module)
+    return missing
+
+
 def select_base_python(parent_env, operator_home):
-    """Pick a supported base interpreter for a first .venv bootstrap, statically."""
+    """Pick a verified 3.11-3.13 distribution interpreter for a first .venv, statically."""
     explicit = parent_env.get("HERMES_WEBUI_TEST_PYTHON", "").strip()
     if explicit:
         return inspect_base_interpreter(explicit, operator_home)
+    directories = [d for d in parent_env.get("PATH", "").split(os.pathsep) if d and os.path.isabs(d)]
+    directories.extend(d for d in WELL_KNOWN_PYTHON_DIRS if d not in directories)
     for name in ("python3.13", "python3.12", "python3.11", "python3"):
-        for directory in parent_env.get("PATH", "").split(os.pathsep):
-            if not directory or not os.path.isabs(directory):
-                continue
+        for directory in directories:
             candidate = os.path.join(directory, name)
             if not os.path.isfile(candidate):
                 continue
@@ -698,7 +962,7 @@ def select_base_python(parent_env, operator_home):
                 return inspect_base_interpreter(candidate, operator_home)
             except Outcome:
                 continue
-    raise not_run("unsupported_python", "no statically identifiable Python 3.11-3.13 outside the operator home")
+    raise not_run("unsupported_python", "no verified Python 3.11-3.13 distribution build was found")
 
 
 def browser_runtime_ready(venv):
@@ -748,34 +1012,83 @@ def trusted_temp_base(operator_home):
     raise refused("unsupported_platform", "no trusted temporary directory is available")
 
 
+def _open_dir_entry(name, dir_fd):
+    """Open a child directory without following links, unlocking a 000 directory once."""
+    try:
+        return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+    except PermissionError as denied:
+        try:
+            os.chmod(name, 0o700, dir_fd=dir_fd, follow_symlinks=False)
+        except (NotImplementedError, OSError):
+            raise denied from None
+        return os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+
+
+def _clear_directory_fd(dir_fd):
+    """Delete everything inside the directory ``dir_fd`` refers to, never following links."""
+    st = os.fstat(dir_fd)
+    if st.st_uid == os.getuid() and st.st_mode & 0o700 != 0o700:
+        os.fchmod(dir_fd, stat.S_IMODE(st.st_mode) | 0o700)  # read-only launcher dirs, or a child's chmod
+    scan_fd = os.open(os.curdir, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+    try:
+        with os.scandir(scan_fd) as iterator:
+            names = [entry.name for entry in iterator]
+    finally:
+        os.close(scan_fd)
+    for name in names:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            child = _open_dir_entry(name, dir_fd)
+            try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                    raise OSError(errno.ESTALE, f"{name} changed during cleanup")
+                _clear_directory_fd(child)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=dir_fd)
+        else:
+            os.unlink(name, dir_fd=dir_fd)
+
+
 class StateRoot:
-    """A private 0700 directory, anchored by descriptor and removed on every exit."""
+    """A private 0700 directory, anchored by descriptor and removed on every exit.
+
+    On POSIX, cleanup walks the allocation-time descriptor, so replacing or
+    moving the path cannot redirect deletion to other content; the final rmdir
+    goes through the parent descriptor and is confirmed against the anchor.
+    """
 
     def __init__(self, base):
-        self.path = tempfile.mkdtemp(prefix="hermes-mu-", dir=base)
-        self._fd = None
+        self._fd = self._parent_fd = None
         self._ident = None
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        self._before_unlink = None  # self-test barrier between identity check and rmdir
         try:
             if os.name == "posix":
-                self._fd = os.open(self.path, flags)
+                self._parent_fd = os.open(base, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            self.path = tempfile.mkdtemp(prefix="hermes-mu-", dir=base)
+            self.name = os.path.basename(self.path)
+            if os.name == "posix":
+                self._fd = os.open(self.name, _DIR_OPEN_FLAGS, dir_fd=self._parent_fd)
                 st = os.fstat(self._fd)
+                lst = os.stat(self.name, dir_fd=self._parent_fd, follow_symlinks=False)
             else:
-                st = os.stat(self.path)
-            lst = os.lstat(self.path)
+                st = lst = os.lstat(self.path)
             if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino) or not stat.S_ISDIR(lst.st_mode):
                 raise refused("unsafe_symlink", "state root changed while it was allocated")
             if os.name == "posix" and (lst.st_uid != os.getuid() or lst.st_mode & 0o077):
                 raise refused("unsafe_symlink", "state root is not private")
             self._ident = (st.st_dev, st.st_ino)
         except BaseException:
-            self._close_fd()
+            self._close()
             raise
 
-    def _close_fd(self):
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+    def _close(self):
+        for attr in ("_fd", "_parent_fd"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                os.close(fd)
+                setattr(self, attr, None)
 
     def intact(self):
         try:
@@ -785,16 +1098,52 @@ class StateRoot:
         return not _is_link_like(st) and (st.st_dev, st.st_ino) == self._ident
 
     def remove(self):
-        """Delete the root only while it is still the allocated directory."""
+        """Remove the allocated directory; anything else at its path is left untouched."""
         try:
-            if not os.path.lexists(self.path):
+            if os.name != "posix":
+                return self._remove_by_path()
+            try:
+                _clear_directory_fd(self._fd)
+            except OSError as exc:
+                raise failed("teardown_failed", f"state root contents could not be removed: {exc}") from None
+            if self._before_unlink is not None:
+                self._before_unlink()
+            try:
+                entry = os.stat(self.name, dir_fd=self._parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                raise failed(
+                    "teardown_failed",
+                    "state root was moved away; its contents were cleared through the anchored descriptor",
+                ) from None
+            if _is_link_like(entry) or (entry.st_dev, entry.st_ino) != self._ident:
+                raise failed(
+                    "teardown_failed",
+                    "state root was replaced; the replacement was left untouched and the original cleared",
+                )
+            try:
+                os.rmdir(self.name, dir_fd=self._parent_fd)
+            except OSError as exc:
+                raise failed("teardown_failed", f"state root could not be removed: {exc}") from None
+            # An unlinked directory refuses new entries; if this succeeds, the
+            # rmdir above removed a swapped-in empty directory, not the anchor.
+            try:
+                os.mkdir(".mu-unlink-probe", dir_fd=self._fd)
+            except FileNotFoundError:
                 return True
-            if not self.intact():
-                raise failed("teardown_failed", "state root was replaced; it was not deleted")
-            shutil.rmtree(self.path)
-            return not os.path.lexists(self.path)
+            except OSError as exc:
+                raise failed("teardown_failed", f"state root removal could not be confirmed: {exc}") from None
+            os.rmdir(".mu-unlink-probe", dir_fd=self._fd)
+            raise failed("teardown_failed", "the removed entry was not the anchored state root")
         finally:
-            self._close_fd()
+            self._close()
+
+    def _remove_by_path(self):
+        if not os.path.lexists(self.path):
+            return True
+        if not self.intact():
+            raise failed("teardown_failed", "state root was replaced; it was not deleted")
+        shutil.rmtree(self.path)
+        return not os.path.lexists(self.path)
 
 
 def create_layout(state_root, helper):
@@ -946,36 +1295,63 @@ def terminate_group(proc, first_signal=None, grace=INTERRUPT_GRACE_SECONDS):
     return os.name != "posix" or not _group_alive(proc.pid)
 
 
-def run_child(cmd, *, env, cwd, timeout, result=None, label="child"):
-    """Run ``cmd`` in its own process group with inherited stdio and bounded waits."""
+def run_child(cmd, *, env, cwd, timeout, result=None, label="child", after_spawn=None):
+    """Run ``cmd`` in its own process group with inherited stdio and bounded waits.
+
+    A signal that arrives while the child is being created is deferred until
+    the child is owned here, and the owned group is terminated on every exit.
+    ``after_spawn`` is a self-test seam called at the ownership boundary.
+    """
     kwargs = {"env": env, "cwd": cwd, "stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     else:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    proc = subprocess.Popen(cmd, **kwargs)
-    deadline = time.monotonic() + timeout
+    _SignalState.phase = "spawn"
     try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    finally:
+        _SignalState.phase = "run"
+    outcome = code = None
+    gone = True
+    try:
+        _SignalState.phase = "spawn"
+        try:
+            if after_spawn is not None:
+                after_spawn(proc)
+        finally:
+            _SignalState.phase = "run"
+        if _SignalState.received is not None:
+            raise _Interrupted(_SignalState.received)
+        deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                gone = terminate_group(proc)
-                raise failed("child_timeout", f"{label} exceeded {timeout}s; owned group terminated={gone}")
+                outcome = failed("child_timeout", f"{label} exceeded {timeout}s")
+                break
             try:
                 code = proc.wait(timeout=min(remaining, 0.5))
                 break
             except subprocess.TimeoutExpired:
                 continue
     except _Interrupted as exc:
+        outcome = failed("interrupted", f"signal {exc.signum} received")
+    finally:
         _SignalState.phase = "teardown"
-        gone = terminate_group(proc, first_signal=signal.SIGINT)
-        raise failed("interrupted", f"signal {exc.signum} received; owned group terminated={gone}") from None
-    if os.name == "posix" and _group_alive(proc.pid):
-        gone = terminate_group(proc)
-        if result is not None:
-            result.check("leftover_descendants_terminated", "PASS" if gone else "FAIL", label)
-        if not gone:
-            raise failed("launcher_error", f"{label} left processes that could not be terminated")
+        try:
+            leftover = proc.poll() is None or (os.name == "posix" and _group_alive(proc.pid))
+            if leftover:
+                interrupted = outcome is not None and outcome.code == "interrupted"
+                gone = terminate_group(proc, first_signal=signal.SIGINT if interrupted else None)
+                if result is not None and outcome is None:
+                    result.check("leftover_descendants_terminated", "PASS" if gone else "FAIL", label)
+        finally:
+            _SignalState.phase = "run"
+    if outcome is not None:
+        outcome.detail += f"; owned group terminated={gone}"
+        raise outcome
+    if not gone:
+        raise failed("launcher_error", f"{label} left processes that could not be terminated")
     return code
 
 
@@ -1113,53 +1489,319 @@ def build_parser():
 
 
 def load_helper(repo_root):
-    """Load the stdlib helper by validated path (works under -I -S)."""
+    """Load the stdlib helper from one validated read (works under -I -S).
+
+    Returns ``(module, source_bytes)``; the same bytes are snapshotted for
+    script runs, so every process uses the version that was validated here.
+    """
     path = os.path.join(repo_root, "scripts", "multiuser_test_fixtures.py")
     st = _walk_components(repo_root, path)
     if not stat.S_ISREG(st.st_mode):
         raise refused("path_missing", "scripts/multiuser_test_fixtures.py is not a regular file")
-    spec = importlib.util.spec_from_file_location("_hermes_mu_fixtures", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    source = _read_validated_file(path, st, "scripts/multiuser_test_fixtures.py")
+    module = types.ModuleType("_hermes_mu_fixtures")
+    module.__file__ = path
+    sys.modules[module.__name__] = module
+    exec(compile(source, path, "exec"), module.__dict__)
+    return module, source
+
+
+# ── Import binding ───────────────────────────────────────────────────────────
+
+IMPORT_GUARD_MODULE = "mu_import_guard"
+IMPORT_MANIFEST_VAR = "HERMES_MU_IMPORT_MANIFEST"
+IMPORT_MANIFEST_SHA_VAR = "HERMES_MU_IMPORT_MANIFEST_SHA256"
+_MANIFEST_SKIP = frozenset({"node_modules", "__pycache__"})
+
+# Written into the state root and loaded first (pytest ``-p``; script runner
+# import) in every child, before any checkout module can be imported.
+_IMPORT_GUARD_SOURCE = '''"""Launcher-owned import guard: checkout sources load only as approved bytes."""
+import errno
+import hashlib
+import json
+import os
+from importlib import machinery
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _load_manifest():
+    fd = os.open(os.environ["HERMES_MU_IMPORT_MANIFEST"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as handle:
+        raw = handle.read()
+    if hashlib.sha256(raw).hexdigest() != os.environ["HERMES_MU_IMPORT_MANIFEST_SHA256"]:
+        raise ImportError("the import manifest does not match the launcher-approved digest")
+    return json.loads(raw)
+
+
+_DATA = _load_manifest()
+_ROOT = _DATA["root"]
+_VENV = os.path.join(_ROOT, ".venv")
+_FILES = _DATA["files"]
+_ROOT_FD = os.open(_ROOT, _DIR_FLAGS)
+_st = os.fstat(_ROOT_FD)
+if (_st.st_dev, _st.st_ino) != (_DATA["root_dev"], _DATA["root_ino"]):
+    raise ImportError("the checkout root changed after launcher preflight")
+try:
+    os.stat(".env", dir_fd=_ROOT_FD, follow_symlinks=False)
+except FileNotFoundError:
+    pass
+else:
+    raise ImportError("a checkout .env appeared after launcher preflight")
+
+
+def _within(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _relative(path):
+    path = os.path.abspath(os.fspath(path))
+    if not _within(path, _ROOT) or _within(path, _VENV):
+        return None
+    return os.path.relpath(path, _ROOT)
+
+
+def _read_anchored(rel):
+    parts = rel.split(os.sep)
+    fd = os.open(os.curdir, _DIR_FLAGS, dir_fd=_ROOT_FD)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        file_fd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=fd)
+    finally:
+        os.close(fd)
+    with os.fdopen(file_fd, "rb") as handle:
+        return handle.read()
+
+
+_source_get_data = machinery.SourceFileLoader.get_data
+_sourceless_get_data = machinery.SourcelessFileLoader.get_data
+_extension_create = machinery.ExtensionFileLoader.create_module
+
+
+def _bound_get_data(self, path):
+    rel = _relative(path)
+    if rel is None:
+        return _source_get_data(self, path)
+    if not rel.endswith(".py"):
+        raise FileNotFoundError(errno.ENOENT, "checkout bytecode is never used", path)
+    expected = _FILES.get(rel.replace(os.sep, "/"))
+    if expected is None:
+        raise ImportError(f"{rel} is not a launcher-approved checkout source")
+    try:
+        data = _read_anchored(rel)
+    except OSError as exc:
+        raise ImportError(f"{rel} cannot be read through the anchored checkout: {exc}") from None
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ImportError(f"{rel} changed after launcher preflight")
+    return data
+
+
+def _refused_sourceless(self, path):
+    if _relative(path) is not None:
+        raise ImportError(f"{path}: sourceless modules inside the checkout are refused")
+    return _sourceless_get_data(self, path)
+
+
+def _refused_extension(self, spec):
+    if _relative(getattr(self, "path", "")) is not None:
+        raise ImportError(f"{self.path}: extension modules inside the checkout are refused")
+    return _extension_create(self, spec)
+
+
+machinery.SourceFileLoader.get_data = _bound_get_data
+machinery.SourcelessFileLoader.get_data = _refused_sourceless
+machinery.ExtensionFileLoader.create_module = _refused_extension
+'''
+
+
+def build_import_manifest(repo_root):
+    """SHA-256 of every regular checkout ``.py``, read by a descriptor-anchored walk.
+
+    Links are never entered or recorded, so nothing reached through one is
+    importable; dot-directories (``.venv``, ``.git``) are outside the manifest.
+    """
+    root_fd = os.open(repo_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    files = {}
+
+    def walk(dir_fd, prefix):
+        scan_fd = os.open(os.curdir, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+        try:
+            with os.scandir(scan_fd) as iterator:
+                names = sorted(entry.name for entry in iterator)
+        finally:
+            os.close(scan_fd)
+        for name in names:
+            if name.startswith(".") or name in _MANIFEST_SKIP:
+                continue
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                child = os.open(name, _DIR_OPEN_FLAGS, dir_fd=dir_fd)
+                try:
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                        raise refused("unsafe_symlink", f"{prefix}{name} changed during the source walk")
+                    walk(child, f"{prefix}{name}/")
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(st.st_mode) and name.endswith(".py"):
+                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+                with os.fdopen(fd, "rb") as handle:
+                    opened = os.fstat(handle.fileno())
+                    if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                        raise refused("unsafe_symlink", f"{prefix}{name} changed during the source walk")
+                    files[prefix + name] = hashlib.sha256(handle.read()).hexdigest()
+
+    try:
+        root_st = os.fstat(root_fd)
+        walk(root_fd, "")
+    finally:
+        os.close(root_fd)
+    return {"root": repo_root, "root_dev": root_st.st_dev, "root_ino": root_st.st_ino, "files": files}
+
+
+def check_import_shadowing(repo_root, venv):
+    """Refuse checkout top-level modules that would shadow stdlib/venv modules.
+
+    ``python -m pytest`` and the runner's interpreter search the checkout
+    before stdlib and site-packages while starting up, before the import guard
+    is installed, so a same-named checkout module would load unbound.
+    """
+    shadowable = set(getattr(sys, "stdlib_module_names", ())) | {IMPORT_GUARD_MODULE, "multiuser_test_fixtures"}
+    for site in venv.site_dirs:
+        for name in os.listdir(site):
+            stem = name[:-3] if name.endswith(".py") else name
+            if stem.isidentifier():
+                shadowable.add(stem)
+    for name in os.listdir(repo_root):
+        path = os.path.join(repo_root, name)
+        stem = name[:-3] if name.endswith(".py") else name
+        # A directory without __init__.py is only a namespace portion and
+        # loses to a regular package later on sys.path.
+        importable = name.endswith(".py") or os.path.isfile(os.path.join(path, "__init__.py"))
+        if importable and stem in shadowable:
+            raise refused("import_shadowing", f"checkout top-level {name!r} shadows a stdlib or venv module")
+
+
+def write_import_guard(state_root, manifest):
+    """Write the guard module and manifest read-only; return the env entries that bind them."""
+    launcher_dir = os.path.join(state_root, "launcher")
+    guard_dir = os.path.join(launcher_dir, "importguard")
+    os.makedirs(guard_dir, mode=0o700)
+    _write_new_file(os.path.join(guard_dir, IMPORT_GUARD_MODULE + ".py"), _IMPORT_GUARD_SOURCE.encode())
+    os.chmod(guard_dir, 0o500)
+    raw = json.dumps(manifest, sort_keys=True).encode()
+    manifest_path = os.path.join(launcher_dir, "import-manifest.json")
+    _write_new_file(manifest_path, raw)
+    return {
+        "PYTHONPATH": guard_dir,
+        IMPORT_MANIFEST_VAR: manifest_path,
+        IMPORT_MANIFEST_SHA_VAR: hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _write_new_file(path, data, mode=0o400):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+# ── Pytest configuration ─────────────────────────────────────────────────────
+
+
+def validated_pytest_markers(repo_root):
+    """Read the checkout pytest.ini statically; only ``[pytest] markers`` are allowed."""
+    ini = os.path.join(repo_root, "pytest.ini")
+    if not os.path.lexists(ini):
+        return []
+    st = os.lstat(ini)
+    if _is_link_like(st) or not stat.S_ISREG(st.st_mode):
+        raise refused("unsafe_symlink", "pytest.ini is not a regular file")
+    try:
+        text = _read_validated_file(ini, st, "pytest.ini", limit=64 * 1024).decode("utf-8")
+        parser = configparser.ConfigParser(interpolation=None, strict=True, default_section="\x00none")
+        parser.read_string(text)
+    except (UnicodeDecodeError, configparser.Error) as exc:
+        raise refused("pytest_config_disallowed", f"pytest.ini cannot be parsed safely: {exc.__class__.__name__}") from None
+    extra_sections = [name for name in parser.sections() if name != "pytest"]
+    if extra_sections:
+        raise refused("pytest_config_disallowed", "pytest.ini has unreviewed sections: " + ", ".join(extra_sections))
+    if not parser.has_section("pytest"):
+        return []
+    keys = set(parser["pytest"].keys()) - {"markers"}
+    if keys:
+        raise refused("pytest_config_disallowed", "pytest.ini sets unreviewed options: " + ", ".join(sorted(keys)))
+    markers = [line.strip() for line in parser["pytest"].get("markers", "").splitlines() if line.strip()]
+    for line in markers:
+        if not _MARKER_LINE_RE.match(line):
+            raise refused("pytest_config_disallowed", f"pytest.ini marker line is not a plain marker: {line[:80]!r}")
+    return markers
+
+
+def write_private_ini(state_root, markers):
+    path = os.path.join(state_root, "launcher", "pytest.ini")
+    text = "[pytest]\n"
+    if markers:
+        text += "markers =\n" + "".join(f"    {line}\n" for line in markers)
+    _write_new_file(path, text.encode())
+    return path
 
 
 # ── Real runs ────────────────────────────────────────────────────────────────
 
+# Runs under ``python -P`` (no checkout on sys.path): the import guard loads
+# first, then the snapshot helper installs a deny-by-default NetworkGuard, then
+# the immutable script snapshot executes with only its snapshot dir on sys.path.
 _SCRIPT_RUNNER = (
     "import os, sys\n"
-    "_path, _snapshot = sys.argv[1], sys.argv[2]\n"
-    "with open(_snapshot, 'rb') as _f:\n"
-    "    _code = compile(_f.read(), _path, 'exec')\n"
-    "sys.argv = [_path] + sys.argv[3:]\n"
-    "sys.path[0] = os.path.dirname(_path)\n"
-    "exec(_code, {'__name__': '__main__', '__file__': _path, '__spec__': None})\n"
+    "import mu_import_guard\n"
+    "_snapdir, _name = sys.argv[1], sys.argv[2]\n"
+    "sys.path.insert(0, _snapdir)\n"
+    "import multiuser_test_fixtures as _mu\n"
+    "_mu.NetworkGuard(allow_unix_under=[os.environ['HERMES_MU_STATE_ROOT']]).install()\n"
+    "_script = os.path.join(_snapdir, _name)\n"
+    "with open(_script, 'rb') as _f:\n"
+    "    _code = compile(_f.read(), _script, 'exec')\n"
+    "sys.argv = [_script] + sys.argv[3:]\n"
+    "exec(_code, {'__name__': '__main__', '__file__': _script, '__spec__': None})\n"
 )
 
 
+def write_script_snapshot(state_root, script_path, snapshot, helper_source):
+    snapdir = os.path.join(state_root, "launcher", "script")
+    os.makedirs(snapdir, mode=0o700)
+    name = os.path.basename(script_path)
+    _write_new_file(os.path.join(snapdir, name), snapshot)
+    _write_new_file(os.path.join(snapdir, "multiuser_test_fixtures.py"), helper_source)
+    os.chmod(snapdir, 0o500)
+    return snapdir, name
+
+
 def _pytest_base_args(repo_root, confcutdir, ini):
-    args = ["-p", "no:cacheprovider"]
+    args = ["-p", IMPORT_GUARD_MODULE, "-p", "no:cacheprovider"]
     for plugin in PYTEST_PLUGINS:
         args.extend(("-p", plugin))
-    args.extend((f"--rootdir={repo_root}", "-c", ini, f"--confcutdir={confcutdir}"))
+    args.extend((f"--rootdir={repo_root}", "-c", ini, f"--confcutdir={confcutdir}", "--assert=plain"))
     return args
 
 
-def _pytest_ini(repo_root, state_root):
-    ini = os.path.join(repo_root, "pytest.ini")
-    if os.path.lexists(ini):
-        st = os.lstat(ini)
-        if _is_link_like(st) or not stat.S_ISREG(st.st_mode):
-            raise refused("unsafe_symlink", "pytest.ini is not a regular file")
-        return ini
-    generated = os.path.join(state_root, "launcher", "pytest.ini")
-    with open(generated, "w", encoding="utf-8") as handle:
-        handle.write("[pytest]\n")
-    return generated
+def checkout_unchanged(path, ident):
+    """True while ``path`` is still the explicit checkout directory validated earlier."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return not _is_link_like(st) and (st.st_dev, st.st_ino) == ident
 
 
-def run_selected(selection, args, passthrough, result, repo_root, helper):
+def run_selected(selection, args, passthrough, result, repo_root, helper, helper_source):
     parent_env = dict(os.environ)
     home = helper.operator_home()
     test_sh = os.path.join(repo_root, "scripts", "test.sh")
@@ -1167,21 +1809,27 @@ def run_selected(selection, args, passthrough, result, repo_root, helper):
     if not stat.S_ISREG(sh_st.st_mode):
         raise refused("path_missing", "scripts/test.sh is not a regular file")
 
-    pytest_args = script_path = snapshot = None
+    pytest_args = script_path = snapshot = markers = None
     if selection.mode == "pytest":
         pytest_args = validate_pytest_args(passthrough, repo_root)
+        markers = validated_pytest_markers(repo_root)
     else:
         if any("\0" in arg for arg in passthrough):
             raise refused("usage", "script argument contains a NUL byte")
         script_path, snapshot = validate_repo_script(args.script, repo_root)
+        if os.path.basename(script_path) in (IMPORT_GUARD_MODULE + ".py", "multiuser_test_fixtures.py"):
+            raise refused("script_invalid", "the script name collides with a launcher snapshot module")
     if os.name != "posix":
         raise not_run("platform_route_unverified", "pytest/script runs need a verified Windows shell route")
     tier_prerequisites(selection, args)
 
     agent_path = agent_ident = None
     if args.agent_checkout:
-        agent_path, agent_ident = validate_agent_checkout(args.agent_checkout, repo_root, home)
+        agent_path, agent_ident = validate_agent_checkout(args.agent_checkout, repo_root, home, parent_env)
         result.agent = "explicit"
+    if script_path is not None and not script_admitted(script_path, repo_root):
+        raise not_run("script_unreviewed", "only reviewed F02-aware scripts (tests/multiuser/**, "
+                      "tests/browser_multiuser_*.py) run under the launcher")
     hits = dotenv_hits(*[p for p in (repo_root, agent_path) if p])
     if hits:
         raise not_run("checkout_dotenv_present", "a .env would be loaded: " + ", ".join(hits))
@@ -1190,21 +1838,34 @@ def run_selected(selection, args, passthrough, result, repo_root, helper):
     if agent_hits:
         raise not_run("implicit_agent_discoverable", "installed Agent discoverable at: " + ", ".join(agent_hits))
 
-    bootstrap_base = None
+    prepare_base = None
+    missing = []
     try:
         venv = inspect_venv(repo_root, home, result)
+        missing = missing_runner_modules(venv)
     except Outcome as exc:
         if exc.code != "venv_unavailable":
             raise
         if selection.tier == "browser":
             raise not_run("browser_runtime_unavailable", "repo .venv does not exist, so Playwright is absent") from None
         venv = None
-        bootstrap_base = select_base_python(parent_env, home)
-        scan_interpreter_hooks(bootstrap_base, result)
-        scan_site_packages(bootstrap_base.site_packages, bootstrap_base.prefix)
-    if venv is not None and selection.tier == "browser" and not browser_runtime_ready(venv):
-        raise not_run("browser_runtime_unavailable", "repo .venv has no project-local Playwright browsers")
-    result.check("preflight", "PASS", "paths, sources, dotenv, discovery and interpreter provenance checked")
+        prepare_base = select_base_python(parent_env, home)
+        scan_interpreter_hooks(prepare_base, result)
+        scan_site_packages(prepare_base.site_packages)
+    if selection.tier == "browser":
+        if not browser_runtime_ready(venv):
+            raise not_run("browser_runtime_unavailable", "repo .venv has no project-local Playwright browsers")
+        raise not_run("browser_transport_unverified",
+                      "the browser runs as an unguarded subprocess with its own credential stores; "
+                      "no verified browser transport or credential compartment exists")
+    if agent_path is not None:
+        raise not_run("credential_compartment_unverified",
+                      "explicit Agent code can reach OS credential stores (such as the macOS login "
+                      "Keychain) that HOME isolation does not cover; no synthetic credential "
+                      "compartment is available")
+    if venv is not None:
+        check_import_shadowing(repo_root, venv)
+    result.check("preflight", "PASS", "paths, sources, config, dotenv, discovery and interpreter provenance checked")
 
     base = trusted_temp_base(home)
     root = StateRoot(base)
@@ -1217,48 +1878,44 @@ def run_selected(selection, args, passthrough, result, repo_root, helper):
             "tier": selection.tier, "agent_checkout": agent_path,
             "venv_python": venv_python, "path_dirs": path_dirs,
         }
-        ini = _pytest_ini(repo_root, root.path)
-        if venv is None:
-            empty = os.path.join(root.path, "launcher", "no-conftest")
-            os.makedirs(empty, mode=0o700)
-            env = checked_child_env(parent_env, build_child_env(
-                parent_env, layout, extra={"HERMES_WEBUI_TEST_PYTHON": bootstrap_base.exe}, **common
-            ), helper)
-            cmd = ["/bin/bash", test_sh] + _pytest_base_args(repo_root, empty, ini) + ["--version"]
-            sys.stderr.write("test_multiuser: bootstrapping repo .venv through scripts/test.sh\n")
-            code = run_child(cmd, env=env, cwd=repo_root, timeout=args.child_timeout, result=result,
-                             label="bootstrap")
+        if venv is None or missing:
+            extra = {"HERMES_WEBUI_TEST_PYTHON": prepare_base.exe} if venv is None else None
+            env = checked_child_env(parent_env, build_child_env(parent_env, layout, extra=extra, **common), helper)
+            sys.stderr.write("test_multiuser: provisioning repo .venv through scripts/test.sh --prepare-only\n")
+            code = run_child(["/bin/bash", test_sh, "--prepare-only"], env=env, cwd=repo_root,
+                             timeout=args.child_timeout, result=result, label="prepare")
             if code != 0:
-                raise failed("bootstrap_failed", f"scripts/test.sh bootstrap exited {code}")
+                raise failed("prepare_failed", f"scripts/test.sh --prepare-only exited {code}")
             venv = inspect_venv(repo_root, home, result)
-            if selection.tier == "browser" and not browser_runtime_ready(venv):
-                raise not_run("browser_runtime_unavailable", "repo .venv has no project-local Playwright browsers")
-            result.check("bootstrap", "PASS", "repo .venv created hermetically and re-validated")
-        extra = {"PLAYWRIGHT_BROWSERS_PATH": "0"} if selection.tier == "browser" else None
-        env = checked_child_env(parent_env, build_child_env(parent_env, layout, extra=extra, **common), helper)
-        result.check("child_environment", "PASS", "allowlisted, disposable and verified before spawn")
+            missing = missing_runner_modules(venv)
+            if missing:
+                raise not_run("venv_dependencies_missing", "still missing after prepare: " + ", ".join(missing))
+            check_import_shadowing(repo_root, venv)
+            result.check("venv_prepared", "PASS", "scripts/test.sh --prepare-only, then a static re-audit")
+        bound = write_import_guard(root.path, build_import_manifest(repo_root))
+        env = checked_child_env(parent_env, build_child_env(parent_env, layout, extra=bound, **common), helper)
+        result.check("child_environment", "PASS", "allowlisted, disposable, import-bound and verified before spawn")
         sys.stderr.write(
             f"test_multiuser: tier={selection.tier} mode={selection.mode} state={root.path} (disposable)\n"
         )
         if selection.mode == "pytest":
+            ini = write_private_ini(root.path, markers)
             junit = os.path.join(root.path, "launcher", "junit.xml")
-            cmd = ["/bin/bash", test_sh] + _pytest_base_args(
+            cmd = ["/bin/bash", test_sh, "--execute-only"] + _pytest_base_args(
                 repo_root, os.path.join(repo_root, "tests", "multiuser"), ini
             ) + [f"--junitxml={junit}", "-o", "junit_family=xunit2"] + pytest_args
             code = run_child(cmd, env=env, cwd=repo_root, timeout=args.child_timeout, result=result,
                              label="pytest")
             result.child_exit_code = code
-            counts = parse_junit(junit)
-            result.tests = counts
-            verdict = judge_pytest(code, counts)
+            if code == RUNNER_NOT_PREPARED_EXIT:
+                verdict = not_run("venv_dependencies_missing", "scripts/test.sh --execute-only refused to provision")
+            else:
+                counts = parse_junit(junit)
+                result.tests = counts
+                verdict = judge_pytest(code, counts)
         else:
-            snap = os.path.join(root.path, "launcher", "script_snapshot.py")
-            fd = os.open(snap, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-            try:
-                os.write(fd, snapshot)
-            finally:
-                os.close(fd)
-            cmd = [venv_python, "-c", _SCRIPT_RUNNER, script_path, snap] + list(passthrough)
+            snapdir, name = write_script_snapshot(root.path, script_path, snapshot, helper_source)
+            cmd = [venv_python, "-P", "-c", _SCRIPT_RUNNER, snapdir, name] + list(passthrough)
             code = run_child(cmd, env=env, cwd=repo_root, timeout=args.child_timeout, result=result,
                              label="script")
             result.child_exit_code = code
@@ -1268,14 +1925,9 @@ def run_selected(selection, args, passthrough, result, repo_root, helper):
                 verdict = not_run("script_not_run", f"script exited {SCRIPT_NOT_RUN_EXIT} (prerequisite unavailable)")
             else:
                 verdict = failed("child_failed", f"script exited {code}")
-        if agent_path is not None:
-            try:
-                st = os.lstat(agent_path)
-                same = not _is_link_like(st) and (st.st_dev, st.st_ino) == agent_ident
-            except OSError:
-                same = False
-            if not same:
-                raise failed("source_replaced", "the explicit Agent checkout was replaced during the run")
+        # Reachable once a credential compartment lifts the explicit-Agent gate above.
+        if agent_path is not None and not checkout_unchanged(agent_path, agent_ident):
+            raise failed("source_replaced", "the explicit Agent checkout was replaced during the run")
         if verdict is not None:
             raise verdict
         result.settle("PASS")
@@ -1503,6 +2155,8 @@ class _SelfTest:
             (["../outside_test.py"], "path_outside_checkout"),
             (["tests/multiuser/test_link.py"], "unsafe_symlink"),
             (["tests/multiuser/test_missing.py"], "path_missing"),
+            # The default directory scope collects tests/multiuser/test_link.py through its link.
+            (["-q"], "unsafe_symlink"),
         ]
         for args, code in bad:
             self.expect(lambda args=args: validate_pytest_args(args, repo), "REFUSED", code)
@@ -1510,9 +2164,60 @@ class _SelfTest:
             ["-q", "tests/multiuser/test_ok.py::test_ok", "-k", "ok and not slow", "--timeout=30", "-rA"], repo
         )
         assert good[-1] == "-rA" and "tests/multiuser/test_ok.py::test_ok" in good
-        assert validate_pytest_args(["-q"], repo) == ["-q", os.path.join("tests", "multiuser")]
+        chain = self.fake_repo("pytest-chain")
+        self.symlink(
+            os.path.join(self.scratch, "pytest-args", "outside_test.py"),
+            os.path.join(chain, "tests", "multiuser", "conftest.py"),
+        )
+        self.expect(lambda: validate_pytest_args(["tests/multiuser/test_ok.py"], chain), "REFUSED", "unsafe_symlink")
+        clean = self.fake_repo("pytest-clean")
+        # A linked non-collectable helper is left to the import guard, which refuses links.
+        self.symlink(
+            os.path.join(self.scratch, "pytest-args", "outside_test.py"),
+            os.path.join(clean, "tests", "multiuser", "linked_helper.py"),
+        )
+        assert validate_pytest_args(["-q"], clean) == ["-q", os.path.join("tests", "multiuser")]
         assert not os.path.lexists(self.marker)
-        return f"{len(bad)} unsafe pytest arguments refused; default scope is tests/multiuser"
+        return f"{len(bad) + 1} unsafe pytest arguments or collected links refused; default scope is tests/multiuser"
+
+    def check_pytest_config(self):
+        cases = {
+            "addopts": ("[pytest]\naddopts = -p poison\n", "pytest_config_disallowed"),
+            "pythonpath": ("[pytest]\npythonpath = /elsewhere\n", "pytest_config_disallowed"),
+            "filterwarnings": ("[pytest]\nfilterwarnings = error::api.config.Warning\n", "pytest_config_disallowed"),
+            "section": ("[pytest]\nmarkers =\n    a: b\n[tool:pytest]\naddopts = -x\n", "pytest_config_disallowed"),
+            "marker": ("[pytest]\nmarkers =\n    not a marker line\n", "pytest_config_disallowed"),
+            "duplicate": ("[pytest]\nmarkers = a: b\nmarkers = c: d\n", "pytest_config_disallowed"),
+        }
+        for name, (text, code) in cases.items():
+            repo = self.fake_repo(f"ini-{name}")
+            self.write(os.path.join(repo, "pytest.ini"), text)
+            self.expect(lambda repo=repo: validated_pytest_markers(repo), "REFUSED", code)
+        linked = self.fake_repo("ini-linked")
+        target = self.write(os.path.join(self.scratch, "ini-linked", "real.ini"), "[pytest]\n")
+        self.symlink(target, os.path.join(linked, "pytest.ini"))
+        self.expect(lambda: validated_pytest_markers(linked), "REFUSED", "unsafe_symlink")
+        ok = self.fake_repo("ini-ok")
+        self.write(os.path.join(ok, "pytest.ini"), "[pytest]\nmarkers =\n    integration: live\n    slow(n): long\n")
+        markers = validated_pytest_markers(ok)
+        assert markers == ["integration: live", "slow(n): long"], markers
+        assert validated_pytest_markers(self.fake_repo("ini-absent")) == []
+        state = os.path.join(self.scratch, "ini-state")
+        os.makedirs(os.path.join(state, "launcher"))
+        with open(write_private_ini(state, markers), encoding="utf-8") as handle:
+            text = handle.read()
+        assert text == "[pytest]\nmarkers =\n    integration: live\n    slow(n): long\n", text
+        return f"{len(cases) + 1} unsafe pytest.ini variants refused; private ini carries markers only"
+
+    def check_script_admission(self):
+        repo = self.repo_root
+        admitted = ["tests/multiuser/fixtures/probe.py", "tests/multiuser/x.py", "tests/browser_multiuser_roles.py"]
+        rejected = ["tests/browser_smoke.py", "scripts/x.py", "tests/test_x.py", "tests/browser_multiuser_.py"]
+        for rel in admitted:
+            assert script_admitted(os.path.join(repo, rel), repo), f"{rel} should be admitted"
+        for rel in rejected:
+            assert not script_admitted(os.path.join(repo, rel), repo), f"{rel} should not be admitted"
+        return "only reviewed F02-aware script locations are admitted"
 
     def check_agent_checkout(self):
         repo = self.fake_repo("agent")
@@ -1524,19 +2229,34 @@ class _SelfTest:
         sibling = os.path.join(base, "hermes-agent")
         self.write(os.path.join(sibling, "run_agent.py"), self.marker_writer())
         self.write(os.path.join(repo, "nested-agent", "run_agent.py"), self.marker_writer())
+        xdg = os.path.join(base, "xdg-data")
+        self.write(os.path.join(xdg, "hermes-agent", "run_agent.py"), self.marker_writer())
+        inner_link = os.path.join(base, "agent-inner-link")
+        self.write(os.path.join(inner_link, "run_agent.py"), self.marker_writer())
+        self.symlink(os.path.join(good, "run_agent.py"), os.path.join(inner_link, "tools.py"))
+        parent_env = {"XDG_DATA_HOME": xdg}
         cases = [
             (os.path.join(self.home, ".hermes", "hermes-agent"), "installed_agent_location"),
+            (os.path.join(self.home, ".local", "share", "hermes-agent"), "installed_agent_location"),
+            (os.path.join(xdg, "hermes-agent"), "installed_agent_location"),
             ("/usr/local/lib/hermes-agent", "installed_agent_location"),
             (sibling, "implicit_discovery_location"),
             (os.path.join(repo, "nested-agent"), "agent_checkout_invalid"),
             (os.path.join(base, "agent-missing"), "path_missing"),
             (os.path.join(base, "agent-link"), "unsafe_symlink"),
             (os.path.join(base, "agent-empty"), "agent_checkout_invalid"),
+            (inner_link, "unsafe_symlink"),
         ]
         for raw, code in cases:
-            self.expect(lambda raw=raw: validate_agent_checkout(raw, repo, self.home), "REFUSED", code)
-        path, ident = validate_agent_checkout(good, repo, self.home)
+            self.expect(
+                lambda raw=raw: validate_agent_checkout(raw, repo, self.home, parent_env), "REFUSED", code
+            )
+        path, ident = validate_agent_checkout(good, repo, self.home, parent_env)
         assert path == good and ident[1] == os.lstat(good).st_ino
+        assert checkout_unchanged(good, ident)
+        os.rename(good, good + "-moved")
+        os.makedirs(good)
+        assert not checkout_unchanged(good, ident), "a replaced checkout was not detected"
         assert not os.path.lexists(self.marker), "an Agent checkout was executed during validation"
         return f"{len(cases)} unsafe Agent sources refused; explicit synthetic checkout accepted unexecuted"
 
@@ -1585,9 +2305,23 @@ class _SelfTest:
             self.write(os.path.join(base, "lib", f"python{version}", "sitecustomize.py"), hook)
         return exe
 
-    def fake_venv(self, name, *, version="3.13", include="false", base_hook=None):
+    def trusted_base(self):
+        """A verified distribution interpreter on this host (inspected, never executed)."""
+        try:
+            return inspect_venv(self.repo_root, self.home).base
+        except Outcome:
+            pass
+        env = {"PATH": os.pathsep.join(WELL_KNOWN_PYTHON_DIRS)}
+        try:
+            return select_base_python(env, self.home)
+        except Outcome as exc:
+            raise _NotApplicable(f"no verified distribution interpreter on this host: {exc.detail}") from None
+
+    def fake_venv(self, name, base, *, version=None, include="false"):
+        """A synthetic repo .venv whose home and bin/python point at ``base``'s executable."""
         repo = self.fake_repo(name)
-        exe = self.fake_base(name, version, base_hook)
+        exe = base if isinstance(base, str) else base.exe
+        version = version or (_version_text(base.version) if not isinstance(base, str) else "3.13")
         venv = os.path.join(repo, ".venv")
         self.write(
             os.path.join(venv, "pyvenv.cfg"),
@@ -1602,39 +2336,71 @@ class _SelfTest:
     def check_venv_provenance(self):
         if os.name != "posix":
             raise _NotApplicable("POSIX venv layout only")
-        repo, _site = self.fake_venv("venv-clean")
+        fake = self.fake_base("venv-fake-base")
+        repo, _site = self.fake_venv("venv-fake", fake)
+        self.expect(lambda: inspect_venv(repo, self.home), "NOT_RUN", "venv_provenance_unknown")
+        self.expect(lambda: select_base_python({"HERMES_WEBUI_TEST_PYTHON": fake}, self.home),
+                    "NOT_RUN", "venv_provenance_unknown")
+        hooked = self.fake_base("venv-hook-base", hook=self.marker_writer())
+        fake_interpreter = BaseInterpreter(
+            hooked, hooked, os.path.dirname(os.path.dirname(hooked)), (3, 13),
+            os.path.join(os.path.dirname(os.path.dirname(hooked)), "lib", "python3.13"),
+        )
+        self.expect(lambda: scan_interpreter_hooks(fake_interpreter), "NOT_RUN", "venv_provenance_unknown")
+        base = self.trusted_base()
+        repo, _site = self.fake_venv("venv-clean", base)
         venv = inspect_venv(repo, self.home)
-        assert venv.version == (3, 13)
+        assert venv.version == base.version
+        assert missing_runner_modules(venv) == list(RUNNER_MODULES), "an empty venv must need preparing"
         cases = []
-        repo, site = self.fake_venv("venv-pth")
+        repo, site = self.fake_venv("venv-pth", base)
         self.write(os.path.join(site, "evil.pth"), "import os; " + self.marker_writer())
         cases.append((repo, "venv_provenance_unknown"))
-        repo, site = self.fake_venv("venv-sitecustomize")
+        repo, site = self.fake_venv("venv-sitecustomize", base)
         self.write(os.path.join(site, "sitecustomize.py"), self.marker_writer())
         cases.append((repo, "venv_provenance_unknown"))
-        repo, site = self.fake_venv("venv-path-pth")
+        repo, site = self.fake_venv("venv-path-pth", base)
         self.write(os.path.join(site, "outside.pth"), os.path.join(self.scratch, "elsewhere") + "\n")
         cases.append((repo, "venv_provenance_unknown"))
-        repo, site = self.fake_venv("venv-egg-link")
+        repo, site = self.fake_venv("venv-inner-pth", base)
+        extra = os.path.join(repo, ".venv", "extra")
+        self.write(os.path.join(extra, "sitecustomize.py"), self.marker_writer())
+        self.write(os.path.join(extra, "run_agent.py"), self.marker_writer())
+        self.write(os.path.join(site, "inner.pth"), extra + "\n")
+        cases.append((repo, "venv_provenance_unknown"))
+        repo, site = self.fake_venv("venv-egg-link", base)
         self.write(os.path.join(site, "pkg.egg-link"), "/elsewhere\n")
         cases.append((repo, "venv_provenance_unknown"))
-        repo, site = self.fake_venv("venv-agent")
+        repo, site = self.fake_venv("venv-agent", base)
         self.write(os.path.join(site, "run_agent.py"), self.marker_writer())
         cases.append((repo, "implicit_agent_discoverable"))
-        repo, _site = self.fake_venv("venv-system-site", include="true")
+        repo, _site = self.fake_venv("venv-system-site", base, include="true")
         cases.append((repo, "venv_provenance_unknown"))
-        repo, _site = self.fake_venv("venv-base-hook", base_hook=self.marker_writer())
-        cases.append((repo, "venv_provenance_unknown"))
-        repo, _site = self.fake_venv("venv-old", version="3.10")
+        repo, _site = self.fake_venv("venv-old", base, version="3.10")
         cases.append((repo, "unsupported_python"))
         linked = self.fake_repo("venv-linked")
-        clean_repo, _site = self.fake_venv("venv-link-target")
+        clean_repo, _site = self.fake_venv("venv-link-target", base)
         self.symlink(os.path.join(clean_repo, ".venv"), os.path.join(linked, ".venv"))
         cases.append((linked, "venv_provenance_unknown"))
         for repo, code in cases:
             self.expect(lambda repo=repo: inspect_venv(repo, self.home), "NOT_RUN", code)
         assert not os.path.lexists(self.marker), "a startup hook or interpreter was executed"
-        return f"clean synthetic venv accepted; {len(cases)} hostile venvs NOT_RUN without execution"
+        return (f"fake base and base hook NOT_RUN; clean venv on {base.real} accepted; "
+                f"{len(cases)} hostile venvs NOT_RUN without execution")
+
+    def check_import_shadowing(self):
+        repo = self.fake_repo("shadow")
+        site = os.path.join(self.scratch, "shadow", "site")
+        self.write(os.path.join(site, "pytest", "__init__.py"), "")
+        venv = Venv(None, None, (3, 13), [site], None)
+        check_import_shadowing(repo, venv)
+        self.write(os.path.join(repo, "pytest", "__init__.py"), self.marker_writer())
+        self.expect(lambda: check_import_shadowing(repo, venv), "REFUSED", "import_shadowing")
+        other = self.fake_repo("shadow-stdlib")
+        self.write(os.path.join(other, "mu_import_guard.py"), self.marker_writer())
+        self.expect(lambda: check_import_shadowing(other, venv), "REFUSED", "import_shadowing")
+        assert not os.path.lexists(self.marker)
+        return "checkout modules that would shadow startup imports are refused"
 
     def check_discovery_and_dotenv(self):
         repo = self.fake_repo("discovery")
@@ -1815,6 +2581,154 @@ class _SelfTest:
                 raise AssertionError(f"destination {url} was accepted")
         return "only the exact owned endpoint validates"
 
+    def check_loopback_teardown(self):
+        import threading
+
+        sock = socket_module()
+        helper = self.helper
+        gate = threading.Event()
+
+        def blocking(request):
+            gate.wait(30)
+            return 200, {}, b"late"
+
+        upstream = helper.LoopbackUpstream(blocking).start()
+        client = sock.create_connection(upstream.endpoint, timeout=5)
+        try:
+            client.sendall(b"GET /block HTTP/1.0\r\n\r\n")
+            deadline = time.monotonic() + 5
+            while not upstream.requests and time.monotonic() < deadline:
+                time.sleep(0.02)
+            started = time.monotonic()
+            try:
+                upstream.close(timeout=0.5)
+            except helper.FixtureTeardownError:
+                pass
+            else:
+                raise AssertionError("close() reported success while a handler was still running")
+            assert time.monotonic() - started < 5, "close() was not bounded"
+            stuck = list(upstream.stuck_handlers)
+            assert stuck and all(t.is_alive() for t in stuck), "the stuck handler was not reported"
+        finally:
+            gate.set()
+            client.close()
+        for thread in stuck:
+            thread.join(5)
+        assert not any(t.is_alive() for t in stuck), "released handlers did not exit"
+
+        slow = helper.LoopbackUpstream(request_timeout=30).start()
+        partial = sock.create_connection(slow.endpoint, timeout=5)
+        try:
+            partial.sendall(b"GET /partial HTTP/1.1\r\nHost: x")
+            time.sleep(0.2)
+            slow.close(timeout=5)
+        finally:
+            partial.close()
+        assert not slow.stuck_handlers, "a handler blocked on a client read survived close()"
+
+        quick = helper.LoopbackUpstream(request_timeout=0.3).start()
+        idle = sock.create_connection(quick.endpoint, timeout=5)
+        try:
+            time.sleep(0.8)
+            quick.close(timeout=2)
+        finally:
+            idle.close()
+
+        class FailingStart(helper.LoopbackUpstream):
+            def _start_serve_thread(self, thread):
+                raise RuntimeError("synthetic thread start failure")
+
+        failing = FailingStart()
+        try:
+            failing.start()
+        except helper.FixtureError:
+            pass
+        else:
+            raise AssertionError("a failed serve-thread start was not reported")
+        probe = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+        try:
+            probe.settimeout(1)
+            assert probe.connect_ex(("127.0.0.1", failing.port)) != 0, "a partial start leaked its listener"
+        finally:
+            probe.close()
+        return "stuck handlers raise FixtureTeardownError; blocked reads and idle clients are closed; partial start rolls back"
+
+    def check_import_binding(self):
+        if os.name != "posix":
+            raise _NotApplicable("descriptor-anchored import binding is POSIX-only")
+        repo = self.fake_repo("binding")
+        self.write(os.path.join(repo, "pkg", "__init__.py"), "")
+        self.write(os.path.join(repo, "pkg", "mod.py"), "VALUE = 'approved'\n")
+        self.write(os.path.join(repo, "pkg", "swap.py"), "VALUE = 'approved'\n")
+        outside = self.write(os.path.join(self.scratch, "binding", "foreign.py"), self.marker_writer())
+        state = os.path.join(self.scratch, "binding", "state")
+        os.makedirs(os.path.join(state, "launcher"), mode=0o700)
+        manifest = build_import_manifest(repo)
+        bound = write_import_guard(state, manifest)
+
+        def child(code, extra_env=None):
+            env = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+                   "PYTHONPYCACHEPREFIX": os.path.join(state, "pycache")}
+            env.update(bound)
+            env.update(extra_env or {})
+            script = (
+                "import sys\nimport mu_import_guard\n"
+                f"sys.path.insert(0, {repo!r})\n" + code
+            )
+            return subprocess.run([sys.executable, "-S", "-c", script], env=env, cwd=state,
+                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+
+        ok = child("import pkg.mod\nprint(pkg.mod.VALUE)\n")
+        assert ok.returncode == 0 and ok.stdout.strip() == b"approved", ok.stderr[-400:]
+        self.write(os.path.join(repo, "pkg", "swap.py"), self.marker_writer())
+        self.write(os.path.join(repo, "pkg", "new.py"), self.marker_writer())
+        self.symlink(outside, os.path.join(repo, "pkg", "linked.py"))
+        self.write(os.path.join(repo, "pkg", "compiled.pyc"), "")
+        for module in ("pkg.swap", "pkg.new", "pkg.linked", "pkg.compiled"):
+            refused_run = child(f"import {module}\n")
+            assert refused_run.returncode != 0 and b"ImportError" in refused_run.stderr, (
+                f"{module} imported: {refused_run.stderr[-300:]!r}"
+            )
+        os.rename(os.path.join(repo, "pkg"), os.path.join(repo, "pkg-approved"))
+        os.makedirs(os.path.join(self.scratch, "binding", "foreign-pkg"))
+        self.write(os.path.join(self.scratch, "binding", "foreign-pkg", "__init__.py"), self.marker_writer())
+        self.write(os.path.join(self.scratch, "binding", "foreign-pkg", "mod.py"), self.marker_writer())
+        self.symlink(os.path.join(self.scratch, "binding", "foreign-pkg"), os.path.join(repo, "pkg"))
+        parent_swap = child("import pkg.mod\n")
+        assert parent_swap.returncode != 0 and b"ImportError" in parent_swap.stderr, parent_swap.stderr[-300:]
+        tampered = child("pass\n", {"HERMES_MU_IMPORT_MANIFEST_SHA256": "0" * 64})
+        assert tampered.returncode != 0, "a manifest digest mismatch did not stop the guard"
+        assert not os.path.lexists(self.marker), "a replaced, new, linked or foreign module executed"
+        return "approved bytes import; replaced, new, linked, sourceless and parent-swapped modules refused"
+
+    def check_signal_spawn_boundary(self):
+        if os.name != "posix":
+            raise _NotApplicable("process-group signal checks are POSIX-only")
+        if signal.getsignal(signal.SIGINT) is not _signal_handler:
+            raise _NotApplicable("the launcher signal handler is not installed")
+        hang = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-I', '-S', '-c', 'import time; time.sleep(120)'])\n"
+            "time.sleep(120)\n"
+        )
+        pids = {}
+
+        def interrupt(proc):
+            pids["pgid"] = proc.pid
+            os.kill(os.getpid(), signal.SIGINT)
+
+        try:
+            run_child([sys.executable, "-I", "-S", "-c", hang], env={"PATH": "/usr/bin:/bin"},
+                      cwd=self.scratch, timeout=60, after_spawn=interrupt)
+        except Outcome as exc:
+            assert exc.code == "interrupted" and "terminated=True" in exc.detail, exc.detail
+        else:
+            raise AssertionError("a signal at the spawn boundary was lost")
+        finally:
+            _SignalState.received = None
+        assert not _group_alive(pids["pgid"]), "the owned group survived a spawn-boundary signal"
+        return "a SIGINT at the ownership boundary is deferred, then terminates the owned group"
+
     def check_child_lifecycle(self):
         if os.name != "posix":
             raise _NotApplicable("process-group lifecycle checks are POSIX-only")
@@ -1842,24 +2756,109 @@ class _SelfTest:
         root = StateRoot(base)
         try:
             self.write(os.path.join(root.path, "home", "file"), "x")
+            locked = os.path.join(root.path, "launcher", "locked")
+            self.write(os.path.join(locked, "inner", "f"), "x")
+            os.chmod(os.path.join(locked, "inner"), 0)
+            os.chmod(locked, 0o500)
             raise RuntimeError("synthetic failure")
         except RuntimeError:
             pass
         finally:
             assert root.remove() is True
         assert not os.path.lexists(root.path), "state root survived a failure"
-        swapped = StateRoot(base)
-        moved = swapped.path + "-moved"
-        os.rename(swapped.path, moved)
-        os.makedirs(swapped.path, mode=0o700)
-        keep = self.write(os.path.join(swapped.path, "external-sentinel"), "keep")
-        try:
-            self.expect(swapped.remove, "FAIL", "teardown_failed")
-            assert os.path.exists(keep), "a replaced state root was deleted"
-        finally:
-            shutil.rmtree(swapped.path, ignore_errors=True)
-            shutil.rmtree(moved, ignore_errors=True)
-        return "state root removed after failure; a replaced root is left untouched"
+        if os.name != "posix":
+            raise _NotApplicable("descriptor-anchored teardown is POSIX-only")
+
+        def swap(root, payload):
+            moved = root.path + "-moved"
+            os.rename(root.path, moved)
+            os.makedirs(root.path, mode=0o700)
+            if payload:
+                self.write(os.path.join(root.path, "replacement-sentinel"), "keep")
+            return moved
+
+        outcomes = []
+        for when, payload in (("before", True), ("barrier", True), ("barrier", False), ("moved", None)):
+            root = StateRoot(base)
+            self.write(os.path.join(root.path, "home", "ours"), "x")
+            moved = None
+            try:
+                if when == "before":
+                    moved = swap(root, payload)
+                elif when == "moved":
+                    moved = root.path + "-moved"
+                    os.rename(root.path, moved)
+                else:
+                    holder = {}
+
+                    def barrier(root=root, payload=payload, holder=holder):
+                        holder["moved"] = swap(root, payload)
+
+                    root._before_unlink = barrier
+                self.expect(root.remove, "FAIL", "teardown_failed")
+                moved = moved or holder.get("moved")
+                assert os.listdir(moved) == [], f"{when}: the anchored original was not cleared"
+                if payload is not None:
+                    present = os.path.exists(os.path.join(root.path, "replacement-sentinel"))
+                    assert present == payload and os.path.isdir(root.path), f"{when}: replacement was touched"
+                else:
+                    assert not os.path.lexists(root.path)
+                outcomes.append(when if payload is not False else "barrier-empty")
+            finally:
+                for path in (root.path, moved):
+                    if path:
+                        shutil.rmtree(path, ignore_errors=True)
+        return "failure teardown clears locked dirs; " + ", ".join(outcomes) + " swaps FAIL without touching replacements"
+
+    def check_report_target(self):
+        if os.name != "posix":
+            raise _NotApplicable("descriptor-anchored report writes are POSIX-only")
+        work = os.path.join(self.scratch, "reports")
+        os.makedirs(work, mode=0o700)
+        target = ReportTarget(os.path.join(work, "new.json"), self.home)
+        target.write("{}\n")
+        target.close()
+        st = os.lstat(os.path.join(work, "new.json"))
+        assert stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600
+        auth = self.write(os.path.join(work, "fake-operator-state", "auth.json"), "SYNTHETIC-AUTH")
+        self.expect(lambda: ReportTarget(auth, self.home), "REFUSED", "report_path_disallowed")
+        with open(auth, encoding="utf-8") as handle:
+            assert handle.read() == "SYNTHETIC-AUTH", "an existing file was modified"
+        self.symlink(auth, os.path.join(work, "link.json"))
+        self.expect(lambda: ReportTarget(os.path.join(work, "link.json"), self.home), "REFUSED",
+                    "report_path_disallowed")
+        self.expect(lambda: ReportTarget(os.path.join(self.repo_root, "report.json"), self.home), "REFUSED",
+                    "report_path_disallowed")
+        shared = os.path.join(work, "shared")
+        os.makedirs(shared)
+        os.chmod(shared, 0o777)
+        self.expect(lambda: ReportTarget(os.path.join(shared, "r.json"), self.home), "REFUSED",
+                    "report_path_disallowed")
+        foreign = os.path.join(work, "foreign")
+        os.makedirs(foreign, mode=0o700)
+        self.write(os.path.join(foreign, "foreign-sentinel"), "keep")
+        for replacement in ("directory", "symlink"):
+            anchored = os.path.join(work, f"anchored-{replacement}")
+            os.makedirs(anchored, mode=0o700)
+            target = ReportTarget(os.path.join(anchored, "r.json"), self.home)
+            os.rename(anchored, anchored + "-moved")
+            if replacement == "directory":
+                os.makedirs(anchored, mode=0o700)
+            else:
+                self.symlink(foreign, anchored)
+            try:
+                target.write("{}\n")
+            except OSError:
+                pass
+            else:
+                raise AssertionError(f"a report was written after its parent was replaced by a {replacement}")
+            finally:
+                target.close()
+            assert os.listdir(anchored + "-moved") == [], "the report reached the original parent"
+            assert sorted(os.listdir(foreign)) == ["foreign-sentinel"], "the report reached a foreign directory"
+            if replacement == "directory":
+                assert os.listdir(anchored) == []
+        return "new private reports only; existing, linked, foreign and shared paths refused; replaced parents refused"
 
     def check_no_product_import(self):
         loaded = sorted(
@@ -1899,9 +2898,10 @@ def run_self_test(result, repo_root, helper):
         suite.poison_parent()
         for name in (
             "state_root", "env_scrubbed", "child_observes_env", "leak_refused", "script_paths",
-            "pytest_args", "agent_checkout", "tiers", "venv_provenance", "discovery_and_dotenv",
-            "loopback_fixture", "network_guard", "validate_destination", "child_lifecycle",
-            "teardown", "no_product_import",
+            "script_admission", "pytest_args", "pytest_config", "agent_checkout", "tiers",
+            "venv_provenance", "import_shadowing", "discovery_and_dotenv", "import_binding",
+            "loopback_fixture", "loopback_teardown", "network_guard", "validate_destination",
+            "child_lifecycle", "signal_spawn_boundary", "teardown", "report_target", "no_product_import",
         ):
             suite.run(name, getattr(suite, f"check_{name}"))
         if dict(os.environ) != environ_before:
@@ -1929,20 +2929,18 @@ def run_self_test(result, repo_root, helper):
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
-def _emit(result, report_path):
+def _emit(result, report):
     payload = result.to_dict()
     text = json.dumps(payload, sort_keys=True)
-    if report_path:
+    if report is not None:
         try:
-            fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            try:
-                os.write(fd, (text + "\n").encode())
-            finally:
-                os.close(fd)
+            report.write(text + "\n")
         except OSError as exc:
             result.settle("FAIL", "report_write_failed", f"report not written: {exc.__class__.__name__}")
             payload = result.to_dict()
             text = json.dumps(payload, sort_keys=True)
+        finally:
+            report.close()
     for reason in payload["reasons"]:
         sys.stderr.write(f"test_multiuser: {payload['status']} {reason['code']}: {reason['detail']}\n")
     sys.stdout.write(RESULT_PREFIX + text + "\n")
@@ -1953,7 +2951,7 @@ def _emit(result, report_path):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     result = Result()
-    report_path = None
+    report = None
     previous = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.signal(signum, _signal_handler)
@@ -1966,21 +2964,21 @@ def main(argv=None):
         else:
             launcher_argv, passthrough = argv, []
         args = build_parser().parse_args(launcher_argv)
+        if os.name not in ("posix", "nt"):
+            raise refused("unsupported_platform", f"platform {os.name!r} has unknown path semantics")
+        repo_root = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir))
+        helper, helper_source = load_helper(repo_root)
         if args.report:
-            report_path = validate_output_file(args.report, "--report")
+            report = ReportTarget(args.report, helper.operator_home())
         if not 0 < args.child_timeout <= 86400:
             raise refused("usage", "--child-timeout must be between 1 and 86400 seconds")
         selection = resolve_selection(args, passthrough)
         result.tier, result.mode = selection.tier, selection.mode
         result.agent = selection.agent_mode
-        if os.name not in ("posix", "nt"):
-            raise refused("unsupported_platform", f"platform {os.name!r} has unknown path semantics")
-        repo_root = os.path.realpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir))
-        helper = load_helper(repo_root)
         if selection.mode == "self-test":
             run_self_test(result, repo_root, helper)
         else:
-            run_selected(selection, args, passthrough, result, repo_root, helper)
+            run_selected(selection, args, passthrough, result, repo_root, helper, helper_source)
     except Outcome as exc:
         result.settle(exc.status, exc.code, exc.detail)
     except _Interrupted as exc:
@@ -1993,7 +2991,7 @@ def main(argv=None):
             signal.signal(signum, handler)
     if _SignalState.received is not None and result.status == "PASS":
         result.settle("FAIL", "interrupted", f"signal {_SignalState.received} received")
-    return _emit(result, report_path)
+    return _emit(result, report)
 
 
 if __name__ == "__main__":

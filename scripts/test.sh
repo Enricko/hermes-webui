@@ -4,6 +4,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$ROOT/.venv"
 REQ_FILE="$ROOT/requirements-dev.txt"
+# Exit status when --execute-only refuses to create, rebuild or install.
+EXIT_NOT_PREPARED=78
+
+# Optional first argument; without one, behavior is unchanged.
+#   --prepare-only  create/repair .venv and install missing test dependencies,
+#                   then exit before any post-install Python or pytest starts.
+#   --execute-only  never create, rebuild or install: exit 78 when .venv or a
+#                   test dependency is missing, otherwise run pytest as usual.
+# scripts/test_multiuser.py uses both so it can audit .venv statically between
+# provisioning and execution.
+MODE=default
+case "${1:-}" in
+  --prepare-only|--execute-only)
+    MODE="${1#--}"
+    shift
+    ;;
+esac
 
 resolve_venv_python() {
   local candidate
@@ -108,6 +125,11 @@ create_or_rebuild_venv() {
   local mode="${2:-create}"
   local action="Creating"
   local venv_args=("$VENV_DIR")
+  if [[ "$MODE" == execute-only ]]; then
+    echo "$VENV_DIR needs to be created or rebuilt; refusing under --execute-only." >&2
+    echo "Run ./scripts/test.sh --prepare-only first." >&2
+    return "$EXIT_NOT_PREPARED"
+  fi
   # Never create/clear a virtualenv *through* a symlink: `python -m venv --clear`
   # (and a dangling-symlink create) would empty/write the symlink's target, not a
   # repo-local .venv. A symlinked .venv that already works is used directly above,
@@ -146,6 +168,12 @@ select_python() {
   local requested="${HERMES_WEBUI_TEST_PYTHON:-}"
   local requested_path base_py
   local desired_major_minor current_major_minor
+
+  if [[ "$MODE" == execute-only && ! -x "${VENV_PY:-}" ]]; then
+    echo "$VENV_DIR does not exist; refusing to create it under --execute-only." >&2
+    echo "Run ./scripts/test.sh --prepare-only first." >&2
+    return "$EXIT_NOT_PREPARED"
+  fi
 
   if [[ -n "$requested" ]]; then
     requested_path="$(resolve_executable "$requested")"
@@ -216,13 +244,27 @@ fi
 if missing="$(missing_dev_deps "$PYTHON_BIN" 2>/dev/null)"; then
   :
 else
+  if [[ "$MODE" == execute-only ]]; then
+    echo "Missing Hermes WebUI test dependencies: ${missing:-unknown}; refusing to install under --execute-only." >&2
+    echo "Run ./scripts/test.sh --prepare-only first." >&2
+    exit "$EXIT_NOT_PREPARED"
+  fi
   echo "Installing missing Hermes WebUI test dependencies in $PYTHON_BIN ($(python_version "$PYTHON_BIN"))." >&2
   if [[ -n "${missing:-}" ]]; then
     echo "Missing modules: $missing" >&2
   fi
   ensure_pip "$PYTHON_BIN"
-  "$PYTHON_BIN" -m pip install --upgrade pip
-  "$PYTHON_BIN" -m pip install -r "$REQ_FILE"
+  if [[ "$MODE" == prepare-only ]]; then
+    # A single pip process, so no Python starts after anything is installed.
+    "$PYTHON_BIN" -m pip install --upgrade pip -r "$REQ_FILE"
+  else
+    "$PYTHON_BIN" -m pip install --upgrade pip
+    "$PYTHON_BIN" -m pip install -r "$REQ_FILE"
+  fi
+fi
+
+if [[ "$MODE" == prepare-only ]]; then
+  exit 0
 fi
 
 if [[ $# -eq 0 ]]; then

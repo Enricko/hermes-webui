@@ -29,6 +29,7 @@ import socketserver
 import stat
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "STATE_ROOT_VAR",
     "SYNTHETIC_PREFIX",
     "TIER_VAR",
+    "active_guard",
     "assert_hermetic_environment",
     "disposable_layout",
     "is_secret_like_name",
@@ -144,6 +146,9 @@ LAUNCHER_ENV_VARS = frozenset(
         "HERMES_WEBUI_PYTHON",
         "HERMES_WEBUI_TEST_PYTHON",
         "PLAYWRIGHT_BROWSERS_PATH",
+        "PYTHONPATH",
+        "HERMES_MU_IMPORT_MANIFEST",
+        "HERMES_MU_IMPORT_MANIFEST_SHA256",
         STATE_ROOT_VAR,
         TIER_VAR,
         AGENT_MODE_VAR,
@@ -353,6 +358,12 @@ def verify_hermetic_environment(environ=None) -> list:
             problems.append(f"{name} would configure product multi-user mode")
     if env.get("PYTHONNOUSERSITE") != "1":
         problems.append("PYTHONNOUSERSITE is not 1")
+    # The only PYTHONPATH a launcher child gets is its own import-guard directory.
+    if "PYTHONPATH" in env and env["PYTHONPATH"] != os.path.join(root, "launcher", "importguard"):
+        problems.append("PYTHONPATH is not the launcher import-guard directory")
+    manifest = env.get("HERMES_MU_IMPORT_MANIFEST")
+    if manifest is not None and (not is_within(manifest, root) or "PYTHONPATH" not in env):
+        problems.append("the import manifest is not a launcher-owned file in the state root")
     if env.get("HERMES_WEBUI_HOST", "127.0.0.1") != "127.0.0.1":
         problems.append("HERMES_WEBUI_HOST is not 127.0.0.1")
 
@@ -461,6 +472,15 @@ def validate_destination(url: str, owned=()) -> None:
 _GUARD_LOCK = threading.Lock()
 _ACTIVE_GUARD = None
 _SOCKET_METHODS = ("connect", "connect_ex", "sendto", "sendmsg")
+
+
+def active_guard():
+    """The NetworkGuard installed in this process, or None.
+
+    Launcher ``--script`` runs install a deny-by-default guard before the script
+    starts; a script registers the fixtures it owns with ``active_guard().allow``.
+    """
+    return _ACTIVE_GUARD
 _MODULE_FUNCTIONS = ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo")
 
 
@@ -651,19 +671,58 @@ def _default_handler(request):
     return 200, {"Content-Type": "application/json"}, body
 
 
-class _LoopbackHTTPServer(http.server.ThreadingHTTPServer):
-    daemon_threads = True
+class _LoopbackHTTPServer(http.server.HTTPServer):
+    """One tracked thread per request, so teardown can close and await every one."""
+
     allow_reuse_address = False
-    block_on_close = False
 
     def __init__(self, address, handler_cls, family):
         self.address_family = family
+        self.active = {}
+        self.active_lock = threading.Lock()
         super().__init__(address, handler_cls)
 
     def server_bind(self):
         # HTTPServer.server_bind resolves the FQDN (a DNS lookup); skip it.
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
+
+    def process_request(self, request, client_address):
+        thread = threading.Thread(
+            target=self._serve_request, args=(request, client_address),
+            name="mu-upstream-request", daemon=True,
+        )
+        with self.active_lock:
+            self.active[thread] = request
+        thread.start()
+
+    def _serve_request(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            pass  # a closed or reset fixture connection; the client sees the failure
+        finally:
+            self.shutdown_request(request)
+            with self.active_lock:
+                self.active.pop(threading.current_thread(), None)
+
+    def close_requests(self):
+        """Shut down every open request connection, waking handlers blocked on I/O."""
+        with self.active_lock:
+            requests = list(self.active.values())
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+
+    def handler_threads(self):
+        with self.active_lock:
+            return list(self.active)
 
 
 _MAX_BODY = 10 * 1024 * 1024
@@ -675,9 +734,15 @@ class LoopbackUpstream:
     The listener stays bound from ``start`` until ``close``; the port is chosen
     by the OS, so an existing service is never displaced or killed. ``handler``
     receives a ``RecordedRequest`` and returns ``(status, headers, body)``.
+
+    Request reads time out after ``request_timeout`` seconds. ``close`` sets
+    ``closing`` (cooperative handlers can wait on it), stops the listener,
+    shuts down every open request connection and waits for every request
+    handler; a handler that is still running is reported through
+    ``FixtureTeardownError`` and kept in ``stuck_handlers``.
     """
 
-    def __init__(self, handler=None, *, host="127.0.0.1", ready_timeout=5.0):
+    def __init__(self, handler=None, *, host="127.0.0.1", ready_timeout=5.0, request_timeout=5.0):
         ip = _literal_ip(host)
         if ip is None or not ip.is_loopback or host not in ("127.0.0.1", "::1"):
             raise FixtureError("LoopbackUpstream binds only to 127.0.0.1 or ::1")
@@ -685,10 +750,13 @@ class LoopbackUpstream:
         self._family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
         self._handler = handler or _default_handler
         self._ready_timeout = float(ready_timeout)
+        self._request_timeout = float(request_timeout)
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
         self._closed = False
+        self.closing = threading.Event()
+        self.stuck_handlers = []
         self.port = None
         self.requests = []
 
@@ -707,6 +775,8 @@ class LoopbackUpstream:
         upstream = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            timeout = upstream._request_timeout
+
             def _handle(self):
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -753,7 +823,15 @@ class LoopbackUpstream:
             thread = threading.Thread(target=serve, name="mu-loopback-upstream", daemon=True)
             self._server, self._thread = server, thread
             self.port = server.server_address[1]
-        thread.start()
+        try:
+            self._start_serve_thread(thread)
+        except BaseException:
+            # Roll back the bound listener so a partial start leaks nothing.
+            with self._lock:
+                self._server = self._thread = None
+                self._closed = True
+            server.server_close()
+            raise FixtureError("LoopbackUpstream serve thread could not start") from None
         if not ready.wait(self._ready_timeout):
             try:
                 self.close()
@@ -761,23 +839,37 @@ class LoopbackUpstream:
                 raise FixtureError("LoopbackUpstream did not become ready")
         return self
 
+    def _start_serve_thread(self, thread):
+        thread.start()
+
     def close(self, timeout=5.0):
+        """Stop the listener and every request handler within ``timeout`` seconds."""
         with self._lock:
             server, thread = self._server, self._thread
             self._server = self._thread = None
             self._closed = True
         if server is None:
             return
-        stuck = False
+        self.closing.set()
+        deadline = time.monotonic() + float(timeout)
+        stuck = []
         if thread is not None and thread.is_alive():
             stopper = threading.Thread(target=server.shutdown, name="mu-upstream-stop", daemon=True)
             stopper.start()
-            stopper.join(timeout)
-            thread.join(timeout)
-            stuck = thread.is_alive()
+            stopper.join(max(deadline - time.monotonic(), 0))
+            thread.join(max(deadline - time.monotonic(), 0))
+            if thread.is_alive():
+                stuck.append(thread)
         server.server_close()
+        server.close_requests()
+        for handler in server.handler_threads():
+            handler.join(max(deadline - time.monotonic(), 0))
+        stuck.extend(t for t in server.handler_threads() if t.is_alive())
         if stuck:
-            raise FixtureTeardownError("LoopbackUpstream serve thread did not stop")
+            self.stuck_handlers = stuck
+            raise FixtureTeardownError(
+                f"LoopbackUpstream left {len(stuck)} thread(s) running after close"
+            )
 
     def __enter__(self):
         return self.start()
