@@ -2275,7 +2275,45 @@ def _active_org_marker(skills_dir: Path) -> str | None:
         return None
 
 
+def _profile_skill_dirs(profile_dir: Path, config: dict | None = None) -> list[Path]:
+    """Resolve local/external roots under the owning profile's environment."""
+    from string import Template
+
+    config = load_profile_config(profile_dir) if config is None else config
+    skills = config.get('skills') or {}
+    external = skills.get('external_dirs', []) if isinstance(skills, dict) else []
+    if isinstance(external, str):
+        external = [external]
+    if not isinstance(external, list):
+        external = []
+    roots = [profile_dir / 'skills']
+    env = profile_env_binding(profile_dir) if external else {}
+    for entry in external:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        entry = Template(entry.strip()).safe_substitute(env)
+        if re.search(r'\$(?:\w|\{)', entry):
+            continue
+        try:
+            path = Path(entry).expanduser()
+            if not path.is_absolute():
+                path = profile_dir / path
+            path = path.resolve()
+            if path.is_dir() and all(path != root.resolve() for root in roots):
+                roots.append(path)
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return roots
+
+
 def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
+    roots = _profile_skill_dirs(config_path.parent)
+    if skills_dir not in roots:
+        roots.insert(0, skills_dir)
+    return max(_local_skill_tree_max_mtime_ns(root, config_path) for root in roots)
+
+
+def _local_skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
     """Return the max st_mtime_ns across config.yaml, skill dirs, and SKILL.md files."""
     max_ns = 0
     try:
@@ -2328,10 +2366,6 @@ def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
 
 def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     """Compute (enabled_count, compatible_count) by reading and parsing all SKILL.md files."""
-    skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
-        return (0, 0)
-
     try:
         from agent.skill_utils import iter_skill_index_files, parse_frontmatter, skill_matches_platform
     except ImportError as exc:
@@ -2346,12 +2380,13 @@ def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
         # when the total is 0, so the profile picker stays fully usable.
         return (0, 0)
 
+    config = load_profile_config(profile_dir)
     disabled = set()
     try:
         # Expanded under the profile's own env (#8032: ``disabled: ${VAR}``
         # stays a reference on disk), then decoded like the Skills reader does
         # (a serialized ``'["a","b"]'`` string is a list, #7120).
-        skills_cfg = load_profile_config(profile_dir).get("skills")
+        skills_cfg = config.get("skills")
         if isinstance(skills_cfg, dict):
             # Align with get_disabled_skill_names(platform="webui") behavior:
             platform_disabled = (skills_cfg.get("platform_disabled") or {}).get("webui")
@@ -2374,7 +2409,9 @@ def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     enabled_count = 0
     compatible_count = 0
 
-    for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+    candidates = (path for root in _profile_skill_dirs(profile_dir, config)
+                  for path in iter_skill_index_files(root, "SKILL.md"))
+    for skill_md in candidates:
         try:
             content = skill_md.read_text(encoding="utf-8")[:4000]
             frontmatter, _ = parse_frontmatter(content)

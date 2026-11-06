@@ -108,6 +108,56 @@ def test_no_skills_dir(tmp_path):
     enabled, compat = profiles._get_profile_skills_stats(tmp_path)
     assert enabled == 0 and compat == 0
 
+
+@requires_agent_modules
+def test_shared_external_skills_count_deduplicates_and_uses_owner_env(tmp_path, monkeypatch):
+    home = tmp_path / 'profile'
+    shared = tmp_path / 'shared'
+    wrong = tmp_path / 'other-user'
+    _write_skill(home, 'private')
+    _write_skill(shared, 'shared-enabled')
+    _write_skill(shared, 'shared-disabled')
+    _write_skill(shared, 'private')
+    _write_skill(wrong, 'must-not-count')
+    (home / '.env').write_text(f'SHARED_SKILLS={shared / "skills"}\n')
+    monkeypatch.setenv('SHARED_SKILLS', str(wrong / 'skills'))
+    (home / 'config.yaml').write_text(yaml.safe_dump({'skills': {
+        'external_dirs': ['${SHARED_SKILLS}', '${SHARED_SKILLS}'], 'disabled': ['shared-disabled']}}))
+    profiles.invalidate_profile_skills_stats()
+    assert profiles._get_profile_skills_stats(home) == (2, 3)
+    before = profiles._skill_tree_max_mtime_ns(home / 'skills', home / 'config.yaml')
+    _write_skill(shared, 'added-later')
+    assert profiles._skill_tree_max_mtime_ns(home / 'skills', home / 'config.yaml') > before
+    profiles.invalidate_profile_skills_stats()
+    assert profiles._get_profile_skills_stats(home) == (3, 4)
+
+
+def test_external_skill_roots_and_mtime_follow_owning_profile_without_agent(tmp_path, monkeypatch):
+    home = tmp_path / 'owner'
+    home.mkdir()
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    wrong = tmp_path / 'other-account'
+    wrong.mkdir()
+    (home / '.env').write_text(f'SHARED_SKILLS={shared}\n')
+    (home / 'config.yaml').write_text('skills:\n  external_dirs: ["${SHARED_SKILLS}", "${SHARED_SKILLS}"]\n')
+    monkeypatch.setenv('SHARED_SKILLS', str(wrong))
+    assert profiles._profile_skill_dirs(home) == [home / 'skills', shared]
+    before = profiles._skill_tree_max_mtime_ns(home / 'skills', home / 'config.yaml')
+    (shared / 'new').mkdir()
+    (shared / 'new/SKILL.md').write_text('A new shared skill')
+    assert profiles._skill_tree_max_mtime_ns(home / 'skills', home / 'config.yaml') > before
+
+
+@requires_agent_modules
+def test_external_skills_count_without_private_skills_directory(tmp_path):
+    home = tmp_path / 'profile'
+    home.mkdir()
+    _write_skill(tmp_path / 'shared', 'common')
+    (home / 'config.yaml').write_text('skills:\n  external_dirs: [../shared/skills]\n')
+    profiles.invalidate_profile_skills_stats()
+    assert profiles._get_profile_skills_stats(home) == (1, 1)
+
 @requires_agent_modules
 def test_corrupt_config(tmp_path):
     """Corrupt config.yaml should not crash — disabled set stays empty."""
