@@ -1,3 +1,3 @@
 # Control plane only. Never install Agent dependencies in the gateway environment.
 argon2-cffi>=25.1,<26
-aiohttp>=3.12,<4
+aiohttp>=3.14.3,<4
