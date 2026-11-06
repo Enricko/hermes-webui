@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(os.getenv('HERMES_WEBUI_BROWSER_TESTS') != '1', 
 
 
 @pytest.fixture
-def deployment(tmp_path, provider):  # noqa: F811 -- imported pytest fixture dependency
+def deployment(tmp_path, provider, request):  # noqa: F811 -- imported pytest fixture dependency
     users = tmp_path / 'users.json'
     password = 'synthetic-browser-password'
     password_hash = hash_password(password)
@@ -43,13 +43,20 @@ def deployment(tmp_path, provider):  # noqa: F811 -- imported pytest fixture dep
         policy.replace_grants('admin-id', name+'-id', {'writer':[],'private':[],'coding':[],'managed':['allowed-model']})
     CredentialVault(tmp_path/'member-data'/'credentials.json').put('managed','synthetic-browser-provider-key',binding)
     repo = Path(__file__).resolve().parents[1]
+    native = bool(getattr(request, 'param', False))
     environment = {'PATH':'/usr/bin:/bin','LANG':'C.UTF-8','HERMES_HOME':str(tmp_path/'agent-home'),
                    'HERMES_WEBUI_STATE_DIR':str(tmp_path/'webui'), 'HERMES_WEBUI_USERS_FILE':str(users),
-                   'HERMES_WEBUI_ACCESS_POLICY_FILE':str(policy.path),'HERMES_WEBUI_MEMBER_CHAT':'1',
+                   'HERMES_WEBUI_ACCESS_POLICY_FILE':str(policy.path),'HERMES_WEBUI_MEMBER_CHAT':'0' if native else '1',
                    'HERMES_WEBUI_SKIP_ONBOARDING':'1','PYTHONUNBUFFERED':'1'}
     log = tmp_path/'server.log'
     with log.open('w') as output:
-        process = subprocess.Popen([sys.executable,str(repo/'scripts'/'serve_members.py'),'--port','0'],
+        command = [sys.executable,str(repo/'scripts'/'serve_members.py'),'--port','0']
+        if native:
+            script = ('from server import QuietHTTPServer,Handler; '
+                      's=QuietHTTPServer(("127.0.0.1",0),Handler); '
+                      'print("Private chat listening on http://127.0.0.1:"+str(s.server_port),flush=True); s.serve_forever()')
+            command = [sys.executable,'-c',script]
+        process = subprocess.Popen(command,
                                    cwd=repo,env=environment,stdout=output,stderr=output)
         try:
             deadline = time.monotonic()+20
@@ -87,11 +94,12 @@ def sign_in(page, base, username, password, destination):
     page.wait_for_url(base+destination)
 
 
-def shot(page, name, tmp_path):
+def shot(page, name, tmp_path, *, check_overflow=True):
     root = Path(os.getenv('HERMES_WEBUI_BROWSER_SHOTS',str(tmp_path/'screenshots')))
     root.mkdir(parents=True,exist_ok=True)
     page.screenshot(path=str(root/(name+'.png')),full_page=True)
-    assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+    if check_overflow:
+        assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
 
 
 def test_admin_account_and_access_ui(browser, deployment):
@@ -178,4 +186,39 @@ def test_member_chat_files_and_other_user_denials(browser, deployment):
         'action':'read','context':selection,'path':'alice.txt'}).status==400
     assert page.request.post(base+'/api/admin/users',headers={'X-Hermes-CSRF-Token':csrf,'Origin':base},data={
         'action':'update','username':'bob','role':'admin'}).status==403
+    context.close()
+
+
+@pytest.mark.parametrize('deployment', [True], indirect=True)
+def test_original_hermes_shell_and_embedded_account_controls(browser, deployment):
+    base,password,tmp_path,_ = deployment
+    context = browser.new_context(viewport={'width':1440,'height':1000})
+    page = context.new_page()
+    sign_in(page,base,'admin',password,'/')
+    page.locator('#msg').wait_for(state='visible')
+    assert page.locator('#sessionList').count()==1
+    assert page.locator('#composerBox').count()==1
+    assert page.locator('#new').count()==0  # replacement chat shell is absent
+    # Upstream's closed workspace handle extends past the viewport. This test
+    # preserves that existing shell and checks bounds of the added controls.
+    shot(page,'original-hermes-chat',tmp_path,check_overflow=False)
+    page.evaluate("async()=>{await switchPanel('settings');switchSettingsSection('system');}")
+    block=page.locator('#accountAccessSettingsBlock')
+    block.wait_for(state='visible')
+    block.locator('summary').click()
+    page.get_by_text('Accounts and access loaded.',exact=True).wait_for()
+    assert page.locator('#panelSettings').count()==1
+    assert page.locator('#settingsPaneSystem').is_visible()
+    page.locator('#userAccess-username').fill('native-user')
+    page.locator('#userAccess-password').fill('synthetic-native-password')
+    page.locator('#userAccess-save-account').click()
+    page.get_by_text('Account saved.',exact=True).wait_for()
+    shot(page,'original-hermes-users-desktop',tmp_path,check_overflow=False)
+    page.set_viewport_size({'width':390,'height':844})
+    page.evaluate("()=>{if(typeof closeMobileSidebar==='function')closeMobileSidebar();}")
+    page.locator('#userAccess-username').scroll_into_view_if_needed()
+    shot(page,'original-hermes-users-mobile',tmp_path,check_overflow=False)
+    assert page.locator('#accountAccessControls').evaluate('(element)=>element.getBoundingClientRect().width <= window.innerWidth')
+    response=page.request.get(base+'/admin/users',max_redirects=0)
+    assert response.status==302 and response.headers['location']=='../'
     context.close()

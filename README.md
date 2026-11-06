@@ -1,9 +1,10 @@
 # Hermes Web UI
 
-Fork feature: [username/password multi-user chat](docs/multi-user-chat.md) with
-administrator-assigned profiles, skills, providers/models and private files and
-conversations. This opt-in mode is tool-free; isolated full Agent execution and
-subscription/OAuth support remain separate unfinished work.
+Fork work in progress: username/password accounts and administrator access
+controls are integrated into the existing Hermes interface under Settings →
+System → Users & access. The upstream chat/workspace UI and Agent backend remain
+the main application. Private member Agent runtimes are still unfinished; see
+[implementation status](docs/architecture/multi-user-implementation.md).
 
 [Hermes Agent](https://hermes-agent.nousresearch.com/) is a sophisticated autonomous agent that lives on your server, accessed via a terminal or messaging apps, that remembers what it learns and gets more capable the longer it runs.
 

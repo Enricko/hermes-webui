@@ -1,6 +1,6 @@
 # Portable multi-user Hermes WebUI design
 
-Status: full Agent implementation in progress on `feature/user-roles`. Account lifecycle, transactional policy and an opt-in [tool-free username/password chat service](../multi-user-chat.md) are implemented. That limited mode is not a substitute for the full Agent design below: isolated execution, subscription/OAuth brokerage and full product integration remain release gates. No production deployment has been performed. See [implementation status](multi-user-implementation.md).
+Status: implementation in progress on `feature/user-roles`. Preserve the original Hermes WebUI and Agent backend; add accounts and administrator grants within its existing Control Center. The separate tool-free UI was an incorrect substitution and is not the default/staging interface. Account lifecycle, policy and embedded administration are implemented; private member execution, subscription/OAuth brokerage and full product integration remain release gates. See [implementation status](multi-user-implementation.md).
 
 ## Goal
 

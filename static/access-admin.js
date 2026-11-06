@@ -1,8 +1,11 @@
 'use strict';
-(() => {
-  const $ = id => document.getElementById(id);
-  const root = new URL('../', location.href);
-  const csrf = document.querySelector('meta[name="csrf-token"]').content;
+(function () {
+function initializeAccessControls(host, options = {}) {
+  if (host.dataset.accessInitialized) return;
+  host.dataset.accessInitialized = '1';
+  const $ = id => host.querySelector('#' + (options.prefix || '') + id);
+  const root = options.root || new URL('../', location.href);
+  const csrf = options.csrf || document.querySelector('meta[name="csrf-token"]')?.content || '';
   let data = null, selected = null, busy = false;
   const node = (tag, text) => { const element = document.createElement(tag); if (text !== undefined) element.textContent = text; return element; };
   const notice = (message, error = false) => { $('notice').textContent = message; $('notice').className = error ? 'error' : 'success'; };
@@ -28,9 +31,9 @@
   async function mutate(action) {
     if (busy) return;
     busy = true;
-    document.querySelectorAll('form button').forEach(button => { button.disabled = true; });
+    host.querySelectorAll('form button').forEach(button => { button.disabled = true; });
     try { await action(); } catch (error) { notice(error.message, true); }
-    finally { busy = false; document.querySelectorAll('form button').forEach(button => { button.disabled = false; }); }
+    finally { busy = false; host.querySelectorAll('form button').forEach(button => { button.disabled = false; }); }
   }
   function choose(user) {
     selected = user || null;
@@ -43,7 +46,7 @@
     $('save-account').textContent = user ? 'Save account' : 'Create account';
     $('grant-panel').hidden = !user || !user.enabled;
     renderGrants();
-    document.querySelectorAll('.account').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.username === user?.username)));
+    host.querySelectorAll('.account').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.username === user?.username)));
   }
   function renderGrants() {
     $('grants').replaceChildren();
@@ -118,6 +121,10 @@
   $('resource-kind').addEventListener('change', () => {
     resourceFields($('resource-kind').value);
   });
-  $('reload').addEventListener('click', () => { if (!busy) load().catch(error => notice(error.message, true)); });
+  const reload = $('reload');
+  if (reload) reload.addEventListener('click', () => { if (!busy) load().catch(error => notice(error.message, true)); });
   load().catch(error => notice(error.message, true));
+}
+window.initializeAccessControls = initializeAccessControls;
+if (document.getElementById('account-form')) initializeAccessControls(document.body);
 })();

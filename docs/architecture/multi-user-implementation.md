@@ -1,9 +1,19 @@
 # Multi-user implementation status
 
-This branch now includes an opt-in [tool-free multi-user chat service](../multi-user-chat.md)
-with username/password accounts, administrator grants, private conversations and
-files. The [approved full Agent design](multi-user-access-design.md) remains a
-separate, unfinished release target; no isolated Agent execution is claimed.
+The requested integration preserves the **original Hermes WebUI and Agent
+backend**. Username/password accounts and the account/grant editor are added to
+the existing Control Center under **Settings → System → Users & access**. The
+editor uses the existing theme and does not replace chat, composer, session or
+workspace components. `/admin/users` returns to the main application when the
+experimental member-chat flag is off.
+
+The earlier [separate tool-free chat UI](../multi-user-chat.md) was an incorrect
+substitution for this request. It remains an explicitly enabled experiment for
+development/regressions, not the staging/default interface or the target product.
+The [approved full Agent design](multi-user-access-design.md) remains unfinished:
+private member Agent runtimes and subscription/OAuth brokerage are not complete.
+Only administrator operation through the original backend is currently usable;
+restricted member execution remains denied rather than claiming isolation.
 
 ## Implemented foundation
 
@@ -95,8 +105,9 @@ error-recovery shortcut.
    subscription refresh, auxiliary calls and Agent compatibility proof.
 3. Wire policy and ownership into every session/project/upload/run/event/control/
    recovery/cron path while preserving the existing runtime contracts.
-4. Full Agent admin/member UI integration beyond the implemented tool-free
-   surfaces, including Agent event/control and runtime browser state.
+4. Member identity/runtime integration throughout the preserved upstream UI,
+   including Agent events, controls and account-scoped browser state. Account
+   administration itself is already embedded in the existing System settings.
 5. Migration/rollback, adversarial containment, live provider evidence,
    responsive browser journeys and platform verification.
 

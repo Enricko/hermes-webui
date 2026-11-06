@@ -1,5 +1,12 @@
 # Username/password multi-user chat
 
+**Experimental alternative, not the requested/default Hermes interface.** This
+separate UI was an incorrect substitution for adding multi-user features to the
+original app. The staging/default integration now preserves the upstream UI and
+Agent backend, with account administration inside Settings → System. See
+[current status](architecture/multi-user-implementation.md). The instructions
+below are retained for isolated development/regression work only.
+
 This fork provides an opt-in, **tool-free** multi-user chat service. Each account
 has private conversations and files. Administrators create username/password
 accounts, disable access, reset passwords, and assign profiles, workspaces,

@@ -17180,6 +17180,9 @@ def _handle_session_get(handler, parsed) -> bool:
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
     if parsed.path in {"/admin/users", "/member"}:
+        from api.member_routes import member_enabled
+        if parsed.path == "/admin/users" and not member_enabled():
+            return t(handler, '', status=302, extra_headers={"Location":"../", "Cache-Control":"no-store"})
         from api.member_routes import serve_access_page
         return serve_access_page(handler, admin=parsed.path == "/admin/users")
     if parsed.path.startswith("/api/member/"):

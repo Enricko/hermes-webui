@@ -1293,6 +1293,16 @@ def check_auth(handler, parsed) -> bool:
 
         from api.user_roles import is_restricted
         if is_restricted() and not parsed.path.startswith('/api/') and parsed.path != '/member':
+            from api.member_routes import member_enabled
+            if not member_enabled():
+                body = b'Private member runtimes are not available yet. Contact your administrator.'
+                handler.send_response(403)
+                handler.send_header('Content-Type','text/plain; charset=utf-8')
+                handler.send_header('Content-Length',str(len(body)))
+                handler.send_header('Cache-Control','no-store')
+                handler.end_headers()
+                handler.wfile.write(body)
+                return False
             handler.send_response(302)
             # Relative location retains a reverse proxy's stripped mount prefix.
             handler.send_header('Location', '../' * max(0, parsed.path.count('/') - 1) + 'member')

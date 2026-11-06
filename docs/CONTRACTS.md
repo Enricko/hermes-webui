@@ -13,9 +13,10 @@ contributor guidance; it does not change runtime behavior or CI gates.
 
 - [`docs/architecture/multi-user-implementation.md`](architecture/multi-user-implementation.md):
   fork-only account lifecycle, explicit grants and private ownership policy.
-  Tool-free chat is implemented separately in [`docs/multi-user-chat.md`](multi-user-chat.md).
-  Legacy Agent execution stays denied for members until isolated workers and
-  subscription/OAuth brokerage meet the approved full multi-user design gates.
+  Preserve the original Hermes UI/backend; account administration belongs in its
+  Control Center. The separate tool-free experiment is not the default product.
+  Member Agent execution stays denied until isolated workers and subscription/
+  OAuth brokerage meet the approved full multi-user design gates.
 
 - [`AGENTS.md`](../AGENTS.md): repository entry point for AI assistants,
   public-safety rules, and the short redline checklist.
