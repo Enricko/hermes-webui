@@ -5,8 +5,12 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from api.access_policy import AccessDenied, PolicyUnavailable
-from api.member_chat import ConversationBusy, MemberChat, parse_context
+from api.member_chat import ConversationBusy, MemberChat, ReferenceFolders, parse_context
 from api.provider_broker import ProviderFailure
+
+_REFERENCE_PATHS = {"/api/member/references", "/api/member/reference/files", "/api/member/reference/file"}
+_ADMIN_PREFIX = "/api/member/admin/"
+_ADMIN_PATHS = {"/api/member/admin/conversations", "/api/member/admin/conversation"}
 
 
 def member_enabled():
@@ -30,6 +34,48 @@ def local_actor(handler):
     return actor, info
 
 
+def _handle_reference(handler, parsed, store, account_id):
+    """Read-only folder references; identity comes only from the live login.
+
+    ``owner`` is untrusted input and is re-authorized against the live policy
+    on every request. Every non-GET method is refused before any file access.
+    """
+    from api.helpers import j
+    if handler.command != "GET":
+        return j(handler, {"error": "Reference folders are read only"}, status=405, extra_headers={"Allow": "GET"})
+    folders = ReferenceFolders(store)
+    if parsed.path == "/api/member/references":
+        return j(handler, {"references": folders.targets(account_id)})
+    query = parse_qs(parsed.query)
+    owner, path = query.get("owner", [""])[0], query.get("path", [""])[0]
+    if parsed.path == "/api/member/reference/files":
+        files, truncated = folders.list_files(account_id, owner, path)
+        return j(handler, {"owner": owner, "path": path, "read_only": True, "files": files, "truncated": truncated})
+    content = folders.read_file(account_id, owner, path)
+    return j(handler, {"owner": owner, "path": path, "read_only": True, "size": len(content),
+                       "content": base64.b64encode(content).decode()})
+
+
+def _handle_admin_conversations(handler, parsed, store, actor):
+    """Read-only administrator view of every account's member conversations.
+
+    Administrator authority is re-read on every request: from the live login
+    store (``actor`` was just resolved by ``local_actor``) and from the live
+    policy inside the reading transaction. Non-administrators, every non-GET
+    method and unknown admin paths get the same generic 403 before any
+    conversation is looked up. There is no administrator send/rename/delete
+    path; content reads of other accounts' conversations are audited.
+    """
+    from api.helpers import j
+    if handler.command != "GET" or actor.get("role") != "admin" or parsed.path not in _ADMIN_PATHS:
+        raise AccessDenied("Administrator read-only view")
+    service = MemberChat(store, member_root(store))
+    if parsed.path == "/api/member/admin/conversations":
+        return j(handler, {"conversations": service.admin_conversations(actor["id"]), "read_only": True})
+    conversation_id = parse_qs(parsed.query).get("id", [""])[0]
+    return j(handler, service.admin_read(actor["id"], conversation_id))
+
+
 def handle_member(handler, parsed, body=None):
     from api.access_admin import configured_store
     from api.helpers import bad, j
@@ -47,6 +93,10 @@ def handle_member(handler, parsed, body=None):
         if parsed.path == "/api/member/catalog" and handler.command == "GET":
             return j(handler, {**store.account_snapshot(actor["id"]), "chat_available": True,
                                "username": actor["username"], "role": actor["role"], "tools_available": False})
+        if parsed.path.startswith(_ADMIN_PREFIX):
+            return _handle_admin_conversations(handler, parsed, store, actor)
+        if parsed.path in _REFERENCE_PATHS:
+            return _handle_reference(handler, parsed, store, actor["id"])
         service = MemberChat(store, member_root(store))
         if parsed.path == "/api/member/conversations":
             if handler.command == "GET":

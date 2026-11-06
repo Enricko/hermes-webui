@@ -12,7 +12,7 @@
 <label>Role<select id="role"><option value="user">User</option><option value="admin">Admin</option></select></label>
 <label>Password<input id="password" type="password" minlength="12" maxlength="1024" autocomplete="new-password"><small id="password-help">At least 12 characters. Leave blank to keep an existing password.</small></label>
 <label class="check"><input type="checkbox" id="enabled" checked> Account enabled</label><button id="save-account">Create account</button></form>
-<div id="grant-panel" hidden><h2>Assigned access</h2><p>Only checked resources are available to this user. Select allowed models for each provider connection.</p>
+<div id="grant-panel" hidden><h2>Assigned access</h2><p>Only checked resources are available to this user. Select allowed models for each provider connection. Folder references let this user read, never change, another login's private folder.</p>
 <form id="grants-form"><div id="grants"></div><button>Save access</button></form></div></section></div>
 <section aria-labelledby="resources-title"><h2 id="resources-title">Resources</h2><p>Define shared profile and skill templates, private workspaces, and provider connections before assigning them.</p>
 <form id="resource-form" class="resource-form"><label>Resource ID<input id="resource-id" required pattern="[a-zA-Z0-9_-]{1,128}" maxlength="128" placeholder="team-coding"></label>

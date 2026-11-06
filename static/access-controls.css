@@ -1,21 +1,114 @@
-/* Account administration follows the existing Control Center theme. */
-.user-access-panel{padding-top:var(--space-4);color:var(--text);font:inherit}
-.user-access-panel .columns{display:grid;grid-template-columns:minmax(150px,1fr) minmax(220px,2fr);gap:var(--space-4)}
-.user-access-panel section{min-width:0;padding:var(--space-3);margin:var(--space-3) 0;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-subtle)}
-.user-access-panel h2{font-size:var(--font-size-md);margin:0 0 var(--space-2)}
-.user-access-panel p,.user-access-panel small{color:var(--muted);font-size:var(--font-size-xs)}
-.user-access-panel label{display:flex;flex-direction:column;gap:var(--space-1);margin-bottom:var(--space-3)}
-.user-access-panel input,.user-access-panel select,.user-access-panel textarea{width:100%;box-sizing:border-box;padding:8px;max-width:100%;color:var(--text);background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit}
-.user-access-panel button{padding:7px 10px;min-height:36px;cursor:pointer;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit}
-.user-access-panel button:disabled{opacity:.6;cursor:wait}
-.user-access-panel button:hover{background:var(--hover-bg)}
-.user-access-panel .check{flex-direction:row;align-items:center}.user-access-panel .check input{width:auto}
-.user-access-panel .accounts,.user-access-panel .resource-list{display:grid;gap:var(--space-2);margin-top:var(--space-3)}
-.user-access-panel .account,.user-access-panel .resource-list button{text-align:left;overflow-wrap:anywhere}
-.user-access-panel .account small{display:block}.user-access-panel .account[aria-pressed=true]{border-color:var(--accent)}
-.user-access-panel .resource-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-3)}
-.user-access-panel .wide{grid-column:1/-1}.user-access-panel fieldset{border:1px solid var(--border);border-radius:var(--radius-sm);margin:var(--space-3) 0;padding:var(--space-3)}
-.user-access-panel .model-label{margin-left:var(--space-4)}
-.user-access-panel .error{color:var(--error)}.user-access-panel .success{color:var(--success)}
+/* Users & access, embedded in Settings -> System.
+   Mirrors the Settings conventions in style.css (card summary, 12px muted
+   labels, #mainSettings input rule, tinted accent actions) so the panel reads
+   as a native part of the System pane. Only runtime theme tokens are used. */
+
+/* Card header: title + description + chevron, like the other System cards. */
+#accountAccessSettingsBlock > summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;user-select:none;border-radius:8px}
+#accountAccessSettingsBlock > summary::-webkit-details-marker{display:none}
+#accountAccessSettingsBlock > summary::marker{content:''}
+#accountAccessSettingsBlock > summary:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+.settings-access-head{display:flex;flex-direction:column;gap:3px;min-width:0}
+.settings-access-title{font-size:13px;font-weight:600;color:var(--text)}
+.settings-access-meta{font-size:12px;line-height:1.45;color:var(--muted)}
+.settings-access-chevron{width:16px;height:16px;flex-shrink:0;color:var(--muted);transition:transform .15s}
+#accountAccessSettingsBlock[open] .settings-access-chevron{transform:rotate(180deg)}
+
+/* Panel shell. container-type lets the layout follow the pane width, which
+   depends on the settings sidebar rather than the viewport. */
+.user-access-panel{container-type:inline-size;margin-top:14px;padding-top:14px;border-top:1px solid var(--border);color:var(--text);font-size:13px}
 .user-access-panel [hidden]{display:none!important}
-@media(max-width:700px){.user-access-panel .columns,.user-access-panel .resource-form{grid-template-columns:1fr}}
+/* access-admin.js replaces the notice's className with 'success'/'error', so
+   style it by its stable role instead of a class. */
+.user-access-panel > [role=status]{min-height:18px;margin:0 0 12px;font-size:12px;line-height:1.45;color:var(--muted)}
+.user-access-panel > [role=status].success{color:var(--success)}
+.user-access-panel > [role=status].error{color:var(--error)}
+
+.user-access-panel .columns{display:grid;grid-template-columns:minmax(190px,230px) minmax(0,1fr);gap:12px;align-items:start}
+.user-access-panel .uac-card{min-width:0;margin:0;padding:14px;border:1px solid var(--border);border-radius:10px;background:var(--bg)}
+.user-access-panel .uac-resources{margin-top:12px}
+.user-access-panel .uac-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-height:30px;margin-bottom:4px}
+.user-access-panel h2{margin:0;font-size:13px;font-weight:600;letter-spacing:.01em;color:var(--text)}
+.user-access-panel .uac-intro{margin:0 0 12px;font-size:12px;line-height:1.5;color:var(--muted)}
+
+/* Labels and help text: same scale as #mainSettings .settings-field > label. */
+.user-access-panel label{display:flex;flex-direction:column;gap:6px;min-width:0;margin:0 0 12px;font-size:12px;font-weight:500;letter-spacing:.01em;color:var(--muted)}
+.user-access-panel small{font-size:11.5px;font-weight:400;line-height:1.45;letter-spacing:0;color:var(--muted)}
+
+/* Inputs: identical to the #mainSettings select/text/password rule, extended
+   to the untyped, url and textarea fields that rule does not reach. */
+#mainSettings .user-access-panel input:not([type=checkbox]),
+#mainSettings .user-access-panel select,
+#mainSettings .user-access-panel textarea{box-sizing:border-box;width:100%;max-width:100%;margin:0;padding:8px 12px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px;font:inherit;font-size:13px;font-weight:400;letter-spacing:0;transition:border-color .15s,box-shadow .15s}
+#mainSettings .user-access-panel input:not([type=checkbox]):focus,
+#mainSettings .user-access-panel select:focus,
+#mainSettings .user-access-panel textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-bg);outline:none}
+#mainSettings .user-access-panel input[readonly]{opacity:.7;cursor:default}
+#mainSettings .user-access-panel textarea{min-height:70px;resize:vertical;font-family:var(--font-mono);font-size:12px;line-height:1.5}
+#mainSettings .user-access-panel textarea:disabled{opacity:.45;cursor:not-allowed}
+#mainSettings .user-access-panel .uac-card input:not([type=checkbox]),#mainSettings .user-access-panel .uac-card select,#mainSettings .user-access-panel .uac-card textarea{background:var(--sidebar)!important}
+
+/* The private folder is derived, never typed: show it as a path chip. */
+.user-access-panel output{display:inline-flex;align-self:flex-start;max-width:100%;padding:5px 10px;border:1px dashed var(--border);border-radius:8px;font-family:var(--font-mono);font-size:12px;font-weight:400;color:var(--text);overflow-wrap:anywhere}
+
+/* Checkbox rows. */
+.user-access-panel .check{flex-direction:row;align-items:center;gap:8px;margin:0;padding:4px 0;font-size:13px;font-weight:400;color:var(--text);cursor:pointer}
+.user-access-panel .check input{width:15px;height:15px;margin:0;flex-shrink:0;accent-color:var(--accent);cursor:pointer}
+.user-access-panel .check:has(input:disabled){color:var(--muted);cursor:default}
+.user-access-panel .check:has(input:disabled) input{cursor:default}
+.user-access-panel .check span{min-width:0;overflow-wrap:anywhere}
+.user-access-panel .check .uac-hint{margin-left:auto;padding-left:8px;white-space:nowrap;font-size:11.5px;color:var(--muted)}
+
+/* Buttons: neutral secondary by default; tinted accent for the save actions
+   (readable on every theme, unlike white text on a bright accent). */
+.user-access-panel button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:6px 14px;border:1px solid var(--border);border-radius:8px;background:var(--sidebar);color:var(--text);font:inherit;font-size:13px;font-weight:500;cursor:pointer;transition:background .15s,border-color .15s,color .15s}
+.user-access-panel button:hover{background:var(--hover-bg)}
+.user-access-panel button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.user-access-panel button:disabled{opacity:.55;cursor:wait}
+.user-access-panel button svg{width:14px;height:14px;flex-shrink:0}
+.user-access-panel .uac-primary{background:var(--accent-bg);border-color:var(--accent-bg-strong);color:var(--accent-text);font-weight:600}
+.user-access-panel .uac-primary:hover{background:var(--accent-bg-strong);border-color:var(--accent-text)}
+.user-access-panel .uac-ghost{min-height:28px;padding:4px 10px;background:transparent;font-size:12px;color:var(--muted)}
+.user-access-panel .uac-ghost:hover{color:var(--text)}
+.user-access-panel .uac-actions{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-top:4px}
+.user-access-panel .uac-actions > button{margin-left:auto}
+
+/* Account list: compact selectable rows. */
+.user-access-panel .accounts{display:flex;flex-direction:column;gap:2px}
+.user-access-panel .account{flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:1px;width:100%;min-height:0;padding:7px 10px;border-color:transparent;background:transparent;text-align:left}
+.user-access-panel .account strong{max-width:100%;font-size:13px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+.user-access-panel .account small{font-size:11.5px}
+.user-access-panel .account[aria-pressed=true]{background:var(--accent-bg);border-color:var(--accent-bg-strong)}
+.user-access-panel .account[aria-pressed=true] strong{color:var(--accent-text)}
+.user-access-panel .account[data-enabled=false]{opacity:.6}
+
+/* Account form: username + role side by side when there is room. */
+.user-access-panel .uac-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
+.user-access-panel .wide{grid-column:1/-1}
+
+/* Assigned access: grouped checklists in a responsive grid. */
+.user-access-panel .uac-grant-panel{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.user-access-panel .uac-grants{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin-bottom:12px}
+.user-access-panel fieldset{min-width:0;margin:0;padding:6px 12px 10px;border:1px solid var(--border);border-radius:10px}
+.user-access-panel legend{padding:0 6px;margin-left:-6px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.user-access-panel fieldset > p{margin:4px 0;font-size:12px;line-height:1.5;color:var(--muted)}
+.user-access-panel fieldset.uac-wide{grid-column:1/-1}
+.user-access-panel .model-label{margin:2px 0 6px 23px}
+
+/* Resources: form grid + list of registered items. */
+.user-access-panel .resource-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
+.user-access-panel .uac-subgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
+.user-access-panel .resource-list{display:flex;flex-direction:column;gap:2px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
+.user-access-panel .resource-list:empty{display:none}
+.user-access-panel .resource-row{display:flex;flex-direction:column;align-items:flex-start;justify-content:flex-start;gap:1px;width:100%;min-height:0;padding:7px 10px;border:1px solid transparent;border-radius:8px;background:transparent;text-align:left}
+.user-access-panel .resource-row strong{max-width:100%;font-size:13px;font-weight:600;color:var(--text);overflow-wrap:anywhere}
+.user-access-panel .resource-row small{overflow-wrap:anywhere}
+.user-access-panel div.resource-row{cursor:default}
+
+/* Narrow panes (mobile, or a wide settings sidebar): single column. */
+@container (max-width:640px){
+  .user-access-panel .columns,.user-access-panel .uac-form,.user-access-panel .resource-form,.user-access-panel .uac-subgrid{grid-template-columns:minmax(0,1fr)}
+}
+@media(max-width:700px){
+  .user-access-panel .columns,.user-access-panel .uac-form,.user-access-panel .resource-form,.user-access-panel .uac-subgrid{grid-template-columns:minmax(0,1fr)}
+}

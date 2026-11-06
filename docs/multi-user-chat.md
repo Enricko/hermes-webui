@@ -94,6 +94,59 @@ unsupported platforms refuse file operations. Files are separated by immutable
 account ID and workspace ID. Model/skill/profile grants remain checked by the
 server even if a client manually changes request fields.
 
+### Read-only folder references
+
+An administrator can let one account read another login's private folder
+(`/<login>`) under **Assigned access → Boleh melihat folder (hanya-baca)**, via
+the `grants` admin action's optional `references` list of account IDs, or with
+`scripts/webui_access.py --admin administrator references alice bob`. Default is
+no access; references are one-directional and never expose the target's
+conversations, member-data files, grants or credentials.
+
+- `GET /api/member/references` lists granted targets (`id`, `username`).
+- `GET /api/member/reference/files?owner=<id>&path=<relative>` lists a folder.
+- `GET /api/member/reference/file?owner=<id>&path=<relative>` returns base64
+  content, 2 MiB limit.
+
+Every request re-reads the live grant, so revocation applies to the next request.
+Unknown and ungranted owners get the same 403. Absolute paths, `..`, NUL bytes,
+symlinks at any component, dot entries (`.env`, `.ssh`, …) and common key files
+are refused. These routes accept GET only; other methods get 405 when routed
+here, and the server has no PUT/PATCH/DELETE member routes.
+
+### Administrator read-only conversation view
+
+Conversations are private to their owner: the ordinary list/read/send routes
+only serve the authenticated owner's rows, for administrators too. As a
+disclosed exception, an administrator with a live, enabled admin role in
+**both** the login store and the policy may read other accounts' conversations
+(the member UI does not show this notice yet; the API exposes the owner fields
+below):
+
+- `GET /api/member/admin/conversations` — metadata of every conversation (`id`,
+  `owner_id`, `owner_username`, `created`, `own`). No message content; the title
+  (derived from the first message) is included only for the caller's own rows.
+- `GET /api/member/admin/conversation?id=<id>` — messages, `read_only: true`.
+
+Each read of another account's conversation appends one row to
+`member_admin_audit` (admin ID, owner ID, conversation ID, action `read`, time;
+never message text or titles) in the same SQLite transaction as the admin check.
+If the audit write or commit fails the request returns 503 and no content.
+Listing metadata and reading one's own conversation are not audited. The
+owner's `GET /api/member/conversation` response carries `admin_views` (count)
+and `last_admin_view` (timestamp or `null`), not the administrator's identity.
+
+Conversations of a disabled account are sealed: while the owner is disabled in
+either the policy database or the login store, administrators can neither list
+nor read them (same generic 403 as an unknown ID, nothing audited). They are
+retained and become readable again once the account is re-enabled in both.
+
+Roles are re-read on every request; disabling or demoting an administrator in
+either store denies the next request. Non-administrators, non-GET methods,
+unknown admin paths and unknown/malformed IDs all get the same generic 403.
+There is no administrator send, continue, rename or delete path, and the owner
+routes keep refusing an administrator's foreign conversation IDs.
+
 The new interfaces keep private state in memory, without localStorage or offline
 response caches. Logout clears the visible private state. Username/password login
 clears legacy Hermes draft/session storage and shell caches before switching

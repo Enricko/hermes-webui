@@ -4,6 +4,11 @@
 The configured account store supplies immutable identities. The JSON policy
 input contains registered resource IDs, labels, bindings and model allowlists;
 never pass provider credentials. This initializes policy only, not a runtime.
+
+``references USERNAME [TARGET ...]`` replaces the read-only folder references
+of USERNAME: each TARGET login's private folder becomes readable (never
+writable) by USERNAME. No TARGET clears them. The grants JSON format is
+unchanged and never touches references.
 """
 from __future__ import annotations
 
@@ -34,6 +39,9 @@ def main():
     grants = commands.add_parser("grants", help="replace one account's grants from a JSON file")
     grants.add_argument("username")
     grants.add_argument("json_file", type=Path)
+    references = commands.add_parser("references", help="replace one account's read-only folder references")
+    references.add_argument("username")
+    references.add_argument("targets", nargs="*", help="login usernames whose private folder becomes readable")
     args = parser.parse_args()
     if not args.policy:
         parser.error("--policy or HERMES_WEBUI_ACCESS_POLICY_FILE is required")
@@ -50,12 +58,17 @@ def main():
         if args.command == "show":
             print(json.dumps(store.snapshot(admin["id"]), indent=2))
             return
-        if args.command in {"account", "grants"}:
+        if args.command in {"account", "grants", "references"}:
             user = accounts.get(normalize_username(args.username))
             if not user or not user.get("id"):
                 parser.error("Account must exist and have an immutable ID")
             if args.command == "account":
                 store.put_account(admin["id"], user["id"], role=user["role"], enabled=not args.disable)
+            elif args.command == "references":
+                targets = [accounts.get(normalize_username(name)) for name in args.targets]
+                if any(not target or not target.get("id") for target in targets):
+                    parser.error("Reference targets must be existing accounts with immutable IDs")
+                store.replace_references(admin["id"], user["id"], [target["id"] for target in targets])
             else:
                 store.replace_grants(admin["id"], user["id"], json.loads(args.json_file.read_text()))
         elif args.command == "resource":

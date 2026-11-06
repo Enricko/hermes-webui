@@ -61,8 +61,13 @@ def handle_access_admin(handler, parsed, body=None):
         action = body.get("action")
         if action == 'import_profiles':
             from api.profiles import list_profiles_api
-            names = [row['name'] for row in list_profiles_api() if isinstance(row,dict) and row.get('name')]
-            return j(handler, {'ok':True,'profiles':store.import_profiles(actor['id'],names)})
+            rows = [row for row in list_profiles_api() if isinstance(row,dict) and row.get('name')]
+            # Homes come from server-side discovery, never the request body, so
+            # each profile's skills and SOUL digests are recorded at import.
+            homes = {row['name']: row['path'] for row in rows
+                     if isinstance(row.get('path'), str) and os.path.isabs(row['path'])}
+            return j(handler, {'ok':True,'profiles':store.import_profiles(
+                actor['id'],[row['name'] for row in rows],homes=homes)})
         if action == "account":
             # Account identity is resolved from the trusted local store. A body
             # cannot invent a login identity or a role different from that store.
@@ -91,7 +96,10 @@ def handle_access_admin(handler, parsed, body=None):
                 from api.member_routes import member_root
                 CredentialVault(member_root(store) / "credentials.json").put(body["id"], credential, body["binding"])
         elif action == "grants":
-            store.replace_grants(actor["id"], body.get("account_id"), body.get("grants"))
+            # Optional "references": account IDs whose private folder this
+            # account may read (read only). Omitted leaves them unchanged.
+            store.replace_grants(actor["id"], body.get("account_id"), body.get("grants"),
+                                 references=body.get("references"))
         else:
             return bad(handler, "Unknown access policy action", 400)
         return j(handler, {"ok": True, "revision": store.snapshot(actor["id"])["revision"]})

@@ -48,6 +48,20 @@ for actual guarantees and the remaining worker integration.
 - Opt-in `/api/admin/access` GET/POST administers policy through existing account
   authentication and the normal POST CSRF gate. `/api/access/me` returns only
   the caller's granted catalog, excluding trusted path/connection bindings.
+- Administrator-granted read-only folder references (`reference_grants` table,
+  created on demand so older policy databases still open) let one account read
+  another login's private folder through the member API. Self, unknown and
+  disabled targets are refused; grant/revoke advance the policy revision. The
+  catalog exposes only target IDs and usernames. Worker mounts (`/referensi/*`)
+  and the main WebUI file browser are not wired yet. See
+  [member chat](../multi-user-chat.md#read-only-folder-references).
+- Member-chat conversations stay private to their owner. A live administrator
+  may list conversation metadata and read another account's conversation
+  read-only; each such read appends a content-free `member_admin_audit` row in
+  the same transaction (audit failure denies the read), and the owner's read
+  shows the view count and last view time. Main-UI `Session` ownership is not
+  wired yet. See
+  [member chat](../multi-user-chat.md#administrator-read-only-conversation-view).
 
 Authoritative state: the login account store owns identities/auth generations;
 the server-side session store owns bound login proof; SQLite owns grants,
