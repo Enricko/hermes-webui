@@ -12,6 +12,9 @@ role/template changes and disablement revoke all account sessions immediately.
 Streaming connections revalidate sessions every half second. The reconciler
 also stops/recreates that account's processes on credential-generation changes.
 The last enabled administrator cannot be disabled or demoted.
+HTTPS sessions use a `__Host-` cookie, preventing a sibling subdomain from
+injecting a parent-domain session cookie. Loopback HTTP trials use a separate
+cookie name.
 
 Read the [authority and containment contract](architecture/isolated-multiuser.md)
 before changing this deployment. No existing home, `.env`, conversation database,
@@ -86,6 +89,9 @@ the same verified upstream SQLite into a new private prefix (requires a C
 compiler and make). Set `LD_LIBRARY_PATH=/opt/hermes-multiuser/sqlite/lib` for
 both the gateway **and every operator CLI invocation**, and in the service
 environment file, then rerun the version assertion. Never turn off the check.
+Since `sudo` strips loader variables, an explicit trusted invocation is
+`sudo env LD_LIBRARY_PATH=/opt/hermes-multiuser/sqlite/lib .venv/bin/python -m
+multiuser.manage --root /srv/hermes list-users`.
 
 For an independent localhost trial initialize a **new short root** with
 `--public-url http://127.0.0.1:8799`. HTTP cookies are allowed only on true

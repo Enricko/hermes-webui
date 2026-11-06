@@ -14,7 +14,7 @@ from aiohttp.test_utils import TestServer
 import pytest
 import pytest_asyncio
 
-from multiuser.gateway import create_app
+from multiuser.gateway import Gateway, create_app
 from multiuser.settings import Settings
 from multiuser.store import PolicyError
 
@@ -214,6 +214,7 @@ async def test_frontend_cannot_be_poisoned_by_runtime_or_untrusted_code(gateway)
 def test_only_loopback_trials_can_use_insecure_cookies():
     # Root stays short enough for Unix sockets; origin policy is independent.
     settings = Settings(root=Path('/tmp/hmu-policy'), gateway_uid=os.getuid())
+    assert Gateway(settings).cookie_name == '__Host-hmu_session'
     for url in ['http://public.example', 'https://user:password@host.example', 'https://host.example/path']:
         with pytest.raises(PolicyError):
             replace(settings, public_url=url).validate()

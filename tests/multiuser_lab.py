@@ -33,7 +33,12 @@ class Lab:
         self.event_evidence = []
 
     async def operator(self, *arguments, stdin=None):
-        process = await asyncio.create_subprocess_exec('sudo', '-n', sys.executable, '-m', 'multiuser.manage',
+        command = ['sudo', '-n']
+        # sudo deliberately strips loader variables. This optional prefix is
+        # selected by the trusted test operator, never a browser or Agent.
+        if os.environ.get('LD_LIBRARY_PATH'):
+            command += ['env', 'LD_LIBRARY_PATH=' + os.environ['LD_LIBRARY_PATH']]
+        process = await asyncio.create_subprocess_exec(*command, sys.executable, '-m', 'multiuser.manage',
             '--root', str(self.root), *arguments, cwd=REPO,
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

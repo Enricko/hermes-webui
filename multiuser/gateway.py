@@ -61,6 +61,7 @@ async def object_body(request, allowed):
 class Gateway:
     def __init__(self, settings):
         self.settings = settings.validate()
+        self.cookie_name = '__Host-' + COOKIE if settings.secure else COOKIE
         self.store = settings.store()
         self.brokers = Brokers(settings)
         self.sessions = {}
@@ -73,7 +74,7 @@ class Gateway:
         self.version = 'mu-' + digest.hexdigest()[:16]
 
     def principal(self, request):
-        return self.store.session(request.cookies.get(COOKIE, ''))
+        return self.store.session(request.cookies.get(self.cookie_name, ''))
 
     def require(self, request, *, admin=False):
         session = self.principal(request)
@@ -166,8 +167,10 @@ class Gateway:
         if old:
             self.store.logout(old)
         response = json_response({'ok': True, 'user': session.public()})
-        response.set_cookie(COOKIE, token, max_age=self.settings.session_ttl, httponly=True,
+        response.set_cookie(self.cookie_name, token, max_age=self.settings.session_ttl, httponly=True,
                             secure=self.settings.secure, samesite='Strict', path='/')
+        if self.cookie_name != COOKIE:
+            response.del_cookie(COOKIE, path='/')
         response.del_cookie('hermes_profile', path='/')
         response.headers['Clear-Site-Data'] = '"cache", "storage"'
         return response
@@ -175,7 +178,8 @@ class Gateway:
     async def logout(self, request):
         self.store.logout(self.require(request))
         response = json_response({'ok': True})
-        response.del_cookie(COOKIE, path='/')
+        response.del_cookie(self.cookie_name, path='/', secure=self.settings.secure,
+                            httponly=True, samesite='Strict')
         response.del_cookie('hermes_profile', path='/')
         response.headers['Clear-Site-Data'] = '"cache", "storage"'
         return response

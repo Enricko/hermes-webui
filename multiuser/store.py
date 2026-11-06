@@ -85,6 +85,8 @@ class Store:
         self.session_ttl = session_ttl
         self.login_limit = login_limit
         self.login_window = login_window
+        if sqlite3.sqlite_version_info < (3, 51, 3):
+            raise PolicyError('The account control plane requires SQLite >=3.51.3 (upstream WAL fix)')
         if not 60 <= session_ttl <= 86400:
             raise PolicyError("Session expiry must be between 60 seconds and one day")
 
