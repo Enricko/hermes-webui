@@ -84,3 +84,8 @@ docs/ui-ux/review-shots/
 # Local WebUI runtime data and credentials
 .webui_password
 attachments/
+
+# Private control state for the optional multi-user chat service
+/member-data/
+/access.sqlite*
+/users.json*

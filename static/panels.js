@@ -10033,6 +10033,29 @@ function _syncSettingsMaxTokensPlaceholder(field, fallbackValue){
 async function loadSettingsPanel(){
   try{
     const settings=await api('/api/settings');
+    try {
+      const accountStatus=await api('/api/auth/status');
+      const block=$('accountAccessSettingsBlock');
+      const container=$('accountAccessControls');
+      if(block && container) {
+        block.hidden=!(accountStatus.role==='admin' && accountStatus.auth_type==='local');
+        if(!block.hidden && !block.dataset.accessBound) {
+          block.dataset.accessBound='1';
+          block.addEventListener('toggle',async()=>{
+            if(!block.open || container.dataset.accessInitialized || container.dataset.loading) return;
+            container.dataset.loading='1';
+            try {
+              const root=new URL('.',document.baseURI||location.href);
+              const response=await fetch(new URL('static/access-controls.html',root),{credentials:'same-origin',cache:'no-store'});
+              if(!response.ok) throw new Error('Could not load user management.');
+              container.innerHTML=await response.text();
+              window.initializeAccessControls(container,{prefix:'userAccess-',root,csrf:(window.__HERMES_CONFIG__||{}).csrfToken});
+            } catch(error) { container.textContent=error.message; }
+            finally { delete container.dataset.loading; }
+          });
+        }
+      }
+    } catch(_accountError) { const block=$('accountAccessSettingsBlock'); if(block) block.hidden=true; }
     checkWebUIVersionSkew(settings);
     // Populate the version badges from the server — keeps them in sync with git
     // tags automatically without any manual release step.

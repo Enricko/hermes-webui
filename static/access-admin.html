@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="__ACCESS_CSRF__"><title>Users & access · Hermes</title>
+<link rel="stylesheet" href="../static/access-admin.css"><script src="../static/access-admin.js" defer></script></head>
+<body><header><a href="../">← Hermes</a><h1>Users & access</h1><a href="../member">Private chat</a><button id="reload" type="button">Refresh</button></header>
+<main><p id="notice" role="status" aria-live="polite">Loading accounts…</p>
+<div class="columns"><section aria-labelledby="accounts-title"><h2 id="accounts-title">Accounts</h2>
+<p>Create a username and password, then assign access. Users cannot change their own role or grants.</p>
+<button id="new-account" type="button">New account</button><div id="accounts" class="accounts"></div></section>
+<section aria-labelledby="edit-title"><h2 id="edit-title">Account details</h2>
+<form id="account-form"><label>Username<input id="username" required maxlength="64" pattern="[a-z0-9][a-z0-9._-]{0,63}" autocomplete="off"></label>
+<label>Role<select id="role"><option value="user">User</option><option value="admin">Admin</option></select></label>
+<label>Password<input id="password" type="password" minlength="12" maxlength="1024" autocomplete="new-password"><small id="password-help">At least 12 characters. Leave blank to keep an existing password.</small></label>
+<label class="check"><input type="checkbox" id="enabled" checked> Account enabled</label><button id="save-account">Create account</button></form>
+<div id="grant-panel" hidden><h2>Assigned access</h2><p>Only checked resources are available to this user. Select allowed models for each provider connection.</p>
+<form id="grants-form"><div id="grants"></div><button>Save access</button></form></div></section></div>
+<section aria-labelledby="resources-title"><h2 id="resources-title">Resources</h2><p>Define shared profile and skill templates, private workspaces, and provider connections before assigning them.</p>
+<form id="resource-form" class="resource-form"><label>Resource ID<input id="resource-id" required pattern="[a-zA-Z0-9_-]{1,128}" maxlength="128" placeholder="team-coding"></label>
+<label>Type<select id="resource-kind"><option value="profile">Profile</option><option value="workspace">Private workspace</option><option value="connection">Provider connection</option><option value="skill">Skill</option></select></label>
+<label>Display name<input id="resource-label" required maxlength="160" placeholder="Team coding"></label>
+<label class="wide" id="template-label">Profile instructions<textarea id="resource-content" rows="5" maxlength="64000" placeholder="Instructions for this profile…"></textarea></label>
+<div id="connection-settings" class="wide" hidden><label>Provider API format<select id="resource-protocol"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic Messages</option></select></label>
+<label>Provider base URL<input id="resource-url" type="url" placeholder="https://api.openai.com/v1"></label>
+<label>Upstream account identity<input id="resource-account" maxlength="160" placeholder="team-account"><small>Use a distinct identity for each upstream account, even at the same provider.</small></label></div>
+<p class="wide" id="workspace-note" hidden>Each assigned user receives a separate private folder for this workspace.</p>
+<label class="wide" id="credential-label" hidden>Provider API key (write only)<input id="resource-credential" type="password" autocomplete="new-password"><small>Leave blank to keep a credential. Changing connection metadata requires entering the key again.</small></label>
+<button>Save resource</button></form><div id="resources" class="resource-list"></div></section>
+</main></body></html>

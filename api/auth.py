@@ -668,11 +668,14 @@ def get_oidc_startup_warning() -> str | None:
 
 def is_auth_enabled() -> bool:
     """True if password auth, passkeys, OIDC login, or trusted-header auth is configured."""
+    from api.user_roles import has_accounts  # local patch: users.json accounts
+
     return (
         is_password_auth_enabled()
         or are_passkeys_enabled()
         or is_oidc_auth_enabled()
         or is_trusted_auth_enabled()
+        or has_accounts()
     )
 
 
@@ -707,7 +710,7 @@ def verify_password(plain: str) -> bool:
     return False
 
 
-def create_session(*, auth_type: str | None = None, username: str | None = None, bound_profile: str | None = None) -> str:
+def create_session(*, auth_type: str | None = None, username: str | None = None, bound_profile: str | None = None, account_binding: str | None = None) -> str:
     """Create a new auth session. Returns signed cookie value."""
     token = secrets.token_hex(32)
     expiry = time.time() + _resolve_session_ttl()
@@ -719,6 +722,8 @@ def create_session(*, auth_type: str | None = None, username: str | None = None,
             'username': username,
             'bound_profile': bound_profile,
         }
+        if account_binding is not None:
+            record['account_binding'] = account_binding
     else:
         record = expiry
     with _SESSIONS_LOCK:
@@ -988,6 +993,10 @@ def reset_trusted_auth_request_state(handler) -> None:
             delattr(handler, name)
         except AttributeError:
             pass
+    # Local patch (api/user_roles.py): per-account restriction is per request.
+    from api.user_roles import clear_request_restriction
+
+    clear_request_restriction()
 
 
 def _apply_trusted_session_profile(handler, bound_profile: str | None, cookie_value: str) -> None:
@@ -1006,7 +1015,25 @@ def ensure_trusted_auth_session(handler) -> dict | None:
         return handler._trusted_auth_session_reconciled
     cookie_value = parse_cookie(handler)
     info = get_session_info(cookie_value) if cookie_value and verify_session(cookie_value) else None
+    from api import user_roles
+
+    # Every enabled login path must resolve to a local account in account mode.
+    # Legacy shared-password/passkey/OIDC/header sessions carry no such identity.
+    if user_roles.accounts_configured() and (not info or info.get('auth_type') != 'local'):
+        if info:
+            invalidate_session(cookie_value)
+        handler._trusted_auth_session_rejected = True
+        return _remember_trusted_auth_session(handler, None)
     if info and info.get('auth_type') != 'trusted':
+        if info.get('auth_type') == 'local':
+            # Local patch (api/user_roles.py): username/password accounts with roles.
+            valid, restriction = user_roles.resolve_session_account(info)
+            if not valid:
+                invalidate_session(cookie_value)
+                handler._trusted_auth_session_rejected = True
+                return _remember_trusted_auth_session(handler, None)
+            user_roles.set_request_restriction(restriction)
+            _apply_trusted_session_profile(handler, info.get('bound_profile') or None, cookie_value)
         return _remember_trusted_auth_session(handler, info)
     if not is_trusted_auth_enabled():
         if info:
@@ -1213,6 +1240,16 @@ def check_auth(handler, parsed) -> bool:
     If not authorized, sends 401 (API) or 302 redirect (page) and returns False."""
     if not is_auth_enabled():
         return True
+    from api.user_roles import accounts_configured
+
+    if accounts_configured() and parsed.path.startswith(('/api/auth/oidc/', '/api/auth/passkey/')):
+        body = b'{"error":"Account-linked authentication required"}'
+        handler.send_response(403)
+        handler.send_header('Content-Type', 'application/json')
+        handler.send_header('Content-Length', str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+        return False
     # Public paths don't require auth
     if (
         parsed.path in PUBLIC_PATHS
@@ -1248,6 +1285,37 @@ def check_auth(handler, parsed) -> bool:
                 body = b'Profile access forbidden'
                 handler.send_response(403)
                 handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+            handler.send_header('Content-Length', str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+            return False
+        from api.user_roles import request_denied
+
+        from api.user_roles import is_restricted
+        if is_restricted() and not parsed.path.startswith('/api/') and parsed.path != '/member':
+            from api.member_routes import member_enabled
+            if not member_enabled():
+                body = b'Private member runtimes are not available yet. Contact your administrator.'
+                handler.send_response(403)
+                handler.send_header('Content-Type','text/plain; charset=utf-8')
+                handler.send_header('Content-Length',str(len(body)))
+                handler.send_header('Cache-Control','no-store')
+                handler.end_headers()
+                handler.wfile.write(body)
+                return False
+            handler.send_response(302)
+            # Relative location retains a reverse proxy's stripped mount prefix.
+            handler.send_header('Location', '../' * max(0, parsed.path.count('/') - 1) + 'member')
+            handler.send_header('Cache-Control', 'no-store')
+            handler.send_header('Content-Length', '0')
+            handler.end_headers()
+            return False
+
+        denied = request_denied(handler, parsed)
+        if denied:
+            body = json.dumps({'error': denied}).encode()
+            handler.send_response(403)
+            handler.send_header('Content-Type', 'application/json')
             handler.send_header('Content-Length', str(len(body)))
             handler.end_headers()
             handler.wfile.write(body)

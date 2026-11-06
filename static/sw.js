@@ -8,6 +8,7 @@
 // Cache version is injected by the server at request time (routes.py /sw.js handler).
 // Bumps automatically whenever the git commit changes — no manual edits needed.
 const CACHE_NAME = 'hermes-shell-__WEBUI_VERSION__';
+const ACCOUNT_MODE = '__ACCOUNT_MODE__' === 'true';
 
 // Static assets that form the app shell.
 //
@@ -48,7 +49,7 @@ const SHELL_ASSETS = [
 function deleteOldShellCaches() {
   return caches.keys().then((keys) =>
     Promise.all(
-      keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
+      keys.filter((k) => ACCOUNT_MODE ? k.startsWith('hermes-shell-') : k !== CACHE_NAME).map((k) => caches.delete(k))
     )
   );
 }
@@ -57,6 +58,11 @@ function deleteOldShellCaches() {
 // this before caches.open(CACHE_NAME) avoids a temporary double-cache window on
 // quota-sensitive browsers during frequent version bumps.
 self.addEventListener('install', (event) => {
+  if (ACCOUNT_MODE) {
+    event.waitUntil(deleteOldShellCaches());
+    self.skipWaiting();
+    return;
+  }
   event.waitUntil(
     deleteOldShellCaches().then(() =>
       caches.open(CACHE_NAME).then((cache) => {
@@ -84,6 +90,7 @@ self.addEventListener('activate', (event) => {
 // - Shell assets → network-first with cache fallback
 // - Everything else → network-only
 self.addEventListener('fetch', (event) => {
+  if (ACCOUNT_MODE) return;
   const url = new URL(event.request.url);
 
   // Never intercept cross-origin requests
@@ -92,6 +99,9 @@ self.addEventListener('fetch', (event) => {
   // Never intercept the service worker script itself. Returning a cached sw.js
   // prevents the browser from seeing a new cache version after local patches.
   if (url.pathname.endsWith('/sw.js')) return;
+
+  // Account-scoped pages must never hydrate a previous account's cached shell.
+  if (url.pathname.endsWith('/member') || url.pathname.endsWith('/admin/users')) return;
 
   // Login assets must always hit the network. Older login.js builds have had
   // subpath-sensitive auth POST paths; if the service worker caches one, the

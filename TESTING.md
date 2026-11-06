@@ -104,6 +104,80 @@ and touch flows in real Chromium.
 >
 > Local regression focus: verify that a previously closed workspace panel stays visually closed from first paint through boot completion on desktop refresh; there should be no brief open-then-close flash.
 
+## Hermetic multi-user harness (disposable Docker unit required)
+
+Start F02 verification with `scripts/multiuser_unit.sh`; its worker runs only
+inside an independently admitted disposable Docker unit. The controller is a
+small host-side shell command and never starts Python on the host. Do not invoke
+the multi-user launcher, its self-test, pytest, or a candidate interpreter
+directly on the host. The controller requires an explicit local Unix engine
+socket and a new private evidence directory; it does not select a Docker
+context, use ambient Docker configuration, or start an engine. Missing or
+unverifiable prerequisites produce nonzero `NOT_RUN`.
+Use the shown `/usr/bin/env -i /bin/bash -p` entry so inherited shell startup
+files and exported functions are not evaluated; unsupported direct shell entry
+is refused before the controller creates evidence or contacts Docker.
+
+Build the test image from an approved, digest-pinned Python base image, then run
+the exact full candidate commit using the returned unit image ID:
+
+```bash
+/usr/bin/env -i /bin/bash -p /path/to/checkout/scripts/multiuser_unit.sh \
+  --engine-socket /path/to/local/docker.sock \
+  --evidence-dir /path/to/new/private/build-evidence \
+  build --base-image 'python:3.13-slim@sha256:<verified-manifest-digest>'
+
+/usr/bin/env -i /bin/bash -p /path/to/checkout/scripts/multiuser_unit.sh \
+  --engine-socket /path/to/local/docker.sock \
+  --evidence-dir /path/to/new/private/run-evidence \
+  run --runtime-evidence /path/to/build-evidence/result.json \
+  --image-id sha256:<returned-unit-image-id> \
+  --candidate <full-40-character-commit> -- \
+  --no-agent --tier unit -- -q tests/multiuser/test_f02_unit.py
+```
+
+Replace every placeholder with a value that has been independently verified;
+the example is intentionally not directly executable. Use the same explicit
+engine socket for each call. The run must receive the `result.json` from that
+successful private build evidence directory; the controller validates its
+engine, recipe, image, runtime configuration and recorded freeze metadata
+before creating run resources. It may then use one admitted, never-started,
+leased probe to read the image's freeze bytes. A mismatch stops before candidate
+source copy/commit or execution-unit creation/start. The controller selects
+Docker and `jq` only from fixed absolute locations or explicitly supplied
+absolute binaries, and requires `jq`; an explicitly reviewed real `jq` path is
+appropriate when `/usr/bin/jq` is unavailable. It preprovisions Git in the
+admitted test image for source-bound tests.
+It creates a private per-invocation lease and uses an empty controlled
+environment for every engine call. It never installs missing tools. An
+explicitly supplied `--docker-bin` that points to a synthetic fake CLI is for
+controller control-flow simulations only; those results are not engine or
+OS-isolation evidence. Do not pass credentials, Docker contexts, host
+mounts, the home directory, engine sockets, or existing application state into
+the unit. The source tree is materialized from the selected commit into a
+read-only image; dependencies are provisioned while building the image,
+separately from proof execution. The run path cannot install packages or rebuild
+the runtime.
+
+Captured output has per-stream limits: control replies and diagnostic stderr
+are capped at 64 KiB, info/inspect JSON stdout at 1 MiB, build stdout and stderr
+at 8 MiB, and worker stdout/stderr at 4 MiB/1 MiB. Overflow is a failed run;
+the controller retains at most the documented cap plus one byte to identify it.
+
+`--dry-run` validates the local request and prints planned commands, but returns
+nonzero `NOT_RUN` and is not execution or containment evidence. A worker result
+is advisory: only the controller's engine inspection, exact-unit lifecycle,
+post-exit checks, and verified disposal can produce the controller verdict.
+The worker cannot certify OS containment, Agent pinning, native clients, browser
+privacy, or provider behavior. Native/Agent work remains under F06 and requires
+its separately admitted proof path.
+
+If cleanup must be retried after an interrupted controller, use
+`cleanup --unit-id <controller-uuid>` with that run's existing evidence
+directory and the same explicit engine socket. The lease is bound to the engine
+identity and the exact IDs/tags created by that invocation; do not remove by
+label, name, user ID, or shared image ID, and do not use a prune command.
+
 ---
 
 ## Cancelled-journal recovery combinations

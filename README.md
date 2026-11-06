@@ -1,5 +1,11 @@
 # Hermes Web UI
 
+Fork work in progress: username/password accounts and administrator access
+controls are integrated into the existing Hermes interface under Settings →
+System → Users & access. The upstream chat/workspace UI and Agent backend remain
+the main application. Private member Agent runtimes are still unfinished; see
+[implementation status](docs/architecture/multi-user-implementation.md).
+
 [Hermes Agent](https://hermes-agent.nousresearch.com/) is a sophisticated autonomous agent that lives on your server, accessed via a terminal or messaging apps, that remembers what it learns and gets more capable the longer it runs.
 
 Hermes WebUI is a lightweight, dark-themed web app interface in your browser for [Hermes Agent](https://hermes-agent.nousresearch.com/).

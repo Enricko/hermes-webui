@@ -1,0 +1,21 @@
+/* Account administration follows the existing Control Center theme. */
+.user-access-panel{padding-top:var(--space-4);color:var(--text);font:inherit}
+.user-access-panel .columns{display:grid;grid-template-columns:minmax(150px,1fr) minmax(220px,2fr);gap:var(--space-4)}
+.user-access-panel section{min-width:0;padding:var(--space-3);margin:var(--space-3) 0;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-subtle)}
+.user-access-panel h2{font-size:var(--font-size-md);margin:0 0 var(--space-2)}
+.user-access-panel p,.user-access-panel small{color:var(--muted);font-size:var(--font-size-xs)}
+.user-access-panel label{display:flex;flex-direction:column;gap:var(--space-1);margin-bottom:var(--space-3)}
+.user-access-panel input,.user-access-panel select,.user-access-panel textarea{width:100%;box-sizing:border-box;padding:8px;max-width:100%;color:var(--text);background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit}
+.user-access-panel button{padding:7px 10px;min-height:36px;cursor:pointer;background:var(--input-bg);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);font:inherit}
+.user-access-panel button:disabled{opacity:.6;cursor:wait}
+.user-access-panel button:hover{background:var(--hover-bg)}
+.user-access-panel .check{flex-direction:row;align-items:center}.user-access-panel .check input{width:auto}
+.user-access-panel .accounts,.user-access-panel .resource-list{display:grid;gap:var(--space-2);margin-top:var(--space-3)}
+.user-access-panel .account,.user-access-panel .resource-list button{text-align:left;overflow-wrap:anywhere}
+.user-access-panel .account small{display:block}.user-access-panel .account[aria-pressed=true]{border-color:var(--accent)}
+.user-access-panel .resource-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--space-3)}
+.user-access-panel .wide{grid-column:1/-1}.user-access-panel fieldset{border:1px solid var(--border);border-radius:var(--radius-sm);margin:var(--space-3) 0;padding:var(--space-3)}
+.user-access-panel .model-label{margin-left:var(--space-4)}
+.user-access-panel .error{color:var(--error)}.user-access-panel .success{color:var(--success)}
+.user-access-panel [hidden]{display:none!important}
+@media(max-width:700px){.user-access-panel .columns,.user-access-panel .resource-form{grid-template-columns:1fr}}

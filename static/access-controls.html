@@ -1,0 +1,25 @@
+<p id="userAccess-notice" role="status" aria-live="polite">Loading accounts…</p>
+<div class="columns"><section aria-labelledby="userAccess-accounts-title"><h2 id="userAccess-accounts-title">Accounts</h2>
+<p>Create a username and password, then assign access. Users cannot change their own role or grants.</p>
+<button id="userAccess-new-account" type="button">New account</button><div id="userAccess-accounts" class="accounts"></div></section>
+<section aria-labelledby="userAccess-edit-title"><h2 id="userAccess-edit-title">Account details</h2>
+<form id="userAccess-account-form"><label>Username<input id="userAccess-username" required maxlength="64" pattern="[a-z0-9][a-z0-9._-]{0,63}" autocomplete="off"></label>
+<label>Role<select id="userAccess-role"><option value="user">User</option><option value="admin">Admin</option></select></label>
+<label>Private workspace<output id="userAccess-private-workspace">Created automatically from the login username</output><small>The folder stays private to this login across every assigned profile.</small></label>
+<label>Password<input id="userAccess-password" type="password" minlength="12" maxlength="1024" autocomplete="new-password"><small id="userAccess-password-help">At least 12 characters. Leave blank to keep an existing password.</small></label>
+<label class="check"><input type="checkbox" id="userAccess-enabled" checked> Account enabled</label><button id="userAccess-save-account">Create account</button></form>
+<div id="userAccess-grant-panel" hidden><h2>Assigned access</h2><p>Choose profiles and tools for this login. Every selected profile uses the same private username folder. Installed tools are exposed read only.</p>
+<button id="userAccess-import-profiles" type="button">Refresh existing Hermes profiles</button>
+<form id="userAccess-grants-form"><div id="userAccess-grants"></div><button>Save access</button></form></div></section></div>
+<section aria-labelledby="userAccess-resources-title"><h2 id="userAccess-resources-title">Resources</h2><p>Import existing profiles with Refresh above. Private folders are automatic. Register provider connections, skill instructions and approved installed tools here.</p>
+<form id="userAccess-resource-form" class="resource-form"><label>Resource ID<input id="userAccess-resource-id" required pattern="[a-zA-Z0-9_-]{1,128}" maxlength="128" placeholder="team-coding"></label>
+<label>Type<select id="userAccess-resource-kind"><option value="connection">Provider connection</option><option value="skill">Skill</option><option value="tool">Installed tool</option></select></label>
+<label>Display name<input id="userAccess-resource-label" required maxlength="160" placeholder="Team coding"></label>
+<label class="wide" id="userAccess-template-label">Profile instructions<textarea id="userAccess-resource-content" rows="5" maxlength="64000" placeholder="Instructions for this profile…"></textarea></label>
+<div id="userAccess-connection-settings" class="wide" hidden><label>Provider API format<select id="userAccess-resource-protocol"><option value="openai">OpenAI compatible</option><option value="anthropic">Anthropic Messages</option></select></label>
+<label>Provider base URL<input id="userAccess-resource-url" type="url" placeholder="https://api.openai.com/v1"></label>
+<label>Upstream account identity<input id="userAccess-resource-account" maxlength="160" placeholder="team-account"><small>Use a distinct identity for each upstream account, even at the same provider.</small></label></div>
+<p class="wide" id="userAccess-workspace-note" hidden>Each assigned user receives a separate private folder for this workspace.</p>
+<div class="wide" id="userAccess-tool-settings" hidden><label>Installed executable or script<input id="userAccess-resource-executable" placeholder="/usr/bin/git"><small>Only this approved file is exposed read only. Its private host directories are not shared.</small></label></div>
+<label class="wide" id="userAccess-credential-label" hidden>Provider API key (write only)<input id="userAccess-resource-credential" type="password" autocomplete="new-password"><small>Leave blank to keep a credential. Changing connection metadata requires entering the key again.</small></label>
+<button>Save resource</button></form><div id="userAccess-resources" class="resource-list"></div></section>
