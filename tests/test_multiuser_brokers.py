@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import sqlite3
 import tempfile
 
 import pytest
@@ -94,4 +95,29 @@ async def test_partial_bind_closes_and_removes_its_socket_before_retry(brokers, 
     assert user['id'] not in service.sites
     monkeypatch.setattr(asyncio, 'start_unix_server', real_server)
     await service.bind(user['id'])
+    assert settings.broker_socket(user['id']).is_socket()
+
+
+@pytest.mark.asyncio
+async def test_transient_control_database_open_failure_retries_account_discovery(brokers, monkeypatch):
+    settings, service = brokers
+    user = settings.store().create_user('administrator', secrets.token_urlsafe(24), role='admin', bootstrap=True)
+    (settings.runtime_dir(user['id']) / 'broker').mkdir(parents=True)
+    real_users = service.store.users
+    calls = []
+
+    def temporarily_unavailable_database():
+        calls.append(True)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError('unable to open database file')
+        return real_users()
+
+    monkeypatch.setattr(service.store, 'users', temporarily_unavailable_database)
+    await service.start()
+    for _ in range(60):
+        if user['id'] in service.sites or service.task.done():
+            break
+        await asyncio.sleep(0.05)
+    assert not service.task.done()
+    assert len(calls) >= 2
     assert settings.broker_socket(user['id']).is_socket()

@@ -1,6 +1,7 @@
 """Actual HTTP/SSE gateway tests; OS/container acceptance is a separate gate."""
 
 import asyncio
+import contextlib
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -241,6 +242,22 @@ async def test_unassigned_admin_keeps_account_management_available(gateway):
         assert '/multiuser/static/client.js' in html and 'static/boot.js' not in html
     async with admin.get(server.make_url('/multiuser/api/users')) as response:
         assert response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_health_reports_stopped_account_discovery(gateway):
+    _settings, _store, server, _login, _users, _received = gateway
+    service = next(value for value in server.app.values() if isinstance(value, Gateway))
+    async with aiohttp.ClientSession() as client:
+        async with client.get(server.make_url('/health')) as response:
+            assert response.status == 200
+            assert (await response.json())['account_discovery'] == 'running'
+        service.brokers.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await service.brokers.task
+        async with client.get(server.make_url('/health')) as response:
+            assert response.status == 503
+            assert (await response.json())['account_discovery'] == 'stopped'
 
 
 def test_only_loopback_trials_can_use_insecure_cookies():
