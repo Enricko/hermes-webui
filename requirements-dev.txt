@@ -19,3 +19,5 @@ python-pptx
 # ruamel.yaml: the YAML fallback used when WebUI runs inside a Hermes Agent managed
 # environment that has no PyYAML (api/yaml_compat.py). Installed here so its tests run.
 ruamel.yaml>=0.18
+# Opt-in gateway tests exercise the actual maintained auth/HTTP libraries.
+-r requirements-multiuser.txt

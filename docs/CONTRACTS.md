@@ -11,6 +11,10 @@ contributor guidance; it does not change runtime behavior or CI gates.
 
 ## Start here
 
+- [`docs/architecture/isolated-multiuser.md`](architecture/isolated-multiuser.md):
+  opt-in local accounts, trusted provisioning, and whole-WebUI per-user container
+  isolation. Single-user profiles are not a multi-user security boundary.
+
 - [`AGENTS.md`](../AGENTS.md): repository entry point for AI assistants,
   public-safety rules, and the short redline checklist.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md): contribution style, verification,

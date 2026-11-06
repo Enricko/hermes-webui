@@ -76,6 +76,8 @@ missing_dev_deps() {
 import importlib.util
 
 modules = [
+    "argon2",
+    "aiohttp",
     "cryptography",
     "mcp",
     "pytest",
