@@ -295,6 +295,11 @@ Provider availability and supported request types still determine which listed
 models can complete a chat request. The default `"model_catalog": "allowlist"`
 preserves restricted installations' existing explicit `models` policy.
 
+Upstream keeps a short featured list in `/api/models/live`. The full catalog is
+available in `/api/models` through each group's `models` plus `extra_models`.
+Use the model picker's search or **Show more** to reach the remaining models;
+the featured-list budget does not limit server-side model authorization.
+
 Profile statistics include local and configured external skill roots, resolved
 under the profile owner's environment with duplicate names counted once.
 External changes participate in the existing invalidation/mtime cache. Account
