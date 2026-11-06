@@ -221,4 +221,6 @@ def test_original_hermes_shell_and_embedded_account_controls(browser, deployment
     assert page.locator('#accountAccessControls').evaluate('(element)=>element.getBoundingClientRect().width <= window.innerWidth')
     response=page.request.get(base+'/admin/users',max_redirects=0)
     assert response.status==302 and response.headers['location']=='../'
+    response=page.request.get(base+'/member',max_redirects=0)
+    assert response.status==302 and response.headers['location']=='./'
     context.close()
