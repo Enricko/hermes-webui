@@ -94,7 +94,9 @@ async def run():
                     await dialog.get_by_role('button', name='Close', exact=True).click()
                     await page.goto(lab.origin + '/')
                     await page.locator('#mu-account').wait_for(state='attached')
-                    if await page.locator('#btnHamburger').is_visible():
+                    await page.wait_for_function('typeof S !== "undefined" && S._bootReady')
+                    sidebar_closed = await page.evaluate('innerWidth <= 640 ? !document.querySelector(".sidebar").classList.contains("mobile-open") : document.querySelector(".layout").classList.contains("sidebar-collapsed")')
+                    if sidebar_closed and await page.locator('#btnHamburger').is_visible():
                         await page.locator('#btnHamburger').click()
                     await page.get_by_role('button', name='Sign out', exact=True).click()
                     await page.wait_for_url(lambda url: urlsplit(str(url)).path == '/login')
