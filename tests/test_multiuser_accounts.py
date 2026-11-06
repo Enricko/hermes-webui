@@ -109,3 +109,4 @@ def test_template_cannot_smuggle_state_credentials_or_path_traversal(accounts):
     assert configuration['terminal']['cwd'] == '/workspace'
     assert configuration['model']['base_url'] == 'http://127.0.0.1:8000/v1'
     assert configuration['agent']['max_tokens'] == 1024
+    assert worker_config({**base, 'agent': {'max_iterations': 20}})['agent']['max_turns'] == 20

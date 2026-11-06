@@ -174,6 +174,13 @@ numeric address. Default empty egress permits only the private model broker.
 Web browsing, package downloads and other network tools need explicit egress
 and any runtime dependencies. Direct Internet sockets are unavailable.
 
+Explicit temperature/top-p/service-tier values apply at the broker; max tokens
+are a ceiling (smaller auxiliary requests remain smaller). Reasoning effort uses
+upstream `agent.reasoning_effort`. The template's `max_iterations` maps to the
+upstream configuration key `agent.max_turns`; either spelling is accepted with
+one consistent value. Optional `agent.system_message` instructions append to
+the seeded SOUL file, using the Agent's existing instruction-loading mechanism.
+
 Publish existing reviewed scripts once with `publish-tool`; no user needs to
 recreate their source. The supplied converter is
 [`multiuser/shared_tools/png_to_jpg.py`](../multiuser/shared_tools/png_to_jpg.py).

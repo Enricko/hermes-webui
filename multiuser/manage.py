@@ -58,6 +58,8 @@ def migrate(settings, args):
     if args.parameters:
         document['parameters'] = {k: v for k, v in model.items() if k in PARAMETERS} if isinstance(model, dict) else {}
         document['agent'] = {k: v for k, v in (config.get('agent') or {}).items() if k in AGENT_FIELDS - {'system_message'}}
+        if 'max_turns' in config:
+            document['agent'].setdefault('max_turns', config['max_turns'])
     if args.soul:
         soul = source / 'SOUL.md'
         if soul.is_symlink():

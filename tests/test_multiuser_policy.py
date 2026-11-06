@@ -21,10 +21,11 @@ def document():
 
 
 def test_broker_owns_identity_disables_stored_state_and_bounds_response(document):
-    payload = {'model': 'approved', 'user': 'another-user', 'store': True, 'messages': []}
+    payload = {'model': 'approved', 'user': 'another-user', 'store': True, 'messages': [], 'temperature': 0.1}
     result = model_payload(payload, document, 'owner')
     assert result['user'] == 'owner' and result['store'] is False
     assert result['max_tokens'] == 2048
+    assert result['temperature'] == 0.7
     assert payload['user'] == 'another-user'  # no caller mutation
     for mutation in [{'model': 'unapproved'}, {'max_tokens': 2049}, {'max_tokens': True},
                      {'previous_response_id': 'guess'}, {'messages': [{'audio': {'id': 'guess'}}]},

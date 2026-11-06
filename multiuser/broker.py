@@ -72,7 +72,10 @@ def model_payload(value, template, uid, route='/v1/chat/completions'):
     for key in ('temperature', 'top_p', 'max_tokens', 'service_tier'):
         if key in parameters and route != '/v1/embeddings':
             field = 'max_output_tokens' if key == 'max_tokens' and route == '/v1/responses' else key
-            value.setdefault(field, parameters[key])
+            if key == 'max_tokens':
+                value.setdefault(field, parameters[key])
+            else:
+                value[field] = parameters[key]
     maximum = parameters.get('max_tokens', template['agent'].get('max_tokens', 32768))
     for field in ('max_tokens', 'max_completion_tokens', 'max_output_tokens'):
         if field in value:

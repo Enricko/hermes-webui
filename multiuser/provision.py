@@ -188,8 +188,10 @@ class Provisioner:
         manifest = s.runtime_dir(uid) / 'seed-manifest.json'
         previous = json.loads(manifest.read_text()) if manifest.exists() else {}
         document = template['document']
+        instructions = document['agent'].get('system_message', '')
+        soul = document['soul'] + ('\n\n' + instructions if instructions else '')
         files = {'config.yaml': yaml.safe_dump(worker_config(document), sort_keys=False).encode(),
-                 'SOUL.md': document['soul'].encode()}
+                 'SOUL.md': soul.encode()}
         for name, content in document['skills'].items():
             files['skills/' + relative_file(name)] = content.encode()
         catalog = []

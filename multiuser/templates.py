@@ -10,7 +10,7 @@ from multiuser.store import PolicyError, identifier
 
 FIELDS = {"provider_id", "model", "models", "parameters", "agent", "soul", "skills", "tools", "egress_hosts"}
 PARAMETERS = {"temperature", "top_p", "max_tokens", "reasoning_effort", "service_tier", "context_length"}
-AGENT_FIELDS = {"max_iterations", "max_tokens", "reasoning_effort", "system_message"}
+AGENT_FIELDS = {"max_iterations", "max_turns", "max_tokens", "reasoning_effort", "system_message"}
 SECRET_WORDS = re.compile(r"(?:password|secret|token|credential|api_key|auth\.json|user\.md)", re.I)
 
 
@@ -47,8 +47,8 @@ def validate_template(value):
                 maximum = 2 if name == 'temperature' else 1
                 if isinstance(setting, bool) or not isinstance(setting, (int, float)) or not 0 <= setting <= maximum:
                     raise PolicyError(f"Invalid {name}")
-            elif name in ('max_tokens', 'context_length', 'max_iterations'):
-                maximum = 256 if name == 'max_iterations' else 1048576
+            elif name in ('max_tokens', 'context_length', 'max_iterations', 'max_turns'):
+                maximum = 256 if name in ('max_iterations', 'max_turns') else 1048576
                 if isinstance(setting, bool) or not isinstance(setting, int) or not 1 <= setting <= maximum:
                     raise PolicyError(f"Invalid {name}")
                 if name == 'context_length' and setting < 64000:
@@ -59,6 +59,9 @@ def validate_template(value):
                 raise PolicyError("Invalid service tier")
             elif name == 'system_message' and (not isinstance(setting, str) or len(setting) > 16384):
                 raise PolicyError("System instructions are too long")
+    if ('max_iterations' in out['agent'] and 'max_turns' in out['agent'] and
+            out['agent']['max_iterations'] != out['agent']['max_turns']):
+        raise PolicyError('Specify one consistent Agent turn budget')
     soul = out.setdefault('soul', '')
     if not isinstance(soul, str) or len(soul.encode()) > 65536:
         raise PolicyError("SOUL must be at most 64 KiB")
@@ -98,9 +101,13 @@ def worker_config(template):
     if 'context_length' in parameters:
         model['context_length'] = parameters['context_length']
     agent = dict(document['agent'])
+    # Upstream WebUI reads agent.max_turns and passes it as the AIAgent
+    # constructor's max_iterations; these are different configuration names.
+    agent['max_turns'] = agent.pop('max_iterations', agent.get('max_turns', 90))
+    agent.pop('system_message', None)  # seeded through the upstream SOUL mechanism
     for key in ('max_tokens', 'reasoning_effort', 'service_tier'):
         if key in parameters:
             agent.setdefault(key, parameters[key])
     return {'model': model, 'agent': agent,
             'terminal': {'backend': 'local', 'cwd': '/workspace'},
-            'max_iterations': agent.get('max_iterations', 90)}
+            'max_turns': agent['max_turns']}
