@@ -18,3 +18,5 @@
 .mu-dialog{margin:auto;box-sizing:border-box}.mu-dialog-nav button{flex-shrink:0;white-space:nowrap}
 .mu-record small{display:block}.mu-record label{display:grid;gap:6px;margin:10px 0;font-size:12px}
 .mu-record input,.mu-record select{box-sizing:border-box;width:100%;padding:8px 10px;border:1px solid var(--border,#37374b);border-radius:7px;background:var(--input-bg,#1c1c30);color:inherit;font:inherit}
+.mu-waiting-page .mu-login-card{box-sizing:border-box;width:min(480px,calc(100vw - 40px))}.mu-waiting-page a{color:inherit;text-underline-offset:3px}
+.mu-waiting-page>.mu-account{position:fixed;bottom:0;left:0;right:0}.mu-waiting-page #mu-runtime-notice{display:none}

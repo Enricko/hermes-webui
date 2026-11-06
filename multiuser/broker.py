@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import logging
 import socket
+import sqlite3
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -114,6 +116,7 @@ class Brokers:
         self.limits = {}
         self.client = None
         self.task = None
+        self.retrying = set()
 
     async def start(self):
         self.client = aiohttp.ClientSession(trust_env=False, auto_decompress=False,
@@ -134,14 +137,31 @@ class Brokers:
 
     async def watch(self):
         while True:
-            for user in self.store.users():
+            try:
+                users = self.store.users()
+            except sqlite3.Error:
+                # A temporary control-db lock must not permanently stop account
+                # discovery. Existing sockets keep their own account authority.
+                await asyncio.sleep(0.5)
+                continue
+            for user in users:
                 uid = user['id']
-                directory = self.settings.runtime_dir(uid) / 'broker'
-                if uid in self.sites or not directory.is_dir():
-                    continue
-                if directory.is_symlink() or directory.stat().st_uid != self.settings.gateway_uid:
-                    continue
-                await self.bind(uid)
+                try:
+                    directory = self.settings.runtime_dir(uid) / 'broker'
+                    if uid in self.sites or not directory.is_dir():
+                        continue
+                    if directory.is_symlink() or directory.stat().st_uid != self.settings.gateway_uid:
+                        continue
+                    await self.bind(uid)
+                    self.retrying.discard(uid)
+                except (OSError, PolicyError) as exc:
+                    # The trusted provisioner creates/chowns directories in
+                    # separate steps. A newly published account can briefly
+                    # encounter EACCES/ENOENT; retry only that account instead of
+                    # losing the watcher for every future account.
+                    if uid not in self.retrying:
+                        logging.warning('Private account broker not ready (%s); retrying', type(exc).__name__)
+                    self.retrying.add(uid)
             await asyncio.sleep(0.5)
 
     async def bind(self, uid):
@@ -155,14 +175,27 @@ class Brokers:
             return await self.model(uid, request)
         app.router.add_route('*', '/{path:.*}', model)
         runner = web.AppRunner(app, access_log=None)
-        await runner.setup()
-        site = web.UnixSite(runner, str(path))
-        await site.start()
-        path.chmod(0o660)
-        async def tunnel(reader, writer):
-            await self.egress(uid, reader, writer)
-        server = await asyncio.start_unix_server(tunnel, str(egress_path), limit=16384)
-        egress_path.chmod(0o660)
+        server = None
+        created = []
+        try:
+            await runner.setup()
+            site = web.UnixSite(runner, str(path))
+            await site.start()
+            created.append(path)
+            path.chmod(0o660)
+            async def tunnel(reader, writer):
+                await self.egress(uid, reader, writer)
+            server = await asyncio.start_unix_server(tunnel, str(egress_path), limit=16384)
+            created.append(egress_path)
+            egress_path.chmod(0o660)
+        except BaseException:
+            if server:
+                server.close()
+                await server.wait_closed()
+            await runner.cleanup()
+            for target in created:
+                target.unlink(missing_ok=True)
+            raise
         self.sites[uid] = (runner, server)
         self.limits[uid] = asyncio.Semaphore(4)
 

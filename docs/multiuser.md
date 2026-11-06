@@ -132,6 +132,20 @@ passwords, assign the same template, and wait for their runtime state to become
 their own containers. Users cannot use admin APIs or global provider/secrets
 settings, regardless of visible controls.
 
+An assigned capability template automatically provisions the user's private
+workspace, file storage, conversation database and tools; these do not require
+separate feature assignments. On the first sign-in, a preparing page waits for
+the runtime and opens chat automatically. An unassigned account instead shows
+an explicit template-assignment message. Admin account management remains
+available while the admin's own runtime is preparing.
+
+Account discovery retries temporary permission/socket failures during trusted
+directory creation, without interrupting existing account brokers. `/health`
+reports `account_discovery: running`; if its discovery task stops it returns
+HTTP 503 instead of a misleading healthy result. Login password verification
+does not wait for container provisioning, and sign-in displays its current
+stage while preserving the browser-data cleanup between identities.
+
 CLI equivalents (all from the release directory):
 
 ```bash

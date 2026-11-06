@@ -256,6 +256,15 @@ class Gateway:
         session = self.principal(request)
         if session is None:
             raise web.HTTPFound('/login')
+        runtime = self.store.runtime(session.user_id)
+        if not runtime or runtime['state'] != 'ready':
+            # Do not boot upstream with a cascade of 503 settings/model/file
+            # requests: those initializers do not replay when provisioning ends.
+            html = (ASSETS / 'waiting.html').read_text()
+            controls = ('<script defer src="/multiuser/static/client.js"></script>'
+                        if request.path == '/multiuser/admin' and session.role == 'admin' else '')
+            html = html.replace('__ACCOUNT_CONTROLS__', controls)
+            return web.Response(text=html, content_type='text/html', headers={'Cache-Control': 'no-store'})
         html = (SOURCE / 'static/index.html').read_text()
         # Upstream assets/API helpers use relative URLs; deep account/session
         # routes must resolve them against the same trusted origin root.
@@ -288,7 +297,10 @@ class Gateway:
                               'display': 'standalone', 'icons': [{'src': '/static/favicon-32.png', 'sizes': '32x32', 'type': 'image/png'}]})
 
     async def health(self, _request):
-        return json_response({'status': 'ok', 'mode': 'multiuser'})
+        running = self.brokers.task is not None and not self.brokers.task.done()
+        return json_response({'status': 'ok' if running else 'degraded', 'mode': 'multiuser',
+                              'account_discovery': 'running' if running else 'stopped'},
+                             status=200 if running else 503)
 
     async def updates(self, request):
         self.require(request)

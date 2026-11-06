@@ -211,6 +211,38 @@ async def test_frontend_cannot_be_poisoned_by_runtime_or_untrusted_code(gateway)
             assert response.status == 401
 
 
+@pytest.mark.asyncio
+async def test_pending_runtime_does_not_boot_chat_until_ready(gateway):
+    _settings, store, server, login, users, received = gateway
+    alice, _ = await login('alice')
+    uid = users[1]['id']
+    store.set_runtime(uid, '', 'waiting_for_broker')
+    async with alice.get(server.make_url('/')) as response:
+        html = await response.text()
+        assert response.status == 200 and '/multiuser/static/waiting.js' in html
+        assert 'static/boot.js' not in html and '__ACCOUNT_CONTROLS__' not in html
+        assert '/multiuser/static/client.js' not in html
+    assert uid not in received  # no backend settings/files initialization
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        assert (await response.json())['runtime']['state'] == 'waiting_for_broker'
+    store.set_runtime(uid, 'ready-now', 'ready')
+    async with alice.get(server.make_url('/')) as response:
+        html = await response.text()
+        assert 'static/boot.js' in html and 'multiuser/static/client.js' in html
+
+
+@pytest.mark.asyncio
+async def test_unassigned_admin_keeps_account_management_available(gateway):
+    _settings, store, server, login, users, _received = gateway
+    admin, _ = await login('administrator')
+    store.set_runtime(users[0]['id'], '', 'unassigned')
+    async with admin.get(server.make_url('/multiuser/admin')) as response:
+        html = await response.text()
+        assert '/multiuser/static/client.js' in html and 'static/boot.js' not in html
+    async with admin.get(server.make_url('/multiuser/api/users')) as response:
+        assert response.status == 200
+
+
 def test_only_loopback_trials_can_use_insecure_cookies():
     # Root stays short enough for Unix sockets; origin policy is independent.
     settings = Settings(root=Path('/tmp/hmu-policy'), gateway_uid=os.getuid())

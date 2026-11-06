@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en" class="dark"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opening your workspace · Hermes</title>
+<link rel="icon" href="/static/favicon.svg"><link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/multiuser/static/style.css">
+<script defer src="/multiuser/static/waiting.js"></script>
+__ACCOUNT_CONTROLS__
+</head><body class="mu-login-page mu-waiting-page">
+<main class="mu-login-card">
+  <img src="/static/favicon.svg" width="44" height="44" alt="">
+  <p id="mu-waiting-identity"></p>
+  <h1 id="mu-waiting-title">Opening your workspace</h1>
+  <p id="mu-waiting-message" role="status" aria-live="polite">Checking your private runtime…</p>
+  <p id="mu-waiting-error" class="mu-error" role="alert" hidden></p>
+  <p><a id="mu-manage-accounts" href="/multiuser/admin" hidden>Manage accounts and templates</a></p>
+  <button id="mu-waiting-retry" class="settings-action-btn" type="button">Check again</button>
+  <button id="mu-waiting-logout" class="settings-action-btn" type="button" disabled>Sign out</button>
+</main></body></html>
