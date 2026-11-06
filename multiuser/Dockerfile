@@ -18,7 +18,7 @@ RUN git init /opt/hermes \
     && rm -rf /opt/hermes/.git
 # The compatible Agent requires Python 3.14; WebUI's host test runner stays on
 # its supported 3.11–3.13 interpreter. Install the Agent's pinned core deps.
-RUN pip install --no-cache-dir /opt/hermes 'pyyaml>=6' 'cryptography>=42'
+RUN pip install --no-cache-dir -e /opt/hermes 'pyyaml>=6' 'cryptography>=42'
 COPY . /opt/webui
 RUN printf "__version__ = '%s'\n" "${WEBUI_VERSION}" > /opt/webui/api/_version.py \
     && mkdir -p /state/hermes /workspace /shared/tools \
