@@ -281,6 +281,26 @@ sudo .venv/bin/python -m multiuser.manage --root /srv/hermes assign-provider \
   --user alice --provider PROVIDER_ID
 ```
 
+To expose all models from each account's assigned provider, set
+`"model_catalog": "provider"` in the existing capability document under
+**Templates**. The singular `model` remains the initial selection; it does not
+narrow provider discovery. The broker fetches that account's configured
+`/models` endpoint with its server-held credential. Both discovery and inference
+use the returned IDs. Accounts cannot choose a URL, borrow another provider's
+catalog or invoke an invented model. Catalogs are single-flight, cached for
+30 seconds, bounded to 2 MiB / 4096 entries, and keyed by account generation,
+provider identity, URL, credential fingerprint and policy. A late response after
+reassignment is rejected; failed discovery does not authorize arbitrary models.
+Provider availability and supported request types still determine which listed
+models can complete a chat request. The default `"model_catalog": "allowlist"`
+preserves restricted installations' existing explicit `models` policy.
+
+Profile statistics include local and configured external skill roots, resolved
+under the profile owner's environment with duplicate names counted once.
+External changes participate in the existing invalidation/mtime cache. Account
+profile cards identify the assigned provider and managed connection without
+copying its API key or inventing a local `.env` file.
+
 For rollback, older source can retain the additive database column. Restore an old
 control database only with services stopped and only when intentionally discarding
 later account-control changes. Restore profile capabilities from the private

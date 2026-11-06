@@ -53,6 +53,15 @@ async def run():
                     await page.screenshot(path=str(evidence / (label + '-upstream-chrome.png')))
                     await reference_style.evaluate('(node)=>node.remove()')
                     await page.screenshot(path=str(evidence / (label + '-chat.png')))
+                    if not await page.locator('.nav-tab[data-panel="profiles"]:visible').count():
+                        await page.locator('#btnHamburger').click()
+                    await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
+                    await page.locator('#profilesPanel .profile-card[data-name="default"]').click()
+                    await page.locator('#profileDetailBody').get_by_text('Configured by account administrator', exact=True).wait_for()
+                    assert '2 / 2' in await page.locator('#profileDetailBody').inner_text()
+                    await page.screenshot(path=str(evidence / (label + '-profile-shared-skills.png')))
+                    catalog = await page.evaluate('fetch("/api/models/live").then(response=>response.json())')
+                    assert {model['id'] for model in catalog['models']} >= {'fixture-model', 'fixture-extra'}
                     await page.goto(lab.origin + '/multiuser/admin')
                     dialog = page.locator('.mu-dialog')
                     await dialog.wait_for(state='visible')
@@ -190,6 +199,7 @@ async def run():
             'same_profile_user_switch_clears_private_browser_storage': True,
             'same_profile_user_switch_seconds': switch_seconds,
             'shared_base_profile_and_independent_account_provider_ui': True,
+            'profile_shared_skill_counts_and_complete_provider_catalog': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

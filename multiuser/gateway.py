@@ -431,7 +431,7 @@ class Gateway:
             async with session.request(request.method, 'http://127.0.0.1:8787' + request.rel_url.path_qs,
                                        headers=headers, data=payload,
                                        allow_redirects=False) as upstream:
-                if path == '/api/settings' and request.method == 'GET' and upstream.status == 200:
+                if path in ('/api/settings', '/api/profiles') and request.method == 'GET' and upstream.status == 200:
                     # Bundle identity and authentication belong to the trusted
                     # frontend/gateway. A private worker has different packaging
                     # metadata and intentionally has no browser-login cookie.
@@ -445,9 +445,20 @@ class Gateway:
                     value = json.loads(raw)
                     if not isinstance(value, dict):
                         raise web.HTTPBadGateway()
-                    value.update(runtime_webui_version=value.get('webui_version'), webui_version=self.version,
-                                 auth_enabled=True, password_auth_enabled=True,
-                                 passkeys_enabled=False, passwordless_enabled=False)
+                    if path == '/api/settings':
+                        value.update(runtime_webui_version=value.get('webui_version'), webui_version=self.version,
+                                     auth_enabled=True, password_auth_enabled=True,
+                                     passkeys_enabled=False, passwordless_enabled=False)
+                    else:
+                        user = self.store.user(uid)
+                        if user['template_id']:
+                            template = self.store.template(user['template_id'])
+                            selected = user['provider_id'] or template['document']['provider_id']
+                            provider = next((p for p in self.store.providers() if p['id'] == selected), None)
+                            for row in value.get('profiles', []):
+                                if row.get('is_default'):
+                                    row.update(provider_managed=True, provider_configured=bool(provider and provider['enabled']),
+                                        provider_label=provider['name'] if provider else 'Unavailable', account_runtime_state=runtime['state'])
                     return json_response(value)
                 out_headers = {key: value for key, value in upstream.headers.items() if key.lower() not in HOP_HEADERS}
                 out_headers['Cache-Control'] = 'no-store'

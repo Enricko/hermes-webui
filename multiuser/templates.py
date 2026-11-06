@@ -8,7 +8,7 @@ import re
 
 from multiuser.store import PolicyError, identifier
 
-FIELDS = {"provider_id", "model", "models", "parameters", "agent", "soul", "skills", "tools", "egress_hosts", "skill_bundle_id"}
+FIELDS = {"provider_id", "model", "models", "parameters", "agent", "soul", "skills", "tools", "egress_hosts", "skill_bundle_id", "model_catalog"}
 PARAMETERS = {"temperature", "top_p", "max_tokens", "reasoning_effort", "service_tier", "context_length"}
 AGENT_FIELDS = {"max_iterations", "max_turns", "max_tokens", "reasoning_effort", "system_message"}
 SECRET_WORDS = re.compile(r"(?:password|secret|token|credential|api_key|auth\.json|user\.md)", re.I)
@@ -34,6 +34,8 @@ def validate_template(value):
     identifier(out.get('provider_id'))
     if out.get('skill_bundle_id') is not None:
         identifier(out['skill_bundle_id'])
+    if out.setdefault('model_catalog', 'allowlist') not in ('allowlist', 'provider'):
+        raise PolicyError('Model catalog must be allowlist or provider')
     models = out.get('models', [out.get('model')])
     if not isinstance(models, list) or not 1 <= len(models) <= 64 or any(not isinstance(m, str) or not 1 <= len(m) <= 200 for m in models):
         raise PolicyError("Select 1–64 explicit models")

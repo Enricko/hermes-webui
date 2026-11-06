@@ -39,6 +39,13 @@ the immutable bundle is mounted read-only at `/shared/skills`. Hermes's official
 `skills.external_dirs` loads these alongside private learned skills. Capability
 reuse updates the existing template in place without importing private history.
 
+Model access may use an explicit allowlist (the compatibility default) or the
+live catalog of the account's assigned provider. In provider-catalog mode the
+same validated, bounded catalog authorizes inference and feeds discovery.
+Cache authority includes account generation, provider/credential identity and
+policy; a response fetched under an old assignment cannot authorize a new one.
+Provider failures fail closed without forwarding provider error text or keys.
+
 Authorities and lifecycle invariants:
 
 - The control database is authoritative for role, enablement, session expiry,

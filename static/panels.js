@@ -7392,7 +7392,7 @@ async function loadProfilesPanel() {
       card.dataset.name = p.name;
       const meta = [];
       if (typeof p.model === 'string' && p.model) meta.push(p.model.split('/').pop());
-      if (p.provider) meta.push(p.provider);
+      if (p.provider_label || p.provider) meta.push(p.provider_label || p.provider);
       if (p.total_skills && p.total_skills > 0) meta.push(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`));
       const gwDot = p.gateway_running
         ? `<span class="profile-opt-badge running" title="${esc(t('profile_gateway_running'))}"></span>`
@@ -7459,16 +7459,18 @@ function _renderProfileDetail(p, activeName){
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
   const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
-  const gwBadge = p.gateway_running
+  const gwBadge = p.provider_managed
+    ? `<span class="detail-badge${p.account_runtime_state === 'ready' ? ' ok' : ''}">${esc(p.account_runtime_state === 'ready' ? 'Workspace ready' : 'Workspace ' + p.account_runtime_state)}</span>`
+    : p.gateway_running
     ? `<span class="detail-badge ok">${esc(t('profile_gateway_running'))}</span>`
     : `<span class="detail-badge">${esc(t('profile_gateway_stopped'))}</span>`;
   const rows = [];
   rows.push(`<div class="detail-row"><div class="detail-row-label">Status</div><div class="detail-row-value">${statusBadge}${defaultBadge}</div></div>`);
-  rows.push(`<div class="detail-row"><div class="detail-row-label">Gateway</div><div class="detail-row-value">${gwBadge}</div></div>`);
+  rows.push(`<div class="detail-row"><div class="detail-row-label">${p.provider_managed ? 'Runtime' : 'Gateway'}</div><div class="detail-row-value">${gwBadge}</div></div>`);
   if (p.model) rows.push(`<div class="detail-row"><div class="detail-row-label">Model</div><div class="detail-row-value"><code>${esc(p.model)}</code></div></div>`);
-  if (p.provider) rows.push(`<div class="detail-row"><div class="detail-row-label">Provider</div><div class="detail-row-value">${esc(p.provider)}</div></div>`);
+  if (p.provider_label || p.provider) rows.push(`<div class="detail-row"><div class="detail-row-label">Provider</div><div class="detail-row-value">${esc(p.provider_label || p.provider)}</div></div>`);
   if (p.base_url) rows.push(`<div class="detail-row"><div class="detail-row-label">Base URL</div><div class="detail-row-value"><code>${esc(p.base_url)}</code></div></div>`);
-  rows.push(`<div class="detail-row"><div class="detail-row-label">API key</div><div class="detail-row-value">${p.has_env ? esc(t('profile_api_keys_configured')) : '<span style="color:var(--muted)">Not configured</span>'}</div></div>`);
+  rows.push(`<div class="detail-row"><div class="detail-row-label">${p.provider_managed ? 'Connection' : 'API key'}</div><div class="detail-row-value">${p.provider_managed ? (p.provider_configured ? 'Configured by account administrator' : 'Provider unavailable') : (p.has_env ? esc(t('profile_api_keys_configured')) : '<span style="color:var(--muted)">Not configured</span>')}</div></div>`);
   if (p.total_skills && p.total_skills > 0) rows.push(`<div class="detail-row"><div class="detail-row-label">Skills</div><div class="detail-row-value">${esc(t('profile_skill_count', p.total_skills).replace(String(p.total_skills), `${p.enabled_skills} / ${p.total_skills}`))}</div></div>`);
   if (p.default_workspace) rows.push(`<div class="detail-row"><div class="detail-row-label">Default space</div><div class="detail-row-value"><code>${esc(p.default_workspace)}</code></div></div>`);
   body.innerHTML = `

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import ipaddress
+import json
 import logging
 import socket
 import sqlite3
+import time
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -17,6 +20,25 @@ from multiuser.store import PolicyError
 
 MODEL_ROUTES = {'/v1/chat/completions', '/v1/responses', '/v1/messages', '/v1/embeddings'}
 MAX_MODEL_BODY = 16 * 1024 * 1024
+
+
+class CatalogUnavailable(Exception):
+    """The assigned provider did not supply a valid model catalog."""
+
+
+def catalog_models(value, secret=''):
+    if not isinstance(value, dict) or not isinstance(value.get('data'), list) or not 1 <= len(value['data']) <= 4096:
+        raise CatalogUnavailable()
+    models = {}
+    for entry in value['data']:
+        name = entry.get('id') if isinstance(entry, dict) else None
+        if (not isinstance(name, str) or not 1 <= len(name) <= 200 or
+                any(ord(char) < 32 or ord(char) == 127 for char in name) or (secret and secret in name)):
+            continue
+        models.setdefault(name, {'id': name, 'object': 'model', 'owned_by': 'assigned-provider'})
+    if not models:
+        raise CatalogUnavailable()
+    return list(models.values())
 
 
 def entitlement(store, uid):
@@ -117,6 +139,45 @@ class Brokers:
         self.client = None
         self.task = None
         self.retrying = set()
+        self.catalog_cache = {}
+        self.catalog_locks = {}
+
+    @staticmethod
+    def catalog_key(user, template, provider):
+        return (user['id'], user['auth_version'], provider['id'], provider['base_url'],
+                hashlib.sha256(provider['secret'].encode()).digest(),
+                template.get('model_catalog', 'allowlist'), tuple(template['models']))
+
+    async def models(self, uid, user, template, provider):
+        if template.get('model_catalog', 'allowlist') == 'allowlist':
+            return [{'id': name, 'object': 'model', 'owned_by': 'assigned-template'} for name in template['models']]
+        key = self.catalog_key(user, template, provider)
+        lock = self.catalog_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            cached = self.catalog_cache.get(uid)
+            if cached and cached[0] == key and cached[1] > time.monotonic():
+                return cached[2]
+            async with self.client.get(provider['base_url'] + '/models',
+                    headers={'Authorization': 'Bearer ' + provider['secret'], 'Accept': 'application/json'},
+                    allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10), auto_decompress=True) as response:
+                if response.status != 200:
+                    raise CatalogUnavailable()
+                raw = bytearray()
+                async for part in response.content.iter_chunked(65536):
+                    raw.extend(part)
+                    if len(raw) > 2 * 1024 * 1024:
+                        raise CatalogUnavailable()
+                try:
+                    models = catalog_models(json.loads(raw), provider['secret'])
+                except (ValueError, UnicodeDecodeError) as exc:
+                    raise CatalogUnavailable() from exc
+            # A late response from a former provider/account generation must
+            # never become another assignment's cached authority.
+            current = entitlement(self.store, uid)
+            if self.catalog_key(*current) != key:
+                raise PolicyError('Provider assignment changed during model discovery')
+            self.catalog_cache[uid] = (key, time.monotonic() + 30, models)
+            return models
 
     async def start(self):
         self.client = aiohttp.ClientSession(trust_env=False, auto_decompress=False,
@@ -204,11 +265,14 @@ class Brokers:
         try:
             _user, template, provider = entitlement(self.store, uid)
             if request.method == 'GET' and request.path == '/v1/models':
-                return web.json_response({'object': 'list', 'data': [
-                    {'id': model, 'object': 'model', 'owned_by': 'assigned-template'} for model in template['models']]})
+                if request.query_string:
+                    raise PolicyError('Provider catalog query is not available')
+                return web.json_response({'object': 'list', 'data': await self.models(uid, _user, template, provider)})
             if request.method != 'POST' or request.path not in MODEL_ROUTES or request.query_string:
                 raise PolicyError('Provider route is not available')
-            value = model_payload(await request.json(), template, uid, request.path)
+            models = await self.models(uid, _user, template, provider)
+            policy = {**template, 'models': [model['id'] for model in models]}
+            value = model_payload(await request.json(), policy, uid, request.path)
             suffix = request.path[len('/v1'):]
             endpoint = provider['base_url'] + suffix
             # No browser/worker cookies, authorization or identity headers pass.
@@ -249,7 +313,7 @@ class Brokers:
                     await response.write_eof()
                 return response
             return web.json_response({'error': {'message': 'Model request refused by account policy'}}, status=403)
-        except (aiohttp.ClientError, OSError, TimeoutError):
+        except (aiohttp.ClientError, OSError, TimeoutError, CatalogUnavailable):
             if response is not None and response.prepared:
                 with contextlib.suppress(ConnectionError):
                     await response.write_eof()

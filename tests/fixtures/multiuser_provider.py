@@ -69,5 +69,9 @@ class ModelFixture:
 
     def app(self):
         app = web.Application()
+        async def models(request):
+            assert request.headers.get('Authorization') == 'Bearer ' + self.expected_secret
+            return web.json_response({'data': [{'id': 'fixture-model'}, {'id': 'fixture-extra'}]})
+        app.router.add_get('/v1/models', models)
         app.router.add_post('/v1/chat/completions', self.completion)
         return app

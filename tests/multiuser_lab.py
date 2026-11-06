@@ -86,6 +86,7 @@ class Lab:
         assert status == 200
         self.tool = value['id']
         self.template_document = {'provider_id': self.provider, 'model': 'fixture-model', 'models': ['fixture-model'],
+            'model_catalog': 'provider',
             'parameters': {'context_length': 128000, 'max_tokens': 4096}, 'agent': {'max_iterations': 20},
             'soul': 'You are Hermes. Use the provided read-only shared tools before implementing a converter.',
             'tools': [self.tool], 'skills': {}, 'egress_hosts': []}

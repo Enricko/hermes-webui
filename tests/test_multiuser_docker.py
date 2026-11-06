@@ -47,7 +47,19 @@ async def test_distinct_credentials_roles_and_native_agent_chat(lab):
     events = await lab.events('alice', stream)
     assert any(event == 'token' and 'private Hermes runtime' in item.get('text', '') for event, item in events), events
     assert any(event == 'done' for event, _ in events)
+    status, profiles = await lab.api('alice', '/api/profiles')
+    assert status == 200
+    current = next(p for p in profiles['profiles'] if p['is_active'])
+    assert current['total_skills'] == 2 and current['provider_managed'] is True
+    status, catalog = await lab.api('alice', '/api/models/live')
+    assert status == 200 and {m['id'] for m in catalog['models']} >= {'fixture-model', 'fixture-extra'}
+    status, started = await lab.api('alice', '/api/chat/start', {'session_id': sid, 'message': 'Try another provider model',
+        'model': 'fixture-extra', 'model_provider': 'custom', 'profile': 'default', 'workspace': '/workspace'})
+    assert status == 200
+    assert any(event == 'done' for event, _ in await lab.events('alice', started['stream_id']))
+    assert lab.model.requests[-1]['model'] == 'fixture-extra'
     lab.results['local_auth_roles_and_real_agent_chat'] = True
+    lab.results['shared_profile_skill_count_and_nondefault_provider_model'] = True
 
 
 async def test_private_api_ids_profiles_files_download_and_archive_containment(lab):
