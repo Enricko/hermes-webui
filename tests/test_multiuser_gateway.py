@@ -212,4 +212,3 @@ def test_only_loopback_trials_can_use_insecure_cookies():
     for url in ['http://public.example', 'https://user:password@host.example', 'https://host.example/path']:
         with pytest.raises(PolicyError):
             replace(settings, public_url=url).validate()
-

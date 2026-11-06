@@ -20,7 +20,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc make libc6-
 
 FROM ${PYTHON_IMAGE} AS worker
 ARG AGENT_REV=278aeffe16945e7b1405e3c471ad08553c059237
-ARG WEBUI_VERSION=multiuser-dev
 RUN apt-get update && apt-get install -y --no-install-recommends git bash ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN git init /opt/hermes \
@@ -34,6 +33,7 @@ RUN git init /opt/hermes \
 RUN pip install --no-cache-dir -e /opt/hermes 'pyyaml>=6' 'cryptography>=42'
 COPY --from=sqlite-build /usr/local/lib/libsqlite3.so* /usr/local/lib/
 RUN ldconfig && python -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3,51,3); assert sqlite3.connect(":memory:").execute("PRAGMA secure_delete").fetchone()[0] == 1'
+ARG WEBUI_VERSION=multiuser-dev
 COPY . /opt/webui
 RUN printf "__version__ = '%s'\n" "${WEBUI_VERSION}" > /opt/webui/api/_version.py \
     && mkdir -p /state/hermes /workspace /shared/tools \
