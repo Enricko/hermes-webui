@@ -262,6 +262,9 @@ home and private backup. The existing single-user service can continue independe
 
 ## Verification
 
+See the [recorded baseline and acceptance results](multiuser-verification.md)
+for the tested image IDs, actual outcomes and validation limits.
+
 Run the normal repository gates plus the opt-in acceptance below:
 
 ```bash

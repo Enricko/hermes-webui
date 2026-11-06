@@ -98,9 +98,15 @@ async def test_actual_terminal_file_tools_cannot_reach_other_storage_or_host(lab
                 'import sys,json;paths=json.loads(sys.stdin.read());'
                 'print(json.dumps({"read":[read_file_tool(p) for p in paths],'
                 '"write":[write_file_tool(p,"probe") for p in paths],'
-                '"terminal":terminal_tool("cat "+paths[0],task_id="same-task")}))')
+                '"own_read":read_file_tool("/workspace/private.txt"),'
+                '"own_write":write_file_tool("/workspace/tool-owned.txt","owned-file-tool"),'
+                '"terminal":terminal_tool("printf owned-terminal-tool; cat "+paths[0],task_id="same-task")}))')
         result = await lab.execute('alice', code, stdin=json.dumps([str(host_canary), b_path]).encode())
         assert marker not in result
+        assert 'owned-terminal-tool' in result
+        own = await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/private.txt").read_text())')
+        assert own.strip() in result
+        assert 'owned-file-tool' in await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/tool-owned.txt").read_text())')
         assert host_canary.read_text() == marker
         assert 'probe' not in await lab.execute('bobby', 'from pathlib import Path;print(Path("/workspace/private.txt").read_text())')
         code = ('import os,json,socket,hashlib;'

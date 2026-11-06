@@ -77,13 +77,59 @@ async def run():
                     await page.get_by_role('button', name='Sign out', exact=True).click()
                     await page.wait_for_url(lambda url: urlsplit(str(url)).path == '/login')
                     await context.close()
+                # Exercise the unchanged composer/stream/upload flow as a regular
+                # user, with another account's real conversation already present.
+                bob_session = await lab.session('bobby')
+                stream = await lab.start_chat('bobby', bob_session, 'B private browser canary')
+                assert any(event == 'done' for event, _ in await lab.events('bobby', stream))
+                context = await browser.new_context(viewport={'width': 1440, 'height': 1000})
+                page = await context.new_page()
+                page.on('pageerror', lambda error: failures.append(str(error)))
+                page.on('response', lambda response: statuses.append((response.status, response.url)) if response.status >= 400 else None)
+                await page.goto(lab.origin + '/login')
+                await page.locator('#mu-username').fill('alice')
+                await page.locator('#mu-password').fill(lab.passwords['alice'])
+                await page.locator('#mu-sign-in').click()
+                await page.wait_for_url(lab.origin + '/')
+                await page.locator('#mu-account').wait_for(state='visible')
+                assert not await page.get_by_role('button', name='Accounts', exact=True).count()
+                await page.locator('#msg').fill('A private browser task')
+                await page.locator('#btnSend').click()
+                replies = page.locator('#messages').get_by_text('Hello from your private Hermes runtime.', exact=True)
+                await replies.first.wait_for(timeout=60000)
+                assert 'B private browser canary' not in await page.locator('body').inner_text()
+                for _ in range(100):
+                    if await page.evaluate('!S.busy && S.session && !S.session.active_stream_id'):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise AssertionError('The browser did not settle the owned streamed turn')
+                # Upstream stages composer attachments, then uploads on Send.
+                await page.locator('#fileInput').set_input_files({'name': 'ui-private.txt',
+                    'mimeType': 'text/plain', 'buffer': b'Private browser attachment'})
+                await page.get_by_text('ui-private.txt', exact=False).first.wait_for()
+                await page.locator('#msg').fill('Read my private attachment')
+                async with page.expect_response(lambda response: urlsplit(response.url).path == '/api/upload') as uploaded:
+                    await page.locator('#btnSend').click()
+                assert (await uploaded.value).status == 200
+                await replies.nth(1).wait_for(timeout=60000)
+                for _ in range(100):
+                    if await page.evaluate('!S.busy && S.session && !S.session.active_stream_id'):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    raise AssertionError('The attachment turn did not settle')
+                await page.screenshot(path=str(evidence / 'user-chat-upload.png'))
+                await context.close()
                 assert not failures, failures
                 assert not statuses, statuses
             finally:
                 await browser.close()
         lab.results['browser_desktop_narrow_mobile_login_admin_logout'] = True
+        lab.results['regular_user_browser_chat_stream_upload_and_private_history'] = True
         (evidence / 'browser-acceptance.json').write_text(json.dumps({'viewports': [1440, 760, 390],
             'uncaught_errors': failures, 'http_errors': statuses, 'result': 'pass',
+            'regular_user_chat_stream_and_attachment_reply': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

@@ -140,7 +140,12 @@ class Lab:
         return self.store.runtime(self.users[name]['id'])
 
     async def execute(self, name, code, *, stdin=b''):
-        process = await asyncio.create_subprocess_exec('docker', 'exec', '--interactive', self.runtime(name)['runtime_id'],
+        # docker exec does not inherit the entrypoint process's private runtime
+        # variables. Use the same home/config for real file/terminal tool probes.
+        process = await asyncio.create_subprocess_exec('docker', 'exec', '--interactive',
+            '--env', 'HOME=/state/hermes', '--env', 'HERMES_HOME=/state/hermes',
+            '--env', 'HERMES_BASE_HOME=/state/hermes', '--env', 'HERMES_CONFIG_PATH=/state/hermes/config.yaml',
+            '--env', 'TMPDIR=/tmp', self.runtime(name)['runtime_id'],
             'python', '-c', code, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await process.communicate(stdin)
