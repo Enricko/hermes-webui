@@ -84,3 +84,22 @@ def test_missing_policy_is_service_unavailable(policy, monkeypatch):
     handler = Handler()
     access_admin.handle_access_admin(handler, urlparse("/api/admin/access"))
     assert handler.status == 503
+
+
+def test_admin_imports_existing_profiles_from_server_not_request(policy, monkeypatch):
+    from api import profiles
+    login(monkeypatch)
+    monkeypatch.setattr(profiles,'list_profiles_api',lambda:[{'name':'default'},{'name':'stayfalz'}])
+    handler=Handler('POST')
+    access_admin.handle_access_admin(handler,urlparse('/api/admin/access'),{
+        'action':'import_profiles','profiles':['forged-profile']})
+    assert handler.status==200
+    response=json.loads(handler.wfile.getvalue())
+    assert [row['name'] for row in response['profiles']]==['default','stayfalz']
+
+
+def test_member_cannot_import_server_profiles(policy, monkeypatch):
+    login(monkeypatch,'alice')
+    handler=Handler('POST')
+    access_admin.handle_access_admin(handler,urlparse('/api/admin/access'),{'action':'import_profiles'})
+    assert handler.status==403

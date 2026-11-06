@@ -23,7 +23,8 @@ def test_admin_creates_account_and_private_workspace_without_exposing_password(a
                                         password='synthetic-alice-password', create=True, state_root=root, policy=policy)
     assert user_roles.authenticate('alice', 'synthetic-alice-password')
     record = json.loads(path.read_text())['users']['alice']
-    assert (root / result['id'] / 'workspace').is_dir()
+    assert (root / result['id'] / 'alice').is_dir()
+    assert result['workspace'] == '/alice'
     assert (root / result['id']).stat().st_mode & 0o077 == 0
     assert record['password'] != 'synthetic-alice-password'
     assert 'password' not in json.dumps(account_admin.public_accounts('admin-id'))

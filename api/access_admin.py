@@ -59,6 +59,10 @@ def handle_access_admin(handler, parsed, body=None):
         if not isinstance(body, dict):
             return bad(handler, "JSON object required", 400)
         action = body.get("action")
+        if action == 'import_profiles':
+            from api.profiles import list_profiles_api
+            names = [row['name'] for row in list_profiles_api() if isinstance(row,dict) and row.get('name')]
+            return j(handler, {'ok':True,'profiles':store.import_profiles(actor['id'],names)})
         if action == "account":
             # Account identity is resolved from the trusted local store. A body
             # cannot invent a login identity or a role different from that store.
@@ -68,6 +72,11 @@ def handle_access_admin(handler, parsed, body=None):
             store.put_account(actor["id"], account["id"], role=account["role"], enabled=body.get("enabled", True))
         elif action == "resource":
             credential = body.get("credential")
+            if body.get('kind') == 'tool':
+                from api.workspace_sandbox import validate_tool
+                if not isinstance(body.get('binding'),dict):
+                    raise ValueError('Tool binding is required')
+                validate_tool(body['binding'].get('executable'))
             if credential:
                 from api.provider_broker import CredentialVault
                 if body.get("kind") != "connection":

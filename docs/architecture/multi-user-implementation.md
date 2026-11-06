@@ -15,6 +15,12 @@ private member Agent runtimes and subscription/OAuth brokerage are not complete.
 Only administrator operation through the original backend is currently usable;
 restricted member execution remains denied rather than claiming isolation.
 
+Private workspace names follow the login username, independently of selected
+Hermes profiles. Existing Hermes profiles can now be imported as selectable
+templates; installed tool grants and a separately verified Linux containment
+primitive are implemented. See [username workspace boundaries](username-workspaces.md)
+for actual guarantees and the remaining worker integration.
+
 ## Implemented foundation
 
 - Account mode stays enabled when its store is empty, corrupt, inaccessible or

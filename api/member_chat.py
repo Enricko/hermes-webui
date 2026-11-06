@@ -49,6 +49,7 @@ class MemberChat:
     def _context(raw):
         fields = json.loads(raw)
         fields["skills"] = tuple(fields["skills"])
+        fields["tools"] = tuple(fields.get("tools", ()))
         return AccessContext(**fields)
 
     def _conversation(self, db, account_id, conversation_id):

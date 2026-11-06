@@ -25,7 +25,7 @@ class PolicyUnavailable(RuntimeError):
 
 
 _ID = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
-_KINDS = {"profile", "workspace", "connection", "skill"}
+_KINDS = {"profile", "workspace", "connection", "skill", "tool"}
 
 
 def _id(value: str) -> str:
@@ -42,6 +42,7 @@ class AccessContext:
     connection_id: str
     model: str
     skills: tuple[str, ...] = ()
+    tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,12 @@ class PolicyStore:
     def _bump(db):
         db.execute("UPDATE metadata SET revision=revision+1 WHERE singleton=1")
 
+    @staticmethod
+    def _private_workspace_ids(db):
+        return [row['id'] for row in db.execute("SELECT id,binding FROM resources WHERE kind='workspace'")
+                if (binding := json.loads(row['binding'])).get('scope') == 'login-username'
+                and binding.get('available') is not False]
+
     def put_account(self, actor: str, account_id: str, *, role="user", enabled=True):
         if role not in {"admin", "user"} or not isinstance(enabled, bool):
             raise ValueError("Invalid account role or status")
@@ -134,6 +141,9 @@ class PolicyStore:
                        "role=excluded.role, enabled=excluded.enabled", (_id(account_id), role, int(enabled)))
             if not db.execute("SELECT 1 FROM accounts WHERE role='admin' AND enabled=1").fetchone():
                 raise AccessDenied("Cannot remove the last enabled administrator")
+            if enabled:
+                for workspace in self._private_workspace_ids(db):
+                    db.execute("INSERT OR IGNORE INTO grants VALUES (?,?,'[]')",(account_id,workspace))
             self._bump(db)
 
     def put_resource(self, actor: str, resource_id: str, *, kind: str, label: str, binding: dict):
@@ -175,11 +185,16 @@ class PolicyStore:
         with self._transaction(write=True) as db:
             self._account(db, actor, admin=True)
             self._account(db, account_id)
+            grants = dict(grants)
+            for workspace in self._private_workspace_ids(db):
+                grants[workspace] = []
             db.execute("DELETE FROM grants WHERE account_id=?", (account_id,))
             for resource_id, models in grants.items():
-                resource = db.execute("SELECT kind FROM resources WHERE id=?", (_id(resource_id),)).fetchone()
+                resource = db.execute("SELECT kind,binding FROM resources WHERE id=?", (_id(resource_id),)).fetchone()
                 if resource is None:
                     raise AccessDenied("Unknown resource")
+                if json.loads(resource['binding']).get('available') is False:
+                    raise AccessDenied("Resource is no longer available")
                 if not isinstance(models, list) or any(not isinstance(m, str) or not m.strip() for m in models):
                     raise ValueError("Models must be explicit nonempty strings")
                 if resource[0] == "connection" and not models:
@@ -197,13 +212,15 @@ class PolicyStore:
         self._account(db, context.account_id)
         generation = None
         selections = [("profile", context.profile_id), ("workspace", context.workspace_id),
-                      ("connection", context.connection_id)] + [("skill", s) for s in context.skills]
+                      ("connection", context.connection_id)] + [("skill", s) for s in context.skills] + [("tool", t) for t in context.tools]
         for kind, resource_id in selections:
-            row = db.execute("SELECT r.kind,r.generation,g.models FROM resources r JOIN grants g "
+            row = db.execute("SELECT r.kind,r.generation,r.binding,g.models FROM resources r JOIN grants g "
                              "ON r.id=g.resource_id WHERE g.account_id=? AND r.id=?",
                              (context.account_id, _id(resource_id))).fetchone()
             if row is None or row["kind"] != kind:
                 raise AccessDenied("Selection is not granted to this account")
+            if json.loads(row['binding']).get('available') is False:
+                raise AccessDenied("Resource is no longer available")
             if kind == "connection":
                 if context.model not in json.loads(row["models"]):
                     raise AccessDenied("Model is not granted on this connection")
@@ -267,6 +284,41 @@ class PolicyStore:
         """Trusted call-site data only; never serialize these bindings to a member."""
         with self._transaction() as db:
             admission = self._authorize(db, context)
-            ids = (context.profile_id, context.workspace_id, context.connection_id, *context.skills)
+            ids = (context.profile_id, context.workspace_id, context.connection_id, *context.skills, *context.tools)
             return admission, {resource_id: json.loads(db.execute(
                 "SELECT binding FROM resources WHERE id=?", (resource_id,)).fetchone()[0]) for resource_id in ids}
+
+    def import_profiles(self, actor: str, names: list[str]) -> list[dict]:
+        """Register real Hermes templates with persistent IDs and no credentials.
+
+        Import never clones homes or grants access. Removed templates become
+        unavailable while their instance/ownership records remain intact.
+        """
+        from api.user_roles import _PROFILE_RE
+        if not isinstance(names, list) or any(not isinstance(name, str) or not _PROFILE_RE.fullmatch(name) for name in names):
+            raise ValueError('Invalid Hermes profile names')
+        with self._transaction(write=True) as db:
+            self._account(db, actor, admin=True)
+            known = {}
+            for row in db.execute("SELECT * FROM resources WHERE kind='profile'"):
+                binding = json.loads(row['binding'])
+                if binding.get('source') == 'hermes-profile':
+                    known[binding['profile_name']] = row
+            changed = False
+            result = []
+            for name in sorted(set(names) | set(known)):
+                available = name in names
+                old = known.get(name)
+                binding = json.dumps({'source':'hermes-profile','profile_name':name,'available':available},sort_keys=True,separators=(',',':'))
+                identifier = old['id'] if old else 'profile-' + secrets.token_hex(16)
+                if old is None:
+                    db.execute("INSERT INTO resources VALUES (?,?,?,?,1)",(identifier,'profile',name,binding))
+                    changed = True
+                elif old['binding'] != binding:
+                    db.execute("UPDATE resources SET binding=?,generation=generation+1 WHERE id=?",(binding,identifier))
+                    changed = True
+                if available:
+                    result.append({'id':identifier,'name':name})
+            if changed:
+                self._bump(db)
+            return result

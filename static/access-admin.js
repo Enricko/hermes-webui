@@ -18,6 +18,11 @@ function initializeAccessControls(host, options = {}) {
     $('resource-url').value = binding.base_url || ''; $('resource-account').value = binding.account_id || '';
     $('resource-protocol').value = binding.protocol || 'openai'; $('resource-credential').value = '';
     $('workspace-note').hidden = kind !== 'workspace';
+    if ($('tool-settings')) {
+      $('tool-settings').hidden = kind !== 'tool';
+      $('resource-executable').value = binding.executable || '';
+      $('resource-executable').required = kind === 'tool';
+    }
   }
   async function request(path, body) {
     const response = await fetch(new URL(path, root), { credentials: 'same-origin', cache: 'no-store',
@@ -45,6 +50,7 @@ function initializeAccessControls(host, options = {}) {
     $('password').required = !user;
     $('save-account').textContent = user ? 'Save account' : 'Create account';
     $('grant-panel').hidden = !user || !user.enabled;
+    if ($('private-workspace')) $('private-workspace').textContent = user ? (user.workspace || '/' + user.username) : 'Created automatically from the login username';
     renderGrants();
     host.querySelectorAll('.account').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.username === user?.username)));
   }
@@ -52,12 +58,17 @@ function initializeAccessControls(host, options = {}) {
     $('grants').replaceChildren();
     if (!data || !selected) return;
     const grants = new Map(data.policy.grants.filter(grant => grant.account_id === selected.id).map(grant => [grant.resource_id, JSON.parse(grant.models)]));
-    for (const kind of ['profile', 'workspace', 'connection', 'skill']) {
-      const group = node('fieldset'); group.append(node('legend', {profile:'Profiles',workspace:'Private workspaces',connection:'Provider connections & models',skill:'Skills'}[kind]));
+    for (const kind of ['profile', 'workspace', 'connection', 'skill', 'tool']) {
+      const group = node('fieldset'); group.append(node('legend', {profile:'Profiles',workspace:'Private workspace',connection:'Provider connections & models',skill:'Skills',tool:'Approved installed tools (read only)'}[kind]));
       for (const resource of data.policy.resources.filter(resource => resource.kind === kind)) {
+        const binding = JSON.parse(resource.binding);
+        if (binding.available === false && !grants.has(resource.id)) continue;
         const label = node('label'); label.className = 'check';
         const check = node('input'); check.type = 'checkbox'; check.dataset.resourceId = resource.id; check.checked = grants.has(resource.id);
-        label.append(check, node('span', resource.label)); group.append(label);
+        const title = kind === 'workspace' ? '/' + selected.username : resource.label;
+        label.append(check, node('span', title + (binding.available === false ? ' (unavailable)' : ''))); group.append(label);
+        if (kind === 'workspace' && binding.scope === 'login-username') {check.checked=true;check.disabled=true;}
+        if (binding.available === false) {check.checked=false;check.disabled=true;}
         if (kind === 'connection') {
           const models = node('label', 'Allowed models (one per line)'); models.className = 'model-label';
           const input = node('textarea'); input.rows = 3; input.dataset.modelsFor = resource.id; input.value = (grants.get(resource.id) || []).join('\n');
@@ -77,6 +88,12 @@ function initializeAccessControls(host, options = {}) {
     }
     $('resources').replaceChildren();
     for (const resource of data.policy.resources) {
+      const binding = JSON.parse(resource.binding);
+      if (binding.available === false) continue;
+      if (resource.kind === 'profile' || (resource.kind === 'workspace' && binding.scope === 'login-username')) {
+        $('resources').append(node('p', resource.label + (resource.kind === 'profile' ? ' · managed in Profiles' : ' · automatic private folder')));
+        continue;
+      }
       const button = node('button', `${resource.label} · ${resource.kind} · ${resource.id}`); button.type = 'button';
       button.addEventListener('click', () => {
         $('resource-id').value = resource.id; $('resource-kind').value = resource.kind; $('resource-label').value = resource.label;
@@ -110,7 +127,8 @@ function initializeAccessControls(host, options = {}) {
     event.preventDefault(); mutate(async () => {
       const kind = $('resource-kind').value;
       const binding = kind === 'profile' ? {system_prompt:$('resource-content').value} : kind === 'skill' ? {content:$('resource-content').value}
-        : kind === 'connection' ? {protocol:$('resource-protocol').value,base_url:$('resource-url').value.trim(),account_id:$('resource-account').value.trim()} : {};
+        : kind === 'connection' ? {protocol:$('resource-protocol').value,base_url:$('resource-url').value.trim(),account_id:$('resource-account').value.trim()}
+        : kind === 'tool' ? {executable:$('resource-executable').value.trim()} : {scope:'login-username'};
       await request('api/admin/access', { action: 'resource', id: $('resource-id').value.trim(), kind: $('resource-kind').value,
         label: $('resource-label').value.trim(), binding, ...($('resource-credential').value ? {credential:$('resource-credential').value} : {}) });
       $('resource-credential').value = '';
@@ -123,6 +141,10 @@ function initializeAccessControls(host, options = {}) {
   });
   const reload = $('reload');
   if (reload) reload.addEventListener('click', () => { if (!busy) load().catch(error => notice(error.message, true)); });
+  if ($('import-profiles')) $('import-profiles').addEventListener('click', () => mutate(async () => {
+    await request('api/admin/access',{action:'import_profiles'}); await load(); notice('Existing Hermes profiles refreshed. Choose which profiles to assign.');
+  }));
+  resourceFields($('resource-kind').value);
   load().catch(error => notice(error.message, true));
 }
 window.initializeAccessControls = initializeAccessControls;

@@ -17,6 +17,10 @@ contributor guidance; it does not change runtime behavior or CI gates.
   Control Center. The separate tool-free experiment is not the default product.
   Member Agent execution stays denied until isolated workers and subscription/
   OAuth brokerage meet the approved full multi-user design gates.
+- [`docs/architecture/username-workspaces.md`](architecture/username-workspaces.md):
+  login-based private folder aliases, real Hermes profile imports and approved
+  read-only tools. Distinguishes the tested Linux launch primitive from the
+  unfinished full Agent worker bridge.
 
 - [`AGENTS.md`](../AGENTS.md): repository entry point for AI assistants,
   public-safety rules, and the short redline checklist.

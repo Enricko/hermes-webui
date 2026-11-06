@@ -213,6 +213,17 @@ def test_original_hermes_shell_and_embedded_account_controls(browser, deployment
     page.locator('#userAccess-password').fill('synthetic-native-password')
     page.locator('#userAccess-save-account').click()
     page.get_by_text('Account saved.',exact=True).wait_for()
+    assert page.locator('#userAccess-private-workspace').inner_text()=='/native-user'
+    page.locator('#userAccess-import-profiles').click()
+    page.get_by_text('Existing Hermes profiles refreshed. Choose which profiles to assign.',exact=True).wait_for()
+    assert page.locator('#userAccess-grants').get_by_text('default',exact=True).count()==1
+    page.locator('#userAccess-resource-id').fill('true-tool')
+    page.locator('#userAccess-resource-kind').select_option('tool')
+    page.locator('#userAccess-resource-label').fill('Approved true executable')
+    page.locator('#userAccess-resource-executable').fill('/usr/bin/true')
+    page.locator('#userAccess-resource-form button').click()
+    page.get_by_text('Resource saved.',exact=True).wait_for()
+    assert page.locator('#userAccess-grants').get_by_text('Approved true executable',exact=True).count()==1
     shot(page,'original-hermes-users-desktop',tmp_path,check_overflow=False)
     page.set_viewport_size({'width':390,'height':844})
     page.evaluate("()=>{if(typeof closeMobileSidebar==='function')closeMobileSidebar();}")

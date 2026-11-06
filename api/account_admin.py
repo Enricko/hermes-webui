@@ -71,13 +71,20 @@ def _admin(users, actor_id):
     raise AccessDenied("Active administrator required")
 
 
+def workspace_alias(username: str) -> str:
+    normalized = user_roles.normalize_username(username)
+    if not user_roles._USERNAME_RE.fullmatch(normalized):
+        raise ValueError('Invalid login username')
+    return '/' + normalized
+
+
 def public_accounts(actor_id: str) -> list[dict]:
     # Read under the same inter-process lock as edits. The transaction does not
     # expose raw records, password hashes, trusted paths or credentials.
     with account_transaction(write=False) as data:
         _admin(data["users"], actor_id)
         return [{"username": name, "id": record.get("id"), "role": record.get("role"),
-                 "enabled": not record.get("disabled", False)}
+                 "enabled": not record.get("disabled", False), "workspace":workspace_alias(name)}
                 for name, record in sorted(data["users"].items())]
 
 
@@ -102,14 +109,14 @@ def edit_account(actor_id: str, *, username: str, role: str, enabled: bool,
         record.setdefault("id", secrets.token_hex(16))
         if not previous or (role == "user" and (not record.get("profile") or not record.get("workspaces"))):
             if state_root is None:
-                from api.config import STATE_DIR
-                state_root = Path(STATE_DIR) / "accounts"
+                state_root = user_roles.users_file().parent / 'accounts'
             root = Path(state_root) / record["id"]
             root.mkdir(parents=True, mode=0o700, exist_ok=bool(previous))
-            workspace = root / "workspace"
+            workspace = root / username
             workspace.mkdir(mode=0o700, exist_ok=bool(previous))
             record.update(profile="u-" + record["id"], workspaces=[str(workspace.absolute())])
         record.update(role=role, disabled=not enabled)
+        record['workspace_alias'] = workspace_alias(username)
         if password is not None:
             record["password"] = user_roles.hash_password(password)
         if previous and any(record.get(k) != previous.get(k) for k in ("role", "disabled", "password")):
@@ -122,4 +129,5 @@ def edit_account(actor_id: str, *, username: str, role: str, enabled: bool,
             # atomic JSON write fails after SQLite commits, the two stores
             # must both authorize subsequent access: inconsistency denies it.
             policy.put_account(actor_id, record["id"], role=role, enabled=enabled)
-        return {"id": record["id"], "username": username, "role": role, "enabled": enabled}
+        return {"id": record["id"], "username": username, "role": role, "enabled": enabled,
+                "workspace":workspace_alias(username)}
