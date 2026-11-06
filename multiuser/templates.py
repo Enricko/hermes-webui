@@ -51,6 +51,8 @@ def validate_template(value):
                 maximum = 256 if name == 'max_iterations' else 1048576
                 if isinstance(setting, bool) or not isinstance(setting, int) or not 1 <= setting <= maximum:
                     raise PolicyError(f"Invalid {name}")
+                if name == 'context_length' and setting < 64000:
+                    raise PolicyError('The pinned Hermes Agent requires at least 64,000 context tokens')
             elif name == 'reasoning_effort' and setting not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
                 raise PolicyError("Invalid reasoning effort")
             elif name == 'service_tier' and setting not in ('auto', 'default', 'flex', 'priority'):
@@ -101,5 +103,4 @@ def worker_config(template):
             agent.setdefault(key, parameters[key])
     return {'model': model, 'agent': agent,
             'terminal': {'backend': 'local', 'cwd': '/workspace'},
-            'toolsets': ['terminal', 'file', 'memory', 'skills', 'todo', 'web', 'browser'],
             'max_iterations': agent.get('max_iterations', 90)}
