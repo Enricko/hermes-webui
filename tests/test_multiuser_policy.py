@@ -133,3 +133,22 @@ def test_migration_snapshots_privately_but_imports_only_selected_capabilities(tm
     assert 'private' not in repr(document)
     assert report['personal_state_imported'] is False
     assert (source / 'state.db').read_text() == 'legacy-private-canary-state.db'
+
+
+def test_persisted_capabilities_are_revalidated_before_trusted_filesystem_use(tmp_path):
+    import json
+    from multiuser.store import Store
+    store = Store(tmp_path / 'control/accounts.sqlite')
+    store.initialize()
+    tid = store.put_tool('Reviewed tool', 'Use this script', 'safe.py', 'print("safe")')
+    with store.connection(write=True) as db:
+        db.execute('UPDATE tools SET filename=? WHERE id=?', ('../../root-target', tid))
+    with pytest.raises(PolicyError):
+        store.tool(tid)
+    provider = store.put_provider('Explicit endpoint', 'http://127.0.0.1:9/v1', '')
+    template = store.put_template('Base', {'provider_id': provider, 'model': 'approved'})
+    with store.connection(write=True) as db:
+        db.execute('UPDATE templates SET document=? WHERE id=?', (json.dumps({
+            'provider_id': provider, 'model': 'approved', 'skills': {'../../escape': 'bad'}}), template))
+    with pytest.raises(PolicyError):
+        store.template(template)

@@ -351,12 +351,13 @@ class Store:
             return [{**dict(r), "document": json.loads(r["document"])} for r in db.execute("SELECT * FROM templates ORDER BY name")]
 
     def template(self, tid):
+        from multiuser.templates import validate_template
         identifier(tid)
         with self.connection() as db:
             row = db.execute("SELECT * FROM templates WHERE id=? AND enabled=1", (tid,)).fetchone()
         if row is None:
             raise PolicyError("Template is unavailable")
-        return {**dict(row), "document": json.loads(row["document"])}
+        return {**dict(row), "document": validate_template(json.loads(row["document"]))}
 
     def put_tool(self, name, description, filename, content, *, tool_id=None, enabled=True):
         if not isinstance(name, str) or not 1 <= len(name) <= 80 or not TOOL_NAME.fullmatch(filename):
@@ -384,6 +385,12 @@ class Store:
             row = db.execute("SELECT * FROM tools WHERE id=? AND enabled=1", (tid,)).fetchone()
         if row is None:
             raise PolicyError("Tool is unavailable")
+        # Revalidate at the trusted filesystem boundary, even for persisted
+        # records. The gateway cannot turn database edits into root paths.
+        if (not isinstance(row['filename'], str) or not TOOL_NAME.fullmatch(row['filename']) or
+                not isinstance(row['version'], int) or row['version'] < 1 or
+                not isinstance(row['content'], str) or not 1 <= len(row['content'].encode()) <= 1024 * 1024):
+            raise PolicyError('Published tool record violates filesystem policy')
         return dict(row)
 
     def set_runtime(self, uid, generation, state, runtime_id=None, relay_id=None, error=""):
