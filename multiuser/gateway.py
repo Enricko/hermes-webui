@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+from functools import lru_cache
+import gzip
 import hashlib
 import http.cookies
 import json
@@ -14,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import time
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -44,6 +47,32 @@ def json_response(value, *, status=200):
     return web.json_response(value, status=status, headers={'Cache-Control': 'no-store'})
 
 
+@lru_cache(maxsize=64)
+def static_snapshot(path, _size, _mtime_ns):
+    """Cache only trusted source assets; never account or worker responses."""
+    raw = path.read_bytes()
+    packed = None
+    if len(raw) >= 1024 and path.suffix in ('.js', '.css', '.html', '.json', '.svg', '.txt', '.wasm'):
+        candidate = gzip.compress(raw, compresslevel=9, mtime=0)
+        if len(candidate) < len(raw):
+            packed = candidate
+    return raw, packed
+
+
+def accepts_gzip(value):
+    for coding in value.lower().split(','):
+        parts = [part.strip() for part in coding.split(';')]
+        if parts[0] != 'gzip':
+            continue
+        quality = next((part[2:] for part in parts[1:] if part.startswith('q=')), '1')
+        try:
+            if 0 < float(quality) <= 1:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 async def object_body(request, allowed):
     if request.content_length is not None and request.content_length > 2 * 1024 * 1024:
         raise web.HTTPRequestEntityTooLarge(max_size=2 * 1024 * 1024, actual_size=request.content_length)
@@ -66,11 +95,14 @@ class Gateway:
         self.brokers = Brokers(settings)
         self.sessions = {}
         self.auth_slots = asyncio.Semaphore(4)
+        self.asset_signatures = {}
         digest = hashlib.sha256()
         for root in (SOURCE / 'static', ASSETS):
             for path in sorted(root.rglob('*')):
                 if path.is_file() and path.suffix in ('.html', '.js', '.css'):
                     digest.update(path.read_bytes())
+                    info = path.stat()
+                    self.asset_signatures[path] = (info.st_size, info.st_mtime_ns)
         self.version = 'mu-' + digest.hexdigest()[:16]
 
     def principal(self, request):
@@ -158,6 +190,7 @@ class Gateway:
                             headers={'Cache-Control': 'no-store'})
 
     async def login(self, request):
+        started = time.monotonic()
         body = await object_body(request, {'username', 'password'})
         if self.auth_slots.locked():
             raise RateLimited('Authentication is busy')
@@ -172,7 +205,12 @@ class Gateway:
         if self.cookie_name != COOKIE:
             response.del_cookie(COOKIE, path='/')
         response.del_cookie('hermes_profile', path='/')
-        response.headers['Clear-Site-Data'] = '"cache", "storage"'
+        # Every private response is no-store. Only trusted static assets can be
+        # in the HTTP cache; preserve them on sign-in rather than making Chrome
+        # scan its network cache before delivering the authentication response.
+        # DOM storage, IndexedDB, CacheStorage and service workers still clear.
+        response.headers['Clear-Site-Data'] = '"storage"'
+        response.headers['Server-Timing'] = f'auth;dur={(time.monotonic() - started) * 1000:.1f}'
         return response
 
     async def logout(self, request):
@@ -283,8 +321,25 @@ class Gateway:
         path = root / relative
         if path.is_symlink() or not path.resolve().is_relative_to(root) or not path.is_file():
             raise web.HTTPNotFound()
-        return web.Response(body=path.read_bytes(), content_type=mimetypes.guess_type(path)[0] or 'application/octet-stream',
-                            headers={'Cache-Control': 'no-cache'})
+        info = path.stat()
+        signature = (info.st_size, info.st_mtime_ns)
+        raw, packed = static_snapshot(path, *signature)
+        compressed = packed is not None and accepts_gzip(request.headers.get('Accept-Encoding', ''))
+        body = packed if compressed else raw
+        etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+        fingerprint = request.query.getall('v', [])
+        immutable = (fingerprint == [self.version] and self.asset_signatures.get(path) == signature)
+        headers = {'Cache-Control': 'public, max-age=31536000, immutable' if immutable else 'no-cache',
+                   'ETag': etag}
+        if packed is not None:
+            headers['Vary'] = 'Accept-Encoding'
+        candidates = [part.strip().removeprefix('W/') for part in request.headers.get('If-None-Match', '').split(',')]
+        if etag in candidates or '*' in candidates:
+            return web.Response(status=304, headers=headers)
+        if compressed:
+            headers['Content-Encoding'] = 'gzip'
+        return web.Response(body=body, content_type=mimetypes.guess_type(path)[0] or 'application/octet-stream',
+                            headers=headers)
 
     async def service_worker(self, _request):
         # A trusted no-fetch worker clears legacy single-user caches and removes

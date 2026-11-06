@@ -146,6 +146,15 @@ HTTP 503 instead of a misleading healthy result. Login password verification
 does not wait for container provisioning, and sign-in displays its current
 stage while preserving the browser-data cleanup between identities.
 
+Sign-in clears DOM storage, IndexedDB, CacheStorage and service-worker state.
+It preserves the HTTP cache of trusted public assets: the browser specification
+notes that an [origin-wide network-cache scan can be expensive](https://w3c.github.io/webappsec-clear-site-data/#cache).
+Private API responses, files, settings and rendered account pages always use
+`Cache-Control: no-store`, including when a worker tries to enable caching.
+Logout retains the full cache/storage reset. Trusted source assets support gzip
+and ETag validation; immutable caching is used only for the running asset version
+and an unchanged source-file signature. No private worker data enters that cache.
+
 CLI equivalents (all from the release directory):
 
 ```bash

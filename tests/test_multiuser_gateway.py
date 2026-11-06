@@ -58,7 +58,8 @@ async def gateway(unused_tcp_port):
                 assert request.content_length is not None
                 assert request.headers.get('Transfer-Encoding') is None
                 return web.json_response({'owner': owner, 'body': await request.json()})
-            return web.json_response({'owner': owner, 'sessions': [{'id': 'private-' + owner}]})
+            return web.json_response({'owner': owner, 'sessions': [{'id': 'private-' + owner}]},
+                                     headers={'Cache-Control': 'public, max-age=31536000'})
         backend.router.add_route('*', '/{path:.*}', handler)
         runner = web.AppRunner(backend, access_log=None)
         await runner.setup()
@@ -78,6 +79,7 @@ async def gateway(unused_tcp_port):
             value = await response.json()
             cookie = response.headers['Set-Cookie']
             assert 'HttpOnly' in cookie and 'SameSite=Strict' in cookie
+            received.setdefault('_login_headers', {})[name] = dict(response.headers)
         client.headers['X-Hermes-CSRF-Token'] = value['user']['csrf_token']
         return client, value['user']['csrf_token']
     yield settings, store, server, login, (admin, alice, bob), received
@@ -258,6 +260,44 @@ async def test_health_reports_stopped_account_discovery(gateway):
         async with client.get(server.make_url('/health')) as response:
             assert response.status == 503
             assert (await response.json())['account_discovery'] == 'stopped'
+
+
+@pytest.mark.asyncio
+async def test_private_worker_data_is_never_http_cached_even_if_worker_requests_it(gateway):
+    settings, _store, server, login, users, received = gateway
+    alice, csrf = await login('alice')
+    assert received['_login_headers']['alice']['Clear-Site-Data'] == '"storage"'
+    for path in ['/api/sessions', '/api/file/raw?path=private.txt', '/api/settings']:
+        async with alice.get(server.make_url(path)) as response:
+            assert response.status == 200
+            assert response.headers['Cache-Control'] == 'no-store'
+            assert (await response.json())['owner'] == users[1]['id']
+    async with alice.post(server.make_url('/api/auth/logout'), json={}, headers={'Origin': settings.origin,
+                          'X-Hermes-CSRF-Token': csrf}) as response:
+        assert response.status == 200
+        assert response.headers['Clear-Site-Data'] == '"cache", "storage"'
+
+
+@pytest.mark.asyncio
+async def test_trusted_assets_support_compression_validation_and_version_caching(gateway):
+    _settings, _store, server, login, _users, _received = gateway
+    alice, _ = await login('alice')
+    async with alice.get(server.make_url('/static/ui.js'), headers={'Accept-Encoding': 'gzip'}) as response:
+        raw = await response.read()
+        assert response.status == 200 and response.headers.get('Content-Encoding') == 'gzip'
+        assert int(response.headers['Content-Length']) < len(raw)
+        assert response.headers['Vary'] == 'Accept-Encoding'
+        etag = response.headers['ETag']
+    async with alice.get(server.make_url('/static/ui.js'), headers={
+            'Accept-Encoding': 'gzip', 'If-None-Match': etag}) as response:
+        assert response.status == 304 and not await response.read()
+    service = next(value for value in server.app.values() if isinstance(value, Gateway))
+    async with alice.get(server.make_url('/static/ui.js?v=' + service.version)) as response:
+        assert 'immutable' in response.headers['Cache-Control']
+    async with alice.get(server.make_url('/static/ui.js?v=unknown')) as response:
+        assert response.headers['Cache-Control'] == 'no-cache'
+    async with alice.get(server.make_url('/static/ui.js'), headers={'Accept-Encoding': 'gzip;q=0'}) as response:
+        assert 'Content-Encoding' not in response.headers
 
 
 def test_only_loopback_trials_can_use_insecure_cookies():

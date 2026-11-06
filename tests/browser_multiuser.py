@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import sys
+import time
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -120,6 +121,50 @@ async def run():
                 else:
                     raise AssertionError('The attachment turn did not settle')
                 await page.screenshot(path=str(evidence / 'user-chat-upload.png'))
+                # Reauthenticate directly in the same browser profile. Keeping
+                # the public HTTP asset cache must not keep Alice's browser
+                # storage or expose her conversation in Bobby's workspace.
+                await page.evaluate('''async () => {
+                  localStorage.setItem('private-account-canary', 'alice');
+                  sessionStorage.setItem('private-account-canary', 'alice');
+                  const cache = await caches.open('private-account-canary');
+                  await cache.put('/private-account-canary', new Response('alice'));
+                  await new Promise((resolve, reject) => {
+                    const request = indexedDB.open('private-account-canary', 1);
+                    request.onsuccess = () => { request.result.close(); resolve(); };
+                    request.onerror = () => reject(request.error);
+                  });
+                }''')
+                await page.goto(lab.origin + '/login')
+                await page.locator('#mu-username').fill('bobby')
+                await page.locator('#mu-password').fill(lab.passwords['bobby'])
+                started = time.monotonic()
+                async with page.expect_response(lambda response: urlsplit(response.url).path == '/api/auth/login') as signed_in:
+                    await page.locator('#mu-sign-in').click()
+                login_response = await signed_in.value
+                assert login_response.status == 200
+                assert (await login_response.all_headers())['clear-site-data'] == '"storage"'
+                await page.wait_for_url(lab.origin + '/')
+                await page.locator('#mu-account').wait_for(state='visible')
+                switch_seconds = round(time.monotonic() - started, 3)
+                assert 'bobby' in await page.locator('#mu-account').inner_text()
+                assert 'A private browser task' not in await page.locator('body').inner_text()
+                storage = await page.evaluate('''async () => ({
+                  local: localStorage.getItem('private-account-canary'),
+                  session: sessionStorage.getItem('private-account-canary'),
+                  caches: await caches.keys(),
+                  databases: (await indexedDB.databases()).map(db => db.name)
+                })''')
+                assert storage['local'] is None and storage['session'] is None
+                assert 'private-account-canary' not in storage['caches']
+                assert 'private-account-canary' not in storage['databases']
+                private = await page.evaluate('''async () => {
+                  const response = await fetch('/api/sessions');
+                  return {cache: response.headers.get('cache-control'), body: await response.text()};
+                }''')
+                assert private['cache'] == 'no-store'
+                assert 'A private browser task' not in private['body']
+                await page.screenshot(path=str(evidence / 'same-profile-user-switch.png'))
                 await context.close()
                 assert not failures, failures
                 assert not statuses, statuses
@@ -130,6 +175,8 @@ async def run():
         (evidence / 'browser-acceptance.json').write_text(json.dumps({'viewports': [1440, 760, 390],
             'uncaught_errors': failures, 'http_errors': statuses, 'result': 'pass',
             'regular_user_chat_stream_and_attachment_reply': True,
+            'same_profile_user_switch_clears_private_browser_storage': True,
+            'same_profile_user_switch_seconds': switch_seconds,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()
