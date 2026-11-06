@@ -172,6 +172,53 @@ async def test_stream_and_cancel_are_owned_by_authenticated_runtime(lab):
     lab.results['stream_cancel_ownership'] = True
 
 
+async def test_same_existing_profile_with_distinct_providers_and_read_only_shared_skills(lab):
+    from aiohttp import web
+    second_secret = secrets.token_urlsafe(32)
+    second = type(lab.model)(second_secret)
+    runner = web.AppRunner(second.app(), access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    lab.runners.append(runner)
+    port = site._server.sockets[0].getsockname()[1]
+    provider = lab.store.put_provider('B account provider', f'http://127.0.0.1:{port}/v1', second_secret)
+    status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users['bobby']['id'], {'provider_id': provider})
+    assert status == 200
+    await lab.ready(['bobby'])
+    await lab.login('bobby', fresh=True)
+    try:
+        before_a, before_b = len(lab.model.requests), len(second.requests)
+        sessions = await asyncio.gather(lab.session('alice'), lab.session('bobby'))
+        streams = await asyncio.gather(*(lab.start_chat(name, sid, 'Use the existing common profile')
+            for name, sid in zip(('alice', 'bobby'), sessions, strict=True)))
+        events = await asyncio.gather(*(lab.events(name, stream) for name, stream in zip(('alice', 'bobby'), streams, strict=True)))
+        assert all(any(event == 'done' for event, _ in owned) for owned in events)
+        assert len(lab.model.requests) > before_a and len(second.requests) > before_b
+        assert second.requests[-1]['user_id'] == lab.users['bobby']['id']
+        assert lab.model.requests[-1]['user_id'] == lab.users['alice']['id']
+        probes = []
+        for name in ('alice', 'bobby'):
+            status, me = await lab.api(name, '/multiuser/api/me')
+            assert status == 200 and me['profile']['id'] == lab.template
+            status, skills = await lab.api(name, '/api/skills')
+            assert status == 200 and 'reviewed-base' in json.dumps(skills)
+            code = ('from pathlib import Path;import json;'
+                    'p=Path("/shared/skills/reviewed-base/SKILL.md");'
+                    'r={"hash":__import__("hashlib").sha256(p.read_bytes()).hexdigest(),"inode":p.stat().st_ino};'
+                    '\ntry:p.write_text("changed");r["writable"]=True\nexcept OSError:r["writable"]=False\n'
+                    'print(json.dumps(r))')
+            probes.append(json.loads(await lab.execute(name, code)))
+        assert probes[0] == probes[1] and probes[0]['writable'] is False
+        assert lab.store.user(lab.users['alice']['id'])['template_id'] == lab.store.user(lab.users['bobby']['id'])['template_id']
+        lab.results['one_existing_profile_distinct_providers_shared_readonly_skills'] = True
+    finally:
+        status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users['bobby']['id'], {'provider_id': None})
+        assert status == 200
+        await lab.ready(['bobby'])
+        await lab.login('bobby', fresh=True)
+
+
 async def test_private_state_survives_restart_and_disable_stops_only_its_jobs(lab):
     await lab.execute('alice', 'from pathlib import Path;Path("/state/hermes/memories").mkdir(exist_ok=True);'
         'Path("/state/hermes/memories/MEMORY.md").write_text("alice-private-memory");'

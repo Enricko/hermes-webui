@@ -31,6 +31,14 @@ not copy USER.md, conversations, memory, cookies, OAuth or account credentials.
 External stateful integrations need independent per-user namespaces and keys;
 they are not silently enabled by copying the main account's config.
 
+Accounts may reuse one existing capability profile with independent provider
+assignments. The account database owns each optional provider override. Assignment
+changes revoke sessions and replace only the affected runtime. A trusted root
+operator snapshots reusable skills, excluding credentials and personal state;
+the immutable bundle is mounted read-only at `/shared/skills`. Hermes's official
+`skills.external_dirs` loads these alongside private learned skills. Capability
+reuse updates the existing template in place without importing private history.
+
 Authorities and lifecycle invariants:
 
 - The control database is authoritative for role, enablement, session expiry,

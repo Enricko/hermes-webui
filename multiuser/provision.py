@@ -269,7 +269,7 @@ class Provisioner:
     def mount(source, destination, *, readonly=False):
         return ['--mount', 'type=bind,src=' + str(source) + ',dst=' + destination + (',readonly' if readonly else '')]
 
-    def start(self, uid, generation):
+    def start(self, uid, generation, template):
         s = self.settings
         relay_name, worker_name = self.names(uid)
         relay = self.common(uid, generation, '128m', '0.25') + [
@@ -291,8 +291,12 @@ class Provisioner:
                                     ('tmp', '/tmp'), ('outputs', '/outputs')]:
             worker += self.mount(user / source, destination)
         worker += self.mount(s.runtime_dir(uid) / 'tools', '/shared/tools', readonly=True)
+        bundle = template['document'].get('skill_bundle_id')
+        if bundle:
+            from multiuser.profile import bundle_path
+            worker += self.mount(bundle_path(s, bundle), '/shared/skills', readonly=True)
         self.docker('create', *worker, s.runtime_image)
-        self.admit_worker(uid, generation, self.inspect(worker_name), actual_relay, running=False)
+        self.admit_worker(uid, generation, self.inspect(worker_name), actual_relay, template=template, running=False)
         self.docker('start', worker_name)
 
     def base_admission(self, uid, generation, actual, image, user, *, running=True):
@@ -336,7 +340,7 @@ class Provisioner:
         self.mounts_admission(actual, {'/relay': (str(s.runtime_dir(uid) / 'relay'), True),
                                       '/broker': (str(s.runtime_dir(uid) / 'broker'), False)})
 
-    def admit_worker(self, uid, generation, actual, relay, *, running=True):
+    def admit_worker(self, uid, generation, actual, relay, *, template=None, running=True):
         s = self.settings
         self.base_admission(uid, generation, actual, s.runtime_image, f'{s.worker_uid}:{s.worker_uid}', running=running)
         if actual['HostConfig']['NetworkMode'] != 'container:' + relay['Id']:
@@ -344,6 +348,11 @@ class Provisioner:
         expected = {dst: (str(s.user_dir(uid) / src), True) for src, dst in [
             ('hermes', '/state/hermes'), ('workspace', '/workspace'), ('tmp', '/tmp'), ('outputs', '/outputs')]}
         expected['/shared/tools'] = (str(s.runtime_dir(uid) / 'tools'), False)
+        template = template if template is not None else self.store.effective_template(self.store.user(uid))
+        bundle = template['document'].get('skill_bundle_id')
+        if bundle:
+            from multiuser.profile import bundle_path
+            expected['/shared/skills'] = (str(bundle_path(s, bundle)), False)
         self.mounts_admission(actual, expected)
 
     def reconcile_user(self, user):
@@ -352,7 +361,7 @@ class Provisioner:
             self.stop(uid)
             self.store.set_runtime(uid, '', 'disabled' if not user['enabled'] else 'unassigned')
             return
-        template = self.store.template(user['template_id'])
+        template = self.store.effective_template(user)
         self.store.provider(template['document']['provider_id'])
         generation = self.generation(user, template)
         relay_name, worker_name = self.names(uid)
@@ -360,7 +369,7 @@ class Provisioner:
         current = self.store.runtime(uid)
         if relay and worker and current and current['generation'] == generation:
             self.admit_relay(uid, generation, relay)
-            self.admit_worker(uid, generation, worker, relay)
+            self.admit_worker(uid, generation, worker, relay, template=template)
         else:
             self.stop(uid)
             self.prepare_directories(uid)
@@ -371,10 +380,10 @@ class Provisioner:
             if not self.settings.broker_socket(uid).is_socket():
                 self.store.set_runtime(uid, generation, 'waiting_for_broker')
                 return
-            self.start(uid, generation)
+            self.start(uid, generation, template)
             relay, worker = self.inspect(relay_name), self.inspect(worker_name)
             self.admit_relay(uid, generation, relay)
-            self.admit_worker(uid, generation, worker, relay)
+            self.admit_worker(uid, generation, worker, relay, template=template)
         client = UnixHTTP(self.settings.relay_socket(uid))
         try:
             client.request('GET', '/api/onboarding/status')

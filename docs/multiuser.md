@@ -224,6 +224,70 @@ new immutable IDs, never install them on the account gateway.
 
 ## Storage and template updates
 
+### Reuse an existing profile with independent providers
+
+Choose the same **Base profile** for every account in **Accounts**. Each user's
+**AI provider → Assign provider** selects a connection independently; **Use base
+profile provider** inherits the existing connection. Add connections under
+**Providers**; credentials remain in the gateway. A provider must support the
+profile's allowed models. Assignment changes revoke that user's sessions and
+restart only their runtime, preserving its workspace. With one enabled profile,
+the create-account form selects it automatically. The sidebar shows the profile
+and provider currently assigned to the signed-in account.
+
+Upgrade an existing v1 installation with the reviewed release's CLI:
+
+```bash
+sudo systemctl stop hermes-provisioner hermes-accounts
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes upgrade \
+  --backup /private/backups/accounts-before-provider-assignments
+sudo systemctl start hermes-accounts hermes-provisioner
+```
+
+The additive migration preserves account IDs, passwords, profile assignments and
+sessions. Its consistent SQLite backup is mode 0600 in a new mode 0700 directory
+outside the installation. It retains the database file's existing mode and owner;
+keep the deployment's setgid control-directory permissions.
+
+With the provisioner stopped, explicitly reuse a main profile by updating the
+existing template **in place**, using the trusted root CLI:
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes reuse-profile \
+  --source /path/to/existing-hermes-home --template EXISTING_TEMPLATE_ID \
+  --backup /private/backups/main-profile-before-reuse
+```
+
+The command backs up selected capabilities, preserves SOUL, imports supported
+model/response parameters, and publishes existing skill resources once. The source
+model must match the template. Hermes loads the read-only `/shared/skills` bundle
+through `skills.external_dirs`; learned skills stay private. Symlinks, caches,
+logs, hidden files and recognizable/known source credentials are excluded. Review
+the private `profile-reuse.json` exclusion report; automated scanning does not
+prove arbitrary source text public. Conversation databases, personal memory,
+USER.md, uploads, OAuth, `.env`, auth.json and jobs are never shared. The original
+Hermes home remains untouched.
+
+Three-way seed protection still preserves user changes. Review `template_conflict`
+privately, then restart the provisioner after resolving it. Upstream's `default`
+subprofile is each account's private root view of the common capabilities, not
+a second empty base template. `/workspace` maps to a different host folder for
+every user even though the path inside each container is identical.
+
+CLI provider assignment (omit `--provider` to inherit):
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes assign-provider \
+  --user alice --provider PROVIDER_ID
+```
+
+For rollback, older source can retain the additive database column. Restore an old
+control database only with services stopped and only when intentionally discarding
+later account-control changes. Restore profile capabilities from the private
+`template-before.json` using the original template ID; retain both skill bundles
+until no runtime references the newer one. Capability rollback never replaces user
+homes or workspace folders.
+
 | Host location | Worker location / owner |
 | --- | --- |
 | `/srv/hermes/control/accounts.sqlite` | Gateway only; accounts, sessions, provider keys, audit |
@@ -232,6 +296,7 @@ new immutable IDs, never install them on the account gateway.
 | `/srv/hermes/users/<id>/tmp` | `/tmp`; private jobs, caches and temporary files |
 | `/srv/hermes/users/<id>/outputs` | `/outputs`; additional private output area |
 | `/srv/hermes/runtimes/<id>/tools` | `/shared/tools`; approved read-only bundle |
+| `/srv/hermes/shared/profiles/<bundle>/skills` | `/shared/skills`; common profile skills, read-only |
 | `/srv/hermes/runtimes/<id>/{relay,broker}` | Trusted relay/gateway sockets; never mounted in Agent |
 
 Back up the entire data root privately with all workers and the gateway stopped

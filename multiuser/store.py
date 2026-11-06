@@ -114,7 +114,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise PolicyError("Unsupported control database schema")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -139,7 +139,8 @@ class Store:
                     password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','user')),
                     enabled INTEGER NOT NULL DEFAULT 1,
                     auth_version INTEGER NOT NULL DEFAULT 1,
-                    template_id TEXT REFERENCES templates(id), created REAL NOT NULL
+                    template_id TEXT REFERENCES templates(id), created REAL NOT NULL,
+                    provider_id TEXT REFERENCES providers(id)
                 );
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
@@ -158,8 +159,10 @@ class Store:
                     id INTEGER PRIMARY KEY, created REAL NOT NULL, actor TEXT,
                     action TEXT NOT NULL, subject TEXT NOT NULL
                 );
-                PRAGMA user_version=1;
             """)
+            if 'provider_id' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
+                db.execute('ALTER TABLE users ADD COLUMN provider_id TEXT REFERENCES providers(id)')
+            db.execute('PRAGMA user_version=2')
         self.path.chmod(0o600)
 
     @staticmethod
@@ -167,13 +170,15 @@ class Store:
         db.execute("INSERT INTO audit(created,actor,action,subject) VALUES(?,?,?,?)",
                    (time.time(), actor, action, subject))
 
-    def create_user(self, name, password, *, role="user", template_id=None,
+    def create_user(self, name, password, *, role="user", template_id=None, provider_id=None,
                     bootstrap=False, actor=None):
         name = username(name)
         if role not in ("admin", "user"):
             raise PolicyError("Invalid role")
         if template_id is not None:
             identifier(template_id)
+        if provider_id is not None:
+            identifier(provider_id)
         encoded = password_hash(password)
         uid = uuid.uuid4().hex
         with self.connection(write=True) as db:
@@ -181,9 +186,11 @@ class Store:
                 raise PolicyError("Bootstrap is allowed only for the first administrator")
             if not bootstrap and not db.execute("SELECT 1 FROM users WHERE enabled=1 AND role='admin'").fetchone():
                 raise PolicyError("Bootstrap an administrator first")
+            if provider_id is not None and not db.execute('SELECT 1 FROM providers WHERE id=? AND enabled=1', (provider_id,)).fetchone():
+                raise PolicyError('Select an enabled provider')
             try:
-                db.execute("INSERT INTO users(id,username,password_hash,role,template_id,created) VALUES(?,?,?,?,?,?)",
-                           (uid, name, encoded, role, template_id, time.time()))
+                db.execute("INSERT INTO users(id,username,password_hash,role,template_id,created,provider_id) VALUES(?,?,?,?,?,?,?)",
+                           (uid, name, encoded, role, template_id, time.time(), provider_id))
             except sqlite3.IntegrityError as exc:
                 raise PolicyError("Username or template is invalid/unavailable") from exc
             self._event(db, "user.created", uid, actor)
@@ -192,17 +199,17 @@ class Store:
     def user(self, uid):
         identifier(uid)
         with self.connection() as db:
-            row = db.execute("SELECT id,username,role,enabled,auth_version,template_id,created FROM users WHERE id=?", (uid,)).fetchone()
+            row = db.execute("SELECT id,username,role,enabled,auth_version,template_id,provider_id,created FROM users WHERE id=?", (uid,)).fetchone()
         if row is None:
             raise PolicyError("Account not found")
         return dict(row)
 
     def users(self):
         with self.connection() as db:
-            return [dict(r) for r in db.execute("SELECT id,username,role,enabled,auth_version,template_id,created FROM users ORDER BY username")]
+            return [dict(r) for r in db.execute("SELECT id,username,role,enabled,auth_version,template_id,provider_id,created FROM users ORDER BY username")]
 
     def update_user(self, uid, *, role=None, enabled=None, password=None,
-                    template_id=None, assign_template=False, actor=None):
+                    template_id=None, assign_template=False, provider_id=None, assign_provider=False, actor=None):
         identifier(uid)
         if role is not None and role not in ("admin", "user"):
             raise PolicyError("Invalid role")
@@ -210,6 +217,8 @@ class Store:
             raise PolicyError("Enabled must be boolean")
         if assign_template and template_id is not None:
             identifier(template_id)
+        if assign_provider and provider_id is not None:
+            identifier(provider_id)
         encoded = password_hash(password) if password is not None else None
         with self.connection(write=True) as db:
             old = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
@@ -222,9 +231,13 @@ class Store:
                 if count <= 1:
                     raise PolicyError("The last enabled administrator cannot be removed")
             new_template = template_id if assign_template else old["template_id"]
+            new_provider = provider_id if assign_provider else old['provider_id']
+            if assign_provider and new_provider is not None and not db.execute(
+                    'SELECT 1 FROM providers WHERE id=? AND enabled=1', (new_provider,)).fetchone():
+                raise PolicyError('Select an enabled provider')
             try:
-                db.execute("UPDATE users SET role=?,enabled=?,password_hash=?,template_id=?,auth_version=auth_version+1 WHERE id=?",
-                           (new_role, new_enabled, encoded or old["password_hash"], new_template, uid))
+                db.execute("UPDATE users SET role=?,enabled=?,password_hash=?,template_id=?,provider_id=?,auth_version=auth_version+1 WHERE id=?",
+                           (new_role, new_enabled, encoded or old["password_hash"], new_template, new_provider, uid))
             except sqlite3.IntegrityError as exc:
                 raise PolicyError("Template not found") from exc
             db.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
@@ -360,6 +373,14 @@ class Store:
         if row is None:
             raise PolicyError("Template is unavailable")
         return {**dict(row), "document": validate_template(json.loads(row["document"]))}
+
+    def effective_template(self, user):
+        """One shared capability profile, with a server-owned provider per account."""
+        template = self.template(user['template_id'])
+        if user.get('provider_id') is not None:
+            template['document']['provider_id'] = identifier(user['provider_id'])
+        self.provider(template['document']['provider_id'])
+        return template
 
     def put_tool(self, name, description, filename, content, *, tool_id=None, enabled=True):
         if not isinstance(name, str) or not 1 <= len(name) <= 80 or not TOOL_NAME.fullmatch(filename):

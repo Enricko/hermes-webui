@@ -67,6 +67,18 @@ async def run():
                         record = dialog.locator('.mu-record').filter(has=page.get_by_text('ui-created', exact=True))
                         await record.get_by_role('button', name='Disable', exact=True).click()
                         await record.get_by_role('button', name='Enable', exact=True).wait_for()
+                        independent = lab.store.put_provider('Independent account provider',
+                            lab.store.provider(lab.provider)['base_url'], lab.provider_secret)
+                        await dialog.get_by_role('button', name='Close', exact=True).click()
+                        await page.get_by_role('button', name='Accounts', exact=True).click()
+                        record = dialog.locator('.mu-record').filter(has=page.get_by_text('ui-created', exact=True))
+                        await record.locator('[name=assigned-provider]').select_option(independent)
+                        async with page.expect_response(lambda response: '/multiuser/api/users/' in response.url and response.request.method == 'POST') as assigned:
+                            await record.get_by_role('button', name='Assign provider', exact=True).click()
+                        assert (await assigned.value).status == 200
+                        created = next(user for user in lab.store.users() if user['username'] == 'ui-created')
+                        assert created['template_id'] == lab.template and created['provider_id'] == independent
+                        await page.screenshot(path=str(evidence / 'desktop-account-provider.png'))
                         for tab in ['Providers', 'Templates', 'Shared tools']:
                             await dialog.get_by_role('button', name=tab, exact=True).click()
                             await dialog.locator('form button[type=submit]').wait_for()
@@ -177,6 +189,7 @@ async def run():
             'regular_user_chat_stream_and_attachment_reply': True,
             'same_profile_user_switch_clears_private_browser_storage': True,
             'same_profile_user_switch_seconds': switch_seconds,
+            'shared_base_profile_and_independent_account_provider_ui': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

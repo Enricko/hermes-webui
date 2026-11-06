@@ -6,6 +6,7 @@
 .mu-login-card button{width:100%;margin-top:10px;min-height:42px}.mu-error{color:#f38b8b!important;white-space:pre-wrap}
 .mu-account{display:flex;align-items:center;gap:8px;padding:9px 10px;border-top:1px solid var(--border,#303044);font-size:12px;flex-wrap:wrap}
 .mu-account-name{flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis}.mu-account button{min-height:32px;padding:5px 8px;font:inherit}
+.mu-base-profile{flex-basis:100%;color:var(--text-muted,#a0a0b0);font-size:11px;overflow-wrap:anywhere}
 .mu-runtime-notice{position:fixed;left:50%;top:8px;transform:translateX(-50%);z-index:1500;background:var(--surface,#1c1c30);border:1px solid var(--border,#37374b);padding:10px 16px;border-radius:8px;max-width:80vw;font-size:13px}
 .mu-dialog{width:min(1000px,calc(100vw - 32px));max-height:90dvh;padding:0;border:1px solid var(--border,#37374b);border-radius:14px;background:var(--surface,#141425);color:var(--text,#e8e8ef);font:14px/1.5 system-ui,sans-serif}
 .mu-dialog::backdrop{background:#0009}.mu-dialog-header{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--border,#37374b)}

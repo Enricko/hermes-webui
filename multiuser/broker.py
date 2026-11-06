@@ -23,7 +23,7 @@ def entitlement(store, uid):
     user = store.user(uid)
     if not user['enabled'] or not user['template_id']:
         raise PolicyError('Account is not enabled for model/network access')
-    template = store.template(user['template_id'])['document']
+    template = store.effective_template(user)['document']
     provider = store.provider(template['provider_id'])
     return user, template, provider
 
@@ -229,7 +229,9 @@ class Brokers:
                     try:
                         while True:
                             done, _ = await asyncio.wait({pending}, timeout=0.5)
-                            entitlement(self.store, uid)
+                            current, _template, _provider = entitlement(self.store, uid)
+                            if current['auth_version'] != _user['auth_version']:
+                                raise PolicyError('Account assignment changed')
                             if not done:
                                 continue
                             data = pending.result()

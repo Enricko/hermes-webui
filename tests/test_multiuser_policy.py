@@ -153,3 +153,28 @@ def test_persisted_capabilities_are_revalidated_before_trusted_filesystem_use(tm
             'provider_id': provider, 'model': 'approved', 'skills': {'../../escape': 'bad'}}), template))
     with pytest.raises(PolicyError):
         store.template(template)
+
+
+def test_shared_skill_snapshot_preserves_resources_but_excludes_secrets_state_and_symlinks(tmp_path):
+    from multiuser.profile import secret_values, snapshot_skills
+    source = tmp_path / 'source'
+    (source / 'existing/scripts').mkdir(parents=True)
+    (source / 'existing/SKILL.md').write_text('Use scripts/tool.py before writing a new tool')
+    (source / 'existing/scripts/tool.py').write_text('print("existing implementation")')
+    for name in ['.env', 'auth.json', 'USER.md', 'private.log']:
+        (source / name).write_text('private state')
+    (source / '.env').write_text("export SECRET_API_KEY='private-api-key-canary'\n")
+    (source / 'existing/private.md').write_text('The credential is private-api-key-canary')
+    (source / 'outside').symlink_to(tmp_path, target_is_directory=True)
+    (source / 'existing/link.md').symlink_to(source / 'existing/SKILL.md')
+    destination = tmp_path / 'snapshot'
+    known = secret_values(source, {})
+    assert b'private-api-key-canary' in known
+    assert 'SECRET_API_KEY' not in os.environ
+    copied, skipped = snapshot_skills(source, destination, known)
+    assert set(copied) == {'existing/SKILL.md', 'existing/scripts/tool.py'}
+    assert len(skipped) == 7
+    assert (destination / 'existing/SKILL.md').read_bytes() == (source / 'existing/SKILL.md').read_bytes()
+    assert not (destination / 'existing/scripts/tool.py').stat().st_mode & 0o222
+    assert not (destination / 'existing/SKILL.md').stat().st_mode & 0o222
+    assert not (destination / 'outside').exists()

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import sys
 import tempfile
@@ -48,6 +49,7 @@ class Lab:
         return json.loads(out)
 
     async def start(self):
+        self.evidence.mkdir(parents=True, exist_ok=True)
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0))
             port = sock.getsockname()[1]
@@ -90,6 +92,15 @@ class Lab:
         status, value = await self.api('administrator', '/multiuser/api/templates', {'name': 'Acceptance base', 'document': self.template_document})
         assert status == 200
         self.template = value['id']
+        self.profile_source = Path(tempfile.mkdtemp(prefix='hmu-profile-fixture-', dir='/tmp'))
+        (self.profile_source / 'skills/reviewed-base').mkdir(parents=True)
+        (self.profile_source / 'config.yaml').write_text('model:\n  default: fixture-model\n')
+        (self.profile_source / 'SOUL.md').write_text(self.template_document['soul'])
+        (self.profile_source / 'skills/reviewed-base/SKILL.md').write_text(
+            '---\nname: reviewed-base\ndescription: Existing shared profile skill\n---\nUse the existing shared converter before recreating it.\n')
+        await self.operator('reuse-profile', '--source', str(self.profile_source), '--template', self.template,
+                            '--backup', str(self.evidence / 'profile-reuse-backup'))
+        self.template_document = self.store.template(self.template)['document']
         for name in ('alice', 'bobby'):
             status, value = await self.api('administrator', '/multiuser/api/users', {'username': name,
                 'password': self.passwords[name], 'role': 'user', 'template_id': self.template})
@@ -207,3 +218,5 @@ class Lab:
                    "c=json.loads((p/'settings.json').read_text());assert c['root']==str(p) and c['public_url'].startswith('http://127.0.0.1:');shutil.rmtree(p)")
         process = await asyncio.create_subprocess_exec('sudo', '-n', sys.executable, '-c', cleanup, str(self.root))
         await process.wait()
+        if hasattr(self, 'profile_source'):
+            shutil.rmtree(self.profile_source)

@@ -119,6 +119,10 @@ async def test_admin_api_and_csrf_are_backend_enforced(gateway):
     for route in ['users', 'providers', 'templates']:
         async with alice.get(server.make_url('/multiuser/api/' + route), headers={'X-Admin': '1'}) as response:
             assert response.status == 403
+    async with alice.post(server.make_url('/multiuser/api/users/' + users[1]['id']),
+                          json={'provider_id': 'f' * 32},
+                          headers={'Origin': settings.origin, 'X-Hermes-CSRF-Token': csrf}) as response:
+        assert response.status == 403
     async with alice.post(server.make_url('/api/echo'), json={'payload': 'x'}, headers={'Origin': settings.origin, 'X-Hermes-CSRF-Token': ''}) as response:
         assert response.status == 403
     for origin in ['https://evil.example', 'null']:
@@ -260,6 +264,21 @@ async def test_health_reports_stopped_account_discovery(gateway):
         async with client.get(server.make_url('/health')) as response:
             assert response.status == 503
             assert (await response.json())['account_discovery'] == 'stopped'
+
+
+@pytest.mark.asyncio
+async def test_identity_controls_remain_available_when_assigned_provider_is_disabled(gateway):
+    settings, store, server, login, users, _received = gateway
+    provider = store.put_provider('Unavailable provider', 'http://127.0.0.1:1/v1', 'private-provider-key')
+    template = store.put_template('Existing profile', {'provider_id': provider, 'model': 'approved'})
+    store.update_user(users[1]['id'], template_id=template, assign_template=True)
+    alice, _csrf = await login('alice')
+    store.put_provider('Unavailable provider', 'http://127.0.0.1:1/v1', provider_id=provider, enabled=False)
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        text = await response.text()
+        assert response.status == 200 and 'private-provider-key' not in text
+        value = await response.json()
+        assert value['profile']['id'] == template and value['provider']['id'] == provider
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ import getpass
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tarfile
 
@@ -30,6 +31,23 @@ def find_user(store, value):
     if len(matches) != 1:
         raise PolicyError('Account not found')
     return matches[0]
+
+
+def upgrade(settings, backup):
+    backup = backup.absolute()
+    if backup.exists() or backup.is_relative_to(settings.root):
+        raise PolicyError('Use a new private backup directory outside the installation')
+    backup.mkdir(parents=True, mode=0o700)
+    store = settings.store()
+    mode = store.path.stat().st_mode & 0o777
+    with store.connection() as source, sqlite3.connect(backup / 'accounts-before.sqlite') as destination:
+        source.backup(destination)
+    (backup / 'accounts-before.sqlite').chmod(0o600)
+    try:
+        store.initialize()
+    finally:
+        store.path.chmod(mode)
+    return {'schema_version': 2, 'backup': str(backup), 'existing_accounts_preserved': True}
 
 
 def migrate(settings, args):
@@ -94,15 +112,18 @@ def main(argv=None):
     init.add_argument('--images', type=Path)
     images = sub.add_parser('set-images')
     images.add_argument('--images', type=Path, required=True)
+    migration = sub.add_parser('upgrade', help='Back up and upgrade the account schema without recreating accounts')
+    migration.add_argument('--backup', type=Path, required=True)
     for command in ['bootstrap-admin', 'create-user']:
         item = sub.add_parser(command)
         item.add_argument('--username', required=True)
         item.add_argument('--password-stdin', action='store_true')
         item.add_argument('--template')
+        item.add_argument('--provider')
         if command == 'create-user':
             item.add_argument('--role', choices=['admin', 'user'], default='user')
     sub.add_parser('list-users')
-    for command in ['disable-user', 'enable-user', 'reset-password', 'set-role', 'assign-template']:
+    for command in ['disable-user', 'enable-user', 'reset-password', 'set-role', 'assign-template', 'assign-provider']:
         item = sub.add_parser(command)
         item.add_argument('--user', required=True, help='Stable ID or username (operator CLI only)')
         if command == 'reset-password':
@@ -111,6 +132,8 @@ def main(argv=None):
             item.add_argument('--role', choices=['admin', 'user'], required=True)
         if command == 'assign-template':
             item.add_argument('--template', required=True)
+        if command == 'assign-provider':
+            item.add_argument('--provider', help='Provider ID; omit to inherit the base profile provider')
     provider = sub.add_parser('put-provider')
     provider.add_argument('--id')
     provider.add_argument('--name', required=True)
@@ -146,6 +169,10 @@ def main(argv=None):
     migration.add_argument('--parameters', action='store_true')
     migration.add_argument('--soul', action='store_true')
     migration.add_argument('--skill', action='append', default=[])
+    reuse = sub.add_parser('reuse-profile', help='Reuse an existing main capability profile without cloning its private state')
+    reuse.add_argument('--source', type=Path, required=True)
+    reuse.add_argument('--template', required=True, help='Existing shared template ID to update in place')
+    reuse.add_argument('--backup', type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == 'init':
@@ -161,7 +188,9 @@ def main(argv=None):
             if os.geteuid() not in (0, settings.gateway_uid):
                 raise PolicyError('Use the dedicated trusted gateway account or a root operator')
             store = settings.store()
-            if args.command == 'set-images':
+            if args.command == 'upgrade':
+                result = upgrade(settings, args.backup)
+            elif args.command == 'set-images':
                 if os.geteuid() != 0:
                     raise PolicyError('Only the trusted root operator can select runtime images')
                 values = json.loads(args.images.read_text())
@@ -171,10 +200,10 @@ def main(argv=None):
                 result = {'images_updated': True}
             elif args.command in ('bootstrap-admin', 'create-user'):
                 result = store.create_user(args.username, password(args), role='admin' if args.command == 'bootstrap-admin' else args.role,
-                                           template_id=args.template, bootstrap=args.command == 'bootstrap-admin')
+                                           template_id=args.template, provider_id=args.provider, bootstrap=args.command == 'bootstrap-admin')
             elif args.command == 'list-users':
                 result = store.users()
-            elif args.command in ('disable-user', 'enable-user', 'reset-password', 'set-role', 'assign-template'):
+            elif args.command in ('disable-user', 'enable-user', 'reset-password', 'set-role', 'assign-template', 'assign-provider'):
                 user = find_user(store, args.user)
                 changes = {}
                 if args.command in ('disable-user', 'enable-user'):
@@ -183,8 +212,10 @@ def main(argv=None):
                     changes['password'] = password(args)
                 elif args.command == 'set-role':
                     changes['role'] = args.role
-                else:
+                elif args.command == 'assign-template':
                     changes.update(template_id=args.template, assign_template=True)
+                else:
+                    changes.update(provider_id=args.provider, assign_provider=True)
                 result = store.update_user(user['id'], **changes)
             elif args.command == 'put-provider':
                 secret = sys.stdin.readline().rstrip('\r\n') if args.secret_stdin else getpass.getpass('Provider API key (empty for a private local endpoint): ')
@@ -211,7 +242,7 @@ def main(argv=None):
                         raise PolicyError('Assign a template first')
                     provisioner.stop(user['id'])
                     provisioner.prepare_directories(user['id'])
-                    kept = provisioner.seed(user['id'], store.template(user['template_id']), keep_private=True)
+                    kept = provisioner.seed(user['id'], store.effective_template(user), keep_private=True)
                     print(json.dumps({'private_files_preserved': kept}))
                     return 0
                 elif args.command == 'stop-runtime':
@@ -226,6 +257,9 @@ def main(argv=None):
                 result = {'reconciled': True}
             elif args.command == 'migrate-single-user':
                 result = migrate(settings, args)
+            elif args.command == 'reuse-profile':
+                from multiuser.profile import reuse_profile
+                result = reuse_profile(settings, args.source, args.template, args.backup)
             else:
                 raise PolicyError('Unsupported command')
         print(json.dumps(result, indent=2))

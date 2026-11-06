@@ -233,7 +233,19 @@ class Gateway:
     async def me(self, request):
         session = self.require(request)
         runtime = self.store.runtime(session.user_id)
-        return json_response({**session.public(), 'runtime': {
+        user = self.store.user(session.user_id)
+        profile, provider = None, None
+        if user['template_id']:
+            # Identity/account controls must remain available even when a
+            # disabled capability/provider prevents the Agent from starting.
+            with contextlib.suppress(PolicyError):
+                template = self.store.template(user['template_id'])
+                profile = {'id': template['id'], 'name': template['name'], 'version': template['version']}
+                selected = user['provider_id'] or template['document']['provider_id']
+                configured = next((p for p in self.store.providers() if p['id'] == selected), None)
+                if configured:
+                    provider = {'id': configured['id'], 'name': configured['name']}
+        return json_response({**session.public(), 'profile': profile, 'provider': provider, 'runtime': {
             'state': runtime['state'] if runtime else 'pending',
             'message': runtime['error'] if runtime else ''}})
 
@@ -245,17 +257,20 @@ class Gateway:
                 runtime = self.store.runtime(user['id'])
                 user['runtime_state'] = runtime['state'] if runtime else 'pending'
             return json_response({'users': users})
-        body = await object_body(request, {'username', 'password', 'role', 'template_id'})
+        body = await object_body(request, {'username', 'password', 'role', 'template_id', 'provider_id'})
         user = await asyncio.to_thread(self.store.create_user, body['username'], body['password'],
-                    role=body.get('role', 'user'), template_id=body.get('template_id'), actor=actor.user_id)
+                    role=body.get('role', 'user'), template_id=body.get('template_id'),
+                    provider_id=body.get('provider_id'), actor=actor.user_id)
         return json_response({'user': user}, status=201)
 
     async def update_user(self, request):
         actor = self.require(request, admin=True)
-        body = await object_body(request, {'role', 'enabled', 'password', 'template_id'})
-        changes = {k: v for k, v in body.items() if k != 'template_id'}
+        body = await object_body(request, {'role', 'enabled', 'password', 'template_id', 'provider_id'})
+        changes = {k: v for k, v in body.items() if k not in ('template_id', 'provider_id')}
         if 'template_id' in body:
             changes.update(template_id=body['template_id'], assign_template=True)
+        if 'provider_id' in body:
+            changes.update(provider_id=body['provider_id'], assign_provider=True)
         user = await asyncio.to_thread(self.store.update_user, request.match_info['uid'], actor=actor.user_id, **changes)
         return json_response({'user': user})
 

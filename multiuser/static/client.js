@@ -77,13 +77,17 @@
     let editing;
     let submit;
     if (tab === 'users') {
-      const [users, templates] = await Promise.all([request('/multiuser/api/users'), request('/multiuser/api/templates')]);
+      const [users, templates, providers] = await Promise.all([request('/multiuser/api/users'), request('/multiuser/api/templates'), request('/multiuser/api/providers')]);
+      const available = templates.templates.filter(t => t.enabled);
+      const providerOptions = [['', 'Use base profile provider'], ...providers.providers.filter(p => p.enabled).map(p => [p.id, p.name])];
       field(form, 'username', 'Username').required = true;
       field(form, 'password', 'Initial password (at least 12 characters)', 'password').required = true;
       select(form, 'role', 'Role', [['user', 'User'], ['admin', 'Admin']], 'user');
-      select(form, 'template_id', 'Capability template', [['', 'Assign later'], ...templates.templates.filter(t => t.enabled).map(t => [t.id, t.name])]);
+      select(form, 'template_id', 'Base profile', [['', 'Assign later'], ...available.map(t => [t.id, t.name])], available.length === 1 ? available[0].id : '');
+      select(form, 'provider_id', 'AI provider', providerOptions);
+      form.append(element('p', 'Reuse the same base profile for all accounts. Each account has private conversations, memory and workspace; its AI provider can be assigned independently.', 'mu-help'));
       submit = async () => {
-        const data = Object.fromEntries(new FormData(form)); data.template_id ||= null;
+        const data = Object.fromEntries(new FormData(form)); data.template_id ||= null; data.provider_id ||= null;
         await request('/multiuser/api/users', data);
       };
       for (const user of users.users) {
@@ -95,8 +99,10 @@
         };
         actions.append(button(user.enabled ? 'Disable' : 'Enable', () => change({enabled: !user.enabled}).catch(e => message(e.message, true))));
         actions.append(button(user.role === 'admin' ? 'Make user' : 'Make admin', () => change({role: user.role === 'admin' ? 'user' : 'admin'}).catch(e => message(e.message, true))));
-        const template = select(record, 'assigned', 'Template', [['', 'Unassigned'], ...templates.templates.map(t => [t.id, t.name])], user.template_id || '');
-        actions.append(button('Assign template', () => change({template_id: template.value || null}).catch(e => message(e.message, true))));
+        const template = select(record, 'assigned', 'Base profile', [['', 'Unassigned'], ...templates.templates.map(t => [t.id, t.name])], user.template_id || '');
+        actions.append(button('Assign profile', () => change({template_id: template.value || null}).catch(e => message(e.message, true))));
+        const provider = select(record, 'assigned-provider', 'AI provider', providerOptions, user.provider_id || '');
+        actions.append(button('Assign provider', () => change({provider_id: provider.value || null}).catch(e => message(e.message, true))));
         const reset = field(record, 'reset-password', 'New password', 'password');
         actions.append(button('Reset password', async () => {
           try { await change({password: reset.value}); reset.value = ''; }
@@ -179,6 +185,8 @@
   }
   async function refreshIdentity() {
     identity = await request('/multiuser/api/me');
+    const profile = document.getElementById('mu-base-profile');
+    if (profile) profile.textContent = identity.profile ? `Profile: ${identity.profile.name} · Provider: ${identity.provider?.name || 'unavailable'}` : 'No base profile assigned';
     const notice = document.getElementById('mu-runtime-notice');
     if (notice) {
       notice.hidden = identity.runtime.state === 'ready';
@@ -195,6 +203,7 @@
       bar.append(element('span', identity.username + (identity.role === 'admin' ? ' · Admin' : ''), 'mu-account-name'));
       if (identity.role === 'admin') bar.append(button('Accounts', () => panel().catch(e => message(e.message, true))));
       bar.append(button('Sign out', () => logout().catch(() => location.replace('/login'))));
+      const profile = element('small', '', 'mu-base-profile'); profile.id = 'mu-base-profile'; bar.append(profile);
       const sidebar = document.querySelector('.sidebar');
       (sidebar || document.body).append(bar);
       const notice = element('div', '', 'mu-runtime-notice'); notice.id = 'mu-runtime-notice';
