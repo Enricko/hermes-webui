@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en" class="dark"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in · Hermes</title>
+<link rel="icon" href="/static/favicon.svg"><link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/multiuser/static/style.css">
+<script defer src="/multiuser/static/login.js"></script>
+</head><body class="mu-login-page">
+<main class="mu-login-card">
+  <img src="/static/favicon.svg" width="44" height="44" alt="">
+  <h1>Welcome to Hermes</h1><p>Sign in to your workspace.</p>
+  <form id="mu-login-form">
+    <label>Username<input name="username" id="mu-username" autocomplete="username" required maxlength="48" autofocus></label>
+    <label>Password<input name="password" id="mu-password" type="password" autocomplete="current-password" required maxlength="1024"></label>
+    <p id="mu-login-error" class="mu-error" role="alert" hidden></p>
+    <button class="settings-action-btn primary" type="submit" id="mu-sign-in">Sign in</button>
+  </form>
+</main></body></html>

@@ -760,6 +760,11 @@ def _hermes_blocked_create_connection(address, *a, **kw):
 
 
 def _hermes_blocked_socket_connect(self, address):
+    # A filesystem Unix socket is a local transport, not an outbound network
+    # destination. The isolated multi-user gateway uses it instead of exposing
+    # private runtimes on host TCP ports; keep Internet TCP/DNS guards intact.
+    if self.family == getattr(_hermes_test_socket, 'AF_UNIX', None):
+        return _REAL_SOCKET_CONNECT(self, address)
     try:
         host = address[0]
     except (TypeError, IndexError):
