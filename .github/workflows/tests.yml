@@ -150,7 +150,7 @@ jobs:
       # cannot be bypassed by the diff scope. (#4641)
       - name: Python syntax gate (whole tree — fails fast on any unparseable .py)
         if: needs.changes.outputs.docs_only != 'true'
-        run: python3 -m compileall -q api server.py bootstrap.py mcp_server.py tests scripts
+        run: python3 -m compileall -q api server.py bootstrap.py mcp_server.py tests scripts multiuser
 
       - name: Ruff forward gate (new/changed lines only)
         if: needs.changes.outputs.docs_only != 'true'
@@ -237,6 +237,13 @@ jobs:
           python -m pip install --upgrade pip
           # Office parsers stay optional at runtime; CI installs them explicitly for the workspace preview tests.
           pip install "pyyaml>=6.0" pytest pytest-timeout pytest-asyncio pytest-shard python-docx openpyxl python-pptx playwright
+          pip install -r requirements-multiuser.txt
+          # The real account gateway rejects SQLite before the upstream WAL fix.
+          # Keep distro/system libraries untouched; use a private verified build.
+          if ! python -c 'import sqlite3; assert sqlite3.sqlite_version_info >= (3,51,3)'; then
+            python scripts/build_multiuser_sqlite.py --output "$RUNNER_TEMP/hermes-sqlite"
+            echo "LD_LIBRARY_PATH=$RUNNER_TEMP/hermes-sqlite/lib" >> "$GITHUB_ENV"
+          fi
           # ruff is installed so tests/test_ruff_forward_lint.py runs its E9/F821
           # tree-clean assertions in-suite (mirrors how eslint is available for
           # tests/test_static_js_runtime_lint.py). If install fails the test

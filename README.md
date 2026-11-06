@@ -955,3 +955,10 @@ Configurable assistant display name, thinking/reasoning block display, and a log
 ```
 git@github.com:nesquena/hermes-webui.git
 ```
+
+## Optional isolated multi-user deployment
+
+Local admin/user accounts with a complete Docker-isolated WebUI and Agent per
+account are available as an explicit deployment mode. See
+[setup, capability templates, shared scripts, migration and rollback](docs/multiuser.md).
+The existing single-user launcher and personal data remain separate.

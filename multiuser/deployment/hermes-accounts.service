@@ -1,0 +1,30 @@
+[Unit]
+Description=Hermes opt-in account gateway (no Agent or Docker privileges)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes-gateway
+Group=hermes-gateway
+WorkingDirectory=/opt/hermes-multiuser
+EnvironmentFile=/etc/hermes-multiuser.env
+ExecStart=/opt/hermes-multiuser/.venv/bin/python -m multiuser.gateway --root ${HERMES_MULTIUSER_ROOT}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=-/run/docker.sock
+ReadWritePaths=/srv/hermes/control /srv/hermes/runtimes
+
+[Install]
+WantedBy=multi-user.target

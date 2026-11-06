@@ -1,0 +1,29 @@
+[Unit]
+Description=Trusted Hermes container reconciler (never an Agent)
+Requires=hermes-accounts.service
+After=hermes-accounts.service docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/hermes-multiuser
+EnvironmentFile=/etc/hermes-multiuser.env
+ExecStart=/opt/hermes-multiuser/.venv/bin/python -m multiuser.manage --root ${HERMES_MULTIUSER_ROOT} reconcile --watch
+ExecStopPost=/opt/hermes-multiuser/.venv/bin/python -m multiuser.manage --root ${HERMES_MULTIUSER_ROOT} stop-all-runtimes
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=240
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/srv/hermes
+
+[Install]
+WantedBy=multi-user.target

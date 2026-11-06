@@ -1,0 +1,7 @@
+# Separate test hostname first. Changing an existing site is an explicit cutover.
+hermes.example.com {
+    reverse_proxy 127.0.0.1:8799 {
+        header_up Host hermes.example.com
+        flush_interval -1
+    }
+}

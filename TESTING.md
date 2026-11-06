@@ -1,5 +1,15 @@
 # Hermes Web UI: Browser Testing Plan
 
+## Opt-in multi-user acceptance
+
+See [the multi-user verification guide](docs/multiuser.md#verification). Account,
+gateway and template-policy tests run in the ordinary Python suite. The explicit
+Docker gate uses three real WebUI/Agent workers, separate storage and real tool
+execution; only the external model response is deterministic. It checks direct
+API ownership, adversarial paths/archives/symlinks, stream/cancel ownership,
+process/filesystem/network bounds, concurrent read-only shared tools and restart
+persistence. Never treat its default skip as containment evidence.
+
 ## Desktop session sidebar compatibility (#7415)
 
 Run `./scripts/test.sh -q tests/test_desktop_session_sidebar_visibility.py`.
