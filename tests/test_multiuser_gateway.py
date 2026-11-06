@@ -49,8 +49,9 @@ async def gateway(unused_tcp_port):
                 except ConnectionError:
                     pass
                 return response
-            if request.path == '/api/raw-code':
-                return web.Response(text='untrusted-worker-code', content_type='application/javascript',
+            if request.path in ('/api/raw-code', '/api/alternate-script-mime'):
+                return web.Response(text='untrusted-worker-code', content_type=(
+                    'application/ecmascript' if request.path.endswith('alternate-script-mime') else 'application/javascript'),
                                     headers={'Service-Worker-Allowed': '/', 'Set-Cookie': 'hmu_session=attacker; Path=/'})
             if request.path == '/api/echo':
                 assert request.content_length is not None
@@ -187,6 +188,10 @@ async def test_frontend_cannot_be_poisoned_by_runtime_or_untrusted_code(gateway)
         assert response.content_type == 'application/octet-stream'
         assert 'Service-Worker-Allowed' not in response.headers
         assert 'Set-Cookie' not in response.headers
+    async with alice.get(server.make_url('/api/alternate-script-mime')) as response:
+        assert response.content_type == 'application/octet-stream'
+    async with alice.get(server.make_url('/api/raw-code'), headers={'Service-Worker': 'script'}) as response:
+        assert response.status == 403
     assert alice.cookie_jar.filter_cookies(server.make_url('/'))['hmu_session'].value == token
     async with alice.get(server.make_url('/sw.js')) as response:
         assert 'unregister' in await response.text()

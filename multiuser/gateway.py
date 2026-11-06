@@ -301,6 +301,9 @@ class Gateway:
                   '/api/update', '/api/restart', '/api/shutdown')
         if path.startswith(denied) or path.startswith('/multiuser') or (request.method in UNSAFE and path.startswith(('/api/provider', '/api/onboarding', '/api/config', '/api/env'))):
             raise web.HTTPForbidden(text='This operation is managed by the account gateway')
+        if (request.headers.get('Service-Worker') or
+                request.headers.get('Sec-Fetch-Dest') in ('serviceworker', 'sharedworker', 'worker', 'script', 'style')):
+            raise web.HTTPForbidden(text='Executable frontend resources must come from the trusted gateway')
         runtime = self.store.runtime(uid)
         if not runtime or runtime['state'] != 'ready':
             return json_response({'error': 'Your private runtime is not ready', 'runtime_state': runtime['state'] if runtime else 'pending'}, status=503)
@@ -363,7 +366,10 @@ class Gateway:
                 out_headers = {key: value for key, value in upstream.headers.items() if key.lower() not in HOP_HEADERS}
                 out_headers['Cache-Control'] = 'no-store'
                 mime = upstream.headers.get('Content-Type', '').split(';')[0].strip().lower()
-                if mime in ('application/javascript', 'text/javascript', 'text/css'):
+                safe_data = (mime in ('application/json', 'text/event-stream', 'text/plain', 'text/html',
+                                     'application/pdf', 'application/zip', 'application/octet-stream') or
+                             mime.startswith(('image/', 'audio/', 'video/')))
+                if not safe_data:
                     out_headers['Content-Type'] = 'application/octet-stream'
                     out_headers['Content-Disposition'] = 'attachment'
                 if mime in ('text/html', 'image/svg+xml'):
