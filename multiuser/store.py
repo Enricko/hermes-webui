@@ -445,7 +445,7 @@ class Store:
         self.provider(selected)
         return template
 
-    def select_access(self, principal, template_id, provider_id):
+    def select_access(self, principal, template_id, provider_id, *, validate_only=False):
         """Self-service activation can only select existing grants, atomically.
 
         Rotate the account generation, retain only this authenticated session,
@@ -471,6 +471,8 @@ class Store:
             selected = provider_id or base_provider
             if selected not in access['provider_ids'] or not db.execute('SELECT 1 FROM providers WHERE id=? AND enabled=1', (selected,)).fetchone():
                 raise PolicyError('Provider is not assigned to this account')
+            if validate_only:
+                return False
             provider_id = None if selected == base_provider else selected
             if old['template_id'] == template_id and old['provider_id'] == provider_id:
                 return False

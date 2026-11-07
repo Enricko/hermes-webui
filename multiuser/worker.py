@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -26,9 +27,13 @@ def cron_loop():
 def main():
     if os.geteuid() == 0:
         raise SystemExit('Worker must run as a non-root account')
-    private_home = '/state/hermes'
+    base_home = '/state/hermes'
+    profile = sys.argv[sys.argv.index('--profile') + 1] if '--profile' in sys.argv else 'default'
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', profile):
+        raise SystemExit('Invalid private scheduler profile')
+    private_home = base_home if profile == 'default' else base_home + '/profiles/' + profile
     os.environ.update({
-        'HOME': private_home, 'HERMES_HOME': private_home, 'HERMES_BASE_HOME': private_home,
+        'HOME': private_home, 'HERMES_HOME': private_home, 'HERMES_BASE_HOME': base_home,
         'HERMES_CONFIG_PATH': private_home + '/config.yaml',
         'HERMES_WEBUI_STATE_DIR': private_home + '/webui',
         'HERMES_WEBUI_DEFAULT_WORKSPACE': '/workspace',
@@ -55,8 +60,14 @@ def main():
         raise SystemExit('Hermes Agent import failed')
     if not Path(private_home + '/config.yaml').is_file():
         raise SystemExit('Provision an explicit capability template first')
-    commands = [[sys.executable, '/opt/webui/server.py'],
-                [sys.executable, '-m', 'multiuser.worker', '--cron']]
+    profiles = os.environ.get('HERMES_MULTIUSER_PROFILE_NAMES', 'default').split(',')
+    if (not 1 <= len(profiles) <= 32 or len(set(profiles)) != len(profiles) or
+            any(not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) for name in profiles)):
+        raise SystemExit('Invalid provisioned scheduler profiles')
+    commands = [[sys.executable, '/opt/webui/server.py']]
+    # Each scheduler imports the official Agent in a fresh process with its
+    # own fixed home/config. Profile switching never changes a shared env.
+    commands += [[sys.executable, '-m', 'multiuser.worker', '--cron', '--profile', name] for name in profiles]
     children = [subprocess.Popen(command, start_new_session=True) for command in commands]
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):

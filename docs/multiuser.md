@@ -115,11 +115,14 @@ granting access to an unchecked option. Removing a provider immediately blocks
 its broker route, including requests from an old worker awaiting reconciliation.
 
 Users click **Profile & provider** in the sidebar to activate any assigned
-combination. This restarts only their own runtime, preserves their saved chats,
-memory and workspace, and keeps the initiating browser signed in. Other sessions
-and streams for that account close. Source profiles are shared capabilities;
-switching them does not import original personal state or create a different
-tenant. Personal config edits remain protected by the existing conflict policy.
+combination. A prepared profile switches in place using the native Hermes
+transition: no page reload, container restart, browser preference reset or
+another login. Running sessions/jobs stay with their original profile. Source
+profiles are shared capabilities; switching them does not import original
+personal state or create a different tenant. Personal config edits remain
+protected by the existing conflict policy. Changing the account's default
+provider still reconciles its runtime and closes its other sessions/streams;
+ordinary profile browsing keeps that provider unchanged.
 
 The **Providers** tab manages gateway-held credentials; the advanced **Templates**
 editor remains available for custom capability policies. Regular users see only
@@ -133,13 +136,24 @@ Assigned profiles also appear directly in **Profiles → Assigned profiles** and
 the composer profile menu as soon as you sign in. Click a profile to open it
 directly, keeping your current assigned provider; no confirmation picker is
 required. If that provider is unavailable, the profile's allowed default (or
-first assigned provider) is used. Wait for the private agent to restart.
+first assigned provider) is used. All granted profiles are provisioned together
+so ordinary switches reuse the already running private workspace.
 **Profile & provider** remains an optional way to change the provider explicitly.
-Both entries use the same account grants as **Profile & provider**. The current
-profile shows its real skill/runtime details; inactive profiles load those
-details after activation. Shared source profiles are read-only in this view;
+Both entries use the same account grants as **Profile & provider**. Prepared
+profiles show their real skill/runtime details. Shared source profiles are read-only in this view;
 administrators change their assignments in Accounts. Additional personal
 subprofiles are listed separately and remain inside the user's private runtime.
+
+On upgrade, the existing account root home stays attached to its current
+capability, retaining its conversations, memory and personal files. Additional
+assigned profiles are created under that account's private `hermes/profiles/`
+directory using sanitized configuration and skills only; old private data is
+never copied to them. The trusted operator publishes the mapping outside the
+Agent's mounts. Back up the account homes, generated seed manifests and control
+database before this one-time provisioning update. New scheduler processes use
+separate fixed homes for each assigned profile. Credential/grant changes still
+replace the account's runtime, while switching already prepared profiles does
+not. No control database schema migration is needed for this update.
 
 Discovery imports model/response/Agent parameters, SOUL instructions and reusable
 skills, including `skills.external_dirs` located **inside the registered Hermes

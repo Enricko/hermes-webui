@@ -49,13 +49,25 @@ another profile's instructions, skills and private state never supply account
 capabilities. Existing accounts retain inherited single-profile behavior until
 an admin explicitly saves an access list.
 
-Self-service activation is an atomic server-side choice within current grants,
-bound to the authenticated session. It increments the account generation, closes
-old streams, revokes other sessions and retains only the initiating session's
-existing expiry/CSRF. Proxy admission closes while that account's runtime is
-reconciled. Concurrent admin revocation cannot be undone by a stale selection.
-Profiles are reusable capabilities; private saved state stays with the account
-when changing its active base profile. No original source-home history is copied.
+The trusted provisioner materializes every granted capability as a native private
+profile in the account's one isolated runtime. Operator-owned `profiles.json`,
+outside worker mounts, maps capability IDs to native names and the account's
+credential generation. The existing root home remains attached to its original
+capability: provisioning another profile never retags or copies its history,
+USER.md or memory. New profiles receive only sanitized capability configuration,
+SOUL and skills. Their private state stays under that account's own home.
+
+Ordinary profile activation validates current grants and uses upstream's
+cookie/request-local `/api/profile/switch`. It does not change the account
+generation, restart containers, clear browser storage or revoke other sessions.
+Existing streams/jobs retain their original profile. Each provisioned profile
+gets an official scheduler process with its own fixed home/environment. Gateway
+checks reserved profile names against authenticated grants; a cookie is never
+account identity. Stale operator mappings close proxy admission until reconciled.
+Admin credential/grant changes and changing the account default provider still
+revoke sessions/reconcile the runtime; these are separate from browsing profiles.
+The legacy selection path retains only its initiating session with unchanged
+expiry/CSRF. Concurrent revocation cannot be undone by a stale selection.
 
 The native Profiles panel and profile menu use the same authenticated assigned
 catalog as the account switcher. `/api/profiles` keeps its worker filesystem
@@ -65,7 +77,7 @@ responses cannot supply that account catalog. Assigned-profile activation uses
 the gateway selection endpoint, never a template ID as a filesystem profile
 name or identity cookie. Shared assigned profiles have no native delete action;
 personal subprofiles remain separate. The active assigned profile's detail uses
-actual worker skill counts. Inactive profiles do not invent runtime statistics.
+actual worker skill counts for each prepared profile.
 
 All assigned profiles are visible immediately from the gateway identity catalog,
 including after late native menu rendering. Clicking a profile activates it
@@ -89,6 +101,11 @@ endpoint. Same-named models remain distinct by provider. Catalog caches are
 separate for each account/connection; removing a connection rejects late catalog
 responses and closes its active inference streams. Per-account primary-provider
 selection remains independent and uses a named connection's own default model.
+Prepared profiles additionally bind their own capability ID into every model
+route. The broker revalidates both profile and provider grants and applies that
+profile's parameters/catalog policy; changing the browser's active profile
+cannot reroute another profile's ongoing inference. Catalog authority includes
+the full capability policy and profile scope, including on late responses.
 
 Authorities and lifecycle invariants:
 

@@ -25,6 +25,7 @@ from aiohttp import web
 from multiuser.broker import Brokers
 from multiuser.settings import Settings
 from multiuser.store import LoginDenied, PolicyError, RateLimited
+from multiuser.runtime_profiles import PREFIX, read_plan, selected_profile
 
 SOURCE = Path(__file__).resolve().parent.parent
 ASSETS = Path(__file__).resolve().parent / 'static'
@@ -238,11 +239,13 @@ class Gateway:
         """One server-owned catalog for identity controls and profile menus."""
         labels = {p['template_id']:p['name'] for p in self.store.discovered_profiles() if p['template_id']}
         profiles = []
+        plan = read_plan(self.settings, user)
         for tid in user['template_ids']:
             with contextlib.suppress(PolicyError):
                 template = self.store.template(tid)
                 profiles.append({'id':tid, 'name':labels.get(tid, template['name']), 'model':template['document']['model'],
-                                 'provider_id':template['document']['provider_id']})
+                                 'provider_id':template['document']['provider_id'],
+                                 **({'native_profile':plan['profiles'][tid]} if plan and tid in plan['profiles'] else {})})
         providers = [{'id':p['id'], 'name':p['name']} for p in self.store.providers()
                      if p['enabled'] and p['id'] in user['provider_ids']]
         return {'profiles':profiles, 'providers':providers}
@@ -254,13 +257,15 @@ class Gateway:
         choices = self.account_choices(user)
         labels = {p['id']:p['name'] for p in choices['profiles']}
         profile, provider = None, None
+        active_id, _native = selected_profile(user, read_plan(self.settings, user), request.cookies.get('hermes_profile'))
         if user['template_id']:
             # Identity/account controls must remain available even when a
             # disabled capability/provider prevents the Agent from starting.
             with contextlib.suppress(PolicyError):
-                template = self.store.template(user['template_id'])
+                template = self.store.template(active_id)
                 profile = {'id': template['id'], 'name': labels.get(template['id'], template['name']), 'version': template['version']}
-                selected = user['provider_id'] or template['document']['provider_id']
+                base = self.store.template(user['template_id'])
+                selected = user['provider_id'] or base['document']['provider_id']
                 configured = next((p for p in self.store.providers() if p['id'] == selected), None)
                 if configured:
                     provider = {'id': configured['id'], 'name': configured['name']}
@@ -272,6 +277,15 @@ class Gateway:
     async def select_access(self, request):
         principal = self.require(request)
         body = await object_body(request, {'template_id', 'provider_id'})
+        self.store.select_access(principal, body.get('template_id'), body.get('provider_id'), validate_only=True)
+        user = self.store.user(principal.user_id)
+        plan = read_plan(self.settings, user)
+        base = self.store.template(user['template_id'])
+        primary = user['provider_id'] or base['document']['provider_id']
+        if plan and body.get('template_id') in plan['profiles'] and body.get('provider_id') == primary:
+            _active, current = selected_profile(user, plan, request.cookies.get('hermes_profile'))
+            native = plan['profiles'][body['template_id']]
+            return json_response({'changed':native != current, 'native_profile':native})
         changed = self.store.select_access(principal, body.get('template_id'), body.get('provider_id'))
         response = json_response({'changed': changed})
         # An assigned base profile always activates the worker's default home,
@@ -428,6 +442,29 @@ class Gateway:
         runtime = self.store.runtime(uid)
         if not runtime or runtime['state'] != 'ready':
             return json_response({'error': 'Your private runtime is not ready', 'runtime_state': runtime['state'] if runtime else 'pending'}, status=503)
+        user = self.store.user(uid)
+        plan = read_plan(self.settings, user)
+        if plan is None and (self.settings.runtime_dir(uid) / 'profiles.json').exists():
+            return json_response({'error':'Assigned profiles are being updated', 'runtime_state':'starting'}, status=503)
+        _active, native_profile = selected_profile(user, plan, request.cookies.get('hermes_profile'))
+        buffered_body = None
+        if plan:
+            # Reserved capability names are not personal profile creation input.
+            # Every selector is checked against this authenticated account's map.
+            selector_keys = ('profile', 'source_profile', 'target_profile', 'clone_from')
+            selectors = [request.query.get(key) for key in selector_keys]
+            if request.method in UNSAFE and (request.content_type == 'application/json' or path.startswith('/api/profile/')):
+                buffered_body = await request.read()
+                data = json.loads(buffered_body) if buffered_body else {}
+                if isinstance(data, dict):
+                    selectors += [data.get(key) for key in selector_keys]
+                    if path.startswith('/api/profile/'):
+                        selectors.append(data.get('name'))
+                    if path.startswith('/api/profile/') and path != '/api/profile/switch' and str(data.get('name', '')).startswith(PREFIX):
+                        raise web.HTTPForbidden(text='Assigned profiles are managed by the account administrator')
+            for selector in selectors:
+                if isinstance(selector, str) and selector.startswith(PREFIX) and selector not in plan['profiles'].values():
+                    raise web.HTTPForbidden(text='Profile is not assigned to this account')
         if request.headers.get('Upgrade') or request.headers.get('Content-Encoding'):
             raise web.HTTPBadRequest(text='Unsupported proxy framing')
         if request.content_length is not None and request.content_length > self.settings.max_upload_bytes + 1024 * 1024:
@@ -437,7 +474,7 @@ class Gateway:
         headers = {key: value for key, value in request.headers.items()
                    if key.lower() in ('content-type', 'accept', 'range', 'if-none-match', 'last-event-id')}
         headers.update({'Host': '127.0.0.1:8787', 'Origin': 'http://127.0.0.1:8787', 'Accept-Encoding': 'identity'})
-        profile = request.cookies.get('hermes_profile')
+        profile = native_profile
         if profile and len(profile) < 256 and all(ch.isalnum() or ch in '._-~%' for ch in profile):
             headers['Cookie'] = 'hermes_profile=' + profile
         async def body():
@@ -448,8 +485,11 @@ class Gateway:
                     raise web.HTTPRequestEntityTooLarge(max_size=self.settings.max_upload_bytes, actual_size=size)
                 yield part
         payload = None
-        if request.can_read_body:
-            if request.content_length is None:
+        if buffered_body is not None:
+            payload = buffered_body
+            headers['Content-Length'] = str(len(payload))
+        elif request.can_read_body:
+            if request.content_length is None or (plan and request.content_type == 'application/json'):
                 payload = await request.read()
                 headers['Content-Length'] = str(len(payload))
             else:
@@ -490,8 +530,9 @@ class Gateway:
                         # Do not turn assigned IDs into filesystem profile names.
                         # Existing session/cron/file clients keep the worker list;
                         # navigation renders this separate authenticated catalog.
-                        value.update(account_profiles=[{'id':p['id'], 'name':p['name']} for p in choices['profiles']],
-                                     account_profile_id=user['template_id'], account_provider_id=None,
+                        active_id, _native = selected_profile(user, plan, request.cookies.get('hermes_profile'))
+                        value.update(account_profiles=[{k:p[k] for k in ('id', 'name', 'native_profile') if k in p} for p in choices['profiles']],
+                                     account_profile_id=active_id, account_provider_id=None,
                                      account_provider_label='Unavailable', account_provider_configured=False,
                                      account_runtime_state=runtime['state'])
                         if user['template_id']:
@@ -502,7 +543,10 @@ class Gateway:
                                 account_provider_label=provider['name'] if provider else 'Unavailable',
                                 account_provider_configured=bool(provider and provider['enabled']))
                             for row in value.get('profiles', []):
-                                if row.get('is_default'):
+                                assigned = next((p for p in choices['profiles'] if p.get('native_profile') == row.get('name')), None)
+                                if assigned:
+                                    row['account_profile_id'] = assigned['id']
+                                if row.get('is_default') or assigned:
                                     row.update(provider_managed=True, provider_configured=bool(provider and provider['enabled']),
                                         provider_label=provider['name'] if provider else 'Unavailable', account_runtime_state=runtime['state'])
                     if not self.session_current(principal):

@@ -299,7 +299,10 @@ def main(argv=None):
                         raise PolicyError('Assign a template first')
                     provisioner.stop(user['id'])
                     provisioner.prepare_directories(user['id'])
-                    kept = provisioner.seed(user['id'], store.effective_template(user), keep_private=True)
+                    kept = []
+                    for native, template in provisioner.runtime_profiles(user)[1]:
+                        kept.extend(native + '/' + name for name in provisioner.seed(user['id'], template,
+                            keep_private=True, native_name=native, scoped=True))
                     print(json.dumps({'private_files_preserved': kept}))
                     return 0
                 elif args.command == 'stop-runtime':

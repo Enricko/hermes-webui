@@ -17,6 +17,7 @@ import time
 from multiuser.settings import Settings
 from multiuser.store import PolicyError, identifier
 from multiuser.templates import relative_file, worker_config
+from multiuser.runtime_profiles import operator_plan, profile_name
 
 
 class UnixHTTP(http.client.HTTPConnection):
@@ -181,16 +182,27 @@ class Provisioner:
         directory(runtime / 'broker', s.gateway_uid, s.gateway_uid, 0o750)
         directory(runtime / 'tools', 0, 0, 0o755)
 
-    def seed(self, uid, template, *, keep_private=False):
+    def seed(self, uid, template, *, keep_private=False, native_name='default', scoped=False):
         import yaml
         s = self.settings
         home = s.user_dir(uid) / 'hermes'
-        manifest = s.runtime_dir(uid) / 'seed-manifest.json'
+        prefix = '' if native_name == 'default' else 'profiles/' + relative_file(native_name) + '/'
+        suffix = '' if native_name == 'default' else '-' + native_name
+        manifest = s.runtime_dir(uid) / ('seed-manifest' + suffix + '.json')
+        tools = s.runtime_dir(uid) / 'tools'
+        tools_path = '/shared/tools'
+        skills_path = '/shared/skills'
+        if native_name != 'default':
+            tools = s.runtime_dir(uid) / ('tools-' + native_name)
+            directory(tools, 0, 0, 0o755)
+            tools_path = '/shared/profile-tools/' + template['id']
+            skills_path = '/shared/profile-skills/' + template['id']
         previous = json.loads(manifest.read_text()) if manifest.exists() else {}
         document = template['document']
         instructions = document['agent'].get('system_message', '')
         soul = document['soul'] + ('\n\n' + instructions if instructions else '')
-        files = {'config.yaml': yaml.safe_dump(worker_config(document), sort_keys=False).encode(),
+        files = {'config.yaml': yaml.safe_dump(worker_config(document, profile_id=template.get('id') if scoped else None,
+                                                            skills_path=skills_path), sort_keys=False).encode(),
                  'SOUL.md': soul.encode()}
         for name, content in document['skills'].items():
             files['skills/' + relative_file(name)] = content.encode()
@@ -211,12 +223,12 @@ class Provisioner:
             if not script.exists():
                 script.write_bytes(content)
                 script.chmod(0o444)
-            dest = s.runtime_dir(uid) / 'tools' / filename
+            dest = tools / filename
             if dest.exists():
                 dest.unlink()
             os.link(script, dest)
-            catalog.append(f"- `/shared/tools/{filename}`: {tool['description']}")
-        for path in (s.runtime_dir(uid) / 'tools').iterdir():
+            catalog.append(f"- `{tools_path}/{filename}`: {tool['description']}")
+        for path in tools.iterdir():
             if path.name not in filenames:
                 path.unlink()
         instruction = ("# Shared tools\n\nUse the existing tools below before reimplementing a converter.\n"
@@ -227,7 +239,7 @@ class Provisioner:
         updated = dict(previous)
         conflicts = []
         for relative, content in files.items():
-            existing = private_read(home, relative)
+            existing = private_read(home, prefix + relative)
             existing_hash = hashlib.sha256(existing).hexdigest() if existing is not None else None
             desired_hash = hashlib.sha256(content).hexdigest()
             if relative in previous and desired_hash == previous[relative]:
@@ -244,15 +256,33 @@ class Provisioner:
                         # baseline while preserving the user's current bytes.
                         updated[relative] = desired_hash
                 continue
-            private_write(home, relative, content, s.worker_uid)
+            private_write(home, prefix + relative, content, s.worker_uid)
             updated[relative] = desired_hash
         manifest.write_text(json.dumps(updated, indent=2) + '\n')
         manifest.chmod(0o600)
         return conflicts
 
+    def runtime_profiles(self, user):
+        previous = operator_plan(self.settings, user)
+        anchor = previous['anchor'] if previous else user['template_id']
+        primary = self.store.effective_template(user)['document']['provider_id']
+        profiles = []
+        for tid in user['template_ids']:
+            try:
+                self.store.template(tid)
+            except PolicyError:
+                if tid == user['template_id']:
+                    raise
+                continue
+            template = self.store.effective_template({**user, 'template_id':tid}, primary)
+            profiles.append((('default' if tid == anchor else profile_name(tid)), template))
+        return anchor, profiles
+
     def generation(self, user, template):
-        versions = [(tid, self.store.tool(tid)['version']) for tid in template['document']['tools']]
-        value = [user['auth_version'], template['id'], template['version'], versions,
+        anchor, profiles = self.runtime_profiles(user)
+        versions = [(native, doc, [(tid, self.store.tool(tid)['version']) for tid in doc['document']['tools']])
+                    for native, doc in profiles]
+        value = ['native-profiles-v1', user['auth_version'], anchor, versions,
                  self.settings.runtime_image, self.settings.relay_image,
                  self.settings.gateway_uid, self.settings.worker_uid, self.settings.relay_uid,
                  self.settings.worker_memory, self.settings.worker_cpus]
@@ -285,16 +315,14 @@ class Provisioner:
         self.admit_relay(uid, generation, actual_relay)
         worker = self.common(uid, generation, s.worker_memory, s.worker_cpus) + [
             '--name', worker_name, '--network', 'container:' + actual_relay['Id'],
-            '--user', f'{s.worker_uid}:{s.worker_uid}', '--shm-size', '128m']
+            '--user', f'{s.worker_uid}:{s.worker_uid}', '--shm-size', '128m',
+            '--env', 'HERMES_MULTIUSER_PROFILE_NAMES=' + ','.join(native for native, _doc in self.runtime_profiles(self.store.user(uid))[1])]
         user = s.user_dir(uid)
         for source, destination in [('hermes', '/state/hermes'), ('workspace', '/workspace'),
                                     ('tmp', '/tmp'), ('outputs', '/outputs')]:
             worker += self.mount(user / source, destination)
-        worker += self.mount(s.runtime_dir(uid) / 'tools', '/shared/tools', readonly=True)
-        bundle = template['document'].get('skill_bundle_id')
-        if bundle:
-            from multiuser.profile import bundle_path
-            worker += self.mount(bundle_path(s, bundle), '/shared/skills', readonly=True)
+        for destination, source in self.profile_mounts(self.store.user(uid)).items():
+            worker += self.mount(source, destination, readonly=True)
         self.docker('create', *worker, s.runtime_image)
         self.admit_worker(uid, generation, self.inspect(worker_name), actual_relay, template=template, running=False)
         self.docker('start', worker_name)
@@ -345,15 +373,26 @@ class Provisioner:
         self.base_admission(uid, generation, actual, s.runtime_image, f'{s.worker_uid}:{s.worker_uid}', running=running)
         if actual['HostConfig']['NetworkMode'] != 'container:' + relay['Id']:
             raise PolicyError("Worker must use only its own relay's loopback namespace")
+        profiles = ','.join(native for native, _doc in self.runtime_profiles(self.store.user(uid))[1])
+        if 'HERMES_MULTIUSER_PROFILE_NAMES=' + profiles not in actual['Config']['Env']:
+            raise PolicyError('Worker scheduler profile scope does not match account grants')
         expected = {dst: (str(s.user_dir(uid) / src), True) for src, dst in [
             ('hermes', '/state/hermes'), ('workspace', '/workspace'), ('tmp', '/tmp'), ('outputs', '/outputs')]}
-        expected['/shared/tools'] = (str(s.runtime_dir(uid) / 'tools'), False)
-        template = template if template is not None else self.store.effective_template(self.store.user(uid))
-        bundle = template['document'].get('skill_bundle_id')
-        if bundle:
-            from multiuser.profile import bundle_path
-            expected['/shared/skills'] = (str(bundle_path(s, bundle)), False)
+        expected.update({dst:(str(src), False) for dst, src in self.profile_mounts(self.store.user(uid)).items()})
         self.mounts_admission(actual, expected)
+
+    def profile_mounts(self, user):
+        from multiuser.profile import bundle_path
+        mounts = {}
+        _anchor, profiles = self.runtime_profiles(user)
+        for native, template in profiles:
+            tid = template['id']
+            tools = 'tools' if native == 'default' else 'tools-' + native
+            mounts['/shared/tools' if native == 'default' else '/shared/profile-tools/' + tid] = self.settings.runtime_dir(user['id']) / tools
+            bundle = template['document'].get('skill_bundle_id')
+            if bundle:
+                mounts['/shared/skills' if native == 'default' else '/shared/profile-skills/' + tid] = bundle_path(self.settings, bundle)
+        return mounts
 
     def reconcile_user(self, user):
         uid = user['id']
@@ -373,7 +412,10 @@ class Provisioner:
         else:
             self.stop(uid)
             self.prepare_directories(uid)
-            conflicts = self.seed(uid, template)
+            anchor, profiles = self.runtime_profiles(user)
+            conflicts = []
+            for native, capability in profiles:
+                conflicts.extend(native + '/' + name for name in self.seed(uid, capability, native_name=native, scoped=True))
             if conflicts:
                 self.store.set_runtime(uid, generation, 'template_conflict', error='Private edits preserved: ' + ', '.join(conflicts))
                 return
@@ -396,6 +438,13 @@ class Provisioner:
             return
         finally:
             client.close()
+        anchor, profiles = self.runtime_profiles(user)
+        plan = {'auth_version':user['auth_version'], 'anchor':anchor,
+                'profiles':{doc['id']:native for native, doc in profiles}}
+        path = self.settings.runtime_dir(uid) / 'profiles.json'
+        temp = path.with_suffix('.json.tmp')
+        temp.write_text(json.dumps(plan) + '\n'); temp.chmod(0o644)
+        os.replace(temp, path)
         self.store.set_runtime(uid, generation, 'ready', worker['Id'], relay['Id'])
 
     def reconcile(self):

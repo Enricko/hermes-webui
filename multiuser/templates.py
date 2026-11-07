@@ -114,11 +114,12 @@ def validate_template(value):
     return out
 
 
-def worker_config(template):
+def worker_config(template, *, profile_id=None, skills_path='/shared/skills'):
     """Shared secrets and legacy personal/integration state cannot enter this output."""
     document = validate_template(template)
+    lane = ('http://127.0.0.1:8000/profiles/' + identifier(profile_id) if profile_id else 'http://127.0.0.1:8000')
     model = {'provider': 'custom', 'default': document['model'],
-             'base_url': 'http://127.0.0.1:8000/v1',
+             'base_url': lane + '/providers/' + document['provider_id'] + '/v1' if profile_id else lane + '/v1',
              'api_key': 'tenant-broker', 'api_mode': 'chat_completions'}
     parameters = document['parameters']
     if 'context_length' in parameters:
@@ -135,7 +136,7 @@ def worker_config(template):
               'terminal': {'backend': 'local', 'cwd': '/workspace'},
               'max_turns': agent['max_turns']}
     if document.get('skill_bundle_id'):
-        config['skills'] = {'external_dirs': ['/shared/skills']}
+        config['skills'] = {'external_dirs': [skills_path]}
     if document['connections']:
         # Bind the default lane to an explicit account-primary identity.
         # Otherwise a named router advertising the same model ID can win the
@@ -144,6 +145,6 @@ def worker_config(template):
         config['custom_providers'] = [{'name': 'Account primary', 'model': document['model'],
             'base_url': model['base_url'], 'api_key': 'tenant-broker', 'discover_models': True}]
         config['custom_providers'] += [{'name': entry['name'], 'model': entry['model'],
-            'base_url': 'http://127.0.0.1:8000/providers/' + entry['provider_id'] + '/v1',
+            'base_url': lane + '/providers/' + entry['provider_id'] + '/v1',
             'api_key': 'tenant-broker', 'discover_models': True} for entry in document['connections']]
     return config

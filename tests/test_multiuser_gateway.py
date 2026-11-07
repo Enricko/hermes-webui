@@ -66,6 +66,11 @@ async def gateway(unused_tcp_port):
                     {'name':'private-work', 'is_default':False}],
                     'account_profiles':[{'id':'f'*32, 'name':'Forged worker profile'}],
                     'account_profile_id':'f'*32})
+            if request.path == '/api/profile/switch':
+                name = (await request.json())['name']
+                response = web.json_response({'active':name, 'is_default':name == 'default'})
+                response.set_cookie('hermes_profile', name, path='/')
+                return response
             return web.json_response({'owner': owner, 'sessions': [{'id': 'private-' + owner}]},
                                      headers={'Cache-Control': 'public, max-age=31536000'})
         backend.router.add_route('*', '/{path:.*}', handler)
@@ -238,6 +243,56 @@ async def test_independent_grants_self_selection_and_old_stream_generation_are_e
         assert response.status == 503  # No admission of the previous active runtime.
     assert store.user(users[2]['id'])['template_id'] == ta
     stream_a.close(); stream_b.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_profile_switch_preserves_runtime_sessions_and_old_streams(gateway, monkeypatch):
+    settings, store, server, login, users, received = gateway
+    provider = store.put_provider('Router', 'http://127.0.0.1:1/v1', 'synthetic-key')
+    a = store.put_template('A', {'provider_id':provider,'model':'base'})
+    b = store.put_template('B', {'provider_id':provider,'model':'base'})
+    for user, tids in [(users[1],[a,b]),(users[2],[a])]:
+        store.update_user(user['id'], template_ids=tids, provider_ids=[provider], template_id=a, assign_template=True)
+    def plan(_settings, user):
+        return {'anchor':a, 'auth_version':user['auth_version'], 'profiles':{
+            tid:('default' if tid == a else 'assigned-'+tid) for tid in user['template_ids']}}
+    monkeypatch.setattr('multiuser.gateway.read_plan', plan)
+    alice, csrf = await login('alice'); bob, _ = await login('bobby')
+    other, _ = await login('alice')
+    before = store.user(users[1]['id']); runtime = store.runtime(users[1]['id'])
+    headers = {'Origin':settings.origin, 'X-Hermes-CSRF-Token':csrf}
+    stream = await alice.get(server.make_url('/api/stream'))
+    await stream.content.readuntil(b'\n\n')
+    async with alice.post(server.make_url('/multiuser/api/selection'), json={'template_id':b,'provider_id':provider}, headers=headers) as response:
+        assert response.status == 200 and (await response.json()) == {'changed':True,'native_profile':'assigned-'+b}
+    async with alice.post(server.make_url('/api/profile/switch'), json={'name':'assigned-'+b}, headers=headers) as response:
+        assert response.status == 200 and (await response.json())['active'] == 'assigned-'+b
+    assert received[users[1]['id']][-1]['headers']['Cookie'] == 'hermes_profile=default'
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        assert (await response.json())['profile']['id'] == b
+    assert store.user(users[1]['id']) == before and store.runtime(users[1]['id']) == runtime
+    async with other.get(server.make_url('/api/sessions')) as response:
+        assert response.status == 200
+    assert users[1]['id'].encode() in await asyncio.wait_for(stream.content.readuntil(b'\n\n'), 2)
+    stream.close()
+    for client, bad_cookie in [(bob,'assigned-'+b), (alice,'assigned%252d'+'f'*32)]:
+        jar = aiohttp.CookieJar(unsafe=True)
+        jar.update_cookies(client.cookie_jar.filter_cookies(server.make_url('/')), response_url=server.make_url('/'))
+        jar.update_cookies({'hermes_profile':bad_cookie}, response_url=server.make_url('/'))
+        async with aiohttp.ClientSession(cookie_jar=jar) as forged:
+            async with forged.get(server.make_url('/api/profiles')) as response:
+                assert response.status in (400,403)
+    async with bob.get(server.make_url('/api/sessions?profile=assigned-'+b)) as response:
+        assert response.status == 403
+    raw_client, b_csrf = await login('bobby')
+    async with raw_client.post(server.make_url('/api/profile/switch'), data=json.dumps({'name':'assigned-'+b}),
+                            headers={'Origin':settings.origin, 'X-Hermes-CSRF-Token':b_csrf, 'Content-Type':'text/plain'}) as response:
+        assert response.status == 403
+    async with alice.post(server.make_url('/api/profile/delete'), json={'name':'assigned-'+b}, headers=headers) as response:
+        assert response.status == 403
+    store.update_user(users[1]['id'], template_ids=[a], provider_ids=[provider])
+    async with alice.get(server.make_url('/api/sessions')) as response:
+        assert response.status == 401
 
 
 @pytest.mark.asyncio
