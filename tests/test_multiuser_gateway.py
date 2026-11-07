@@ -63,7 +63,7 @@ async def gateway(unused_tcp_port):
                 # A worker cannot supply account identity or an assigned catalog.
                 return web.json_response({'active':'default', 'profiles':[
                     {'name':'default', 'is_default':True, 'total_skills':3, 'enabled_skills':3},
-                    {'name':'private-work', 'is_default':False}],
+                    {'name':'private-work', 'is_default':False}] + received.get('_extra_native_profiles', []),
                     'account_profiles':[{'id':'f'*32, 'name':'Forged worker profile'}],
                     'account_profile_id':'f'*32})
             if request.path == '/api/profile/switch':
@@ -257,6 +257,7 @@ async def test_prepared_profile_switch_preserves_runtime_sessions_and_old_stream
         return {'anchor':a, 'auth_version':user['auth_version'], 'profiles':{
             tid:('default' if tid == a else 'assigned-'+tid) for tid in user['template_ids']}}
     monkeypatch.setattr('multiuser.gateway.read_plan', plan)
+    received['_extra_native_profiles'] = [{'name':'assigned-'+b,'is_default':False}]
     alice, csrf = await login('alice'); bob, _ = await login('bobby')
     other, _ = await login('alice')
     before = store.user(users[1]['id']); runtime = store.runtime(users[1]['id'])
@@ -290,6 +291,14 @@ async def test_prepared_profile_switch_preserves_runtime_sessions_and_old_stream
         assert response.status == 403
     async with alice.post(server.make_url('/api/profile/delete'), json={'name':'assigned-'+b}, headers=headers) as response:
         assert response.status == 403
+    document = store.template(b)['document']
+    store.put_template('B', document, template_id=b, enabled=False)
+    async with alice.get(server.make_url('/api/sessions')) as response:
+        assert response.status == 403  # Disabled before its old mapping/mounts are replaced.
+    async with other.get(server.make_url('/api/profiles')) as response:
+        data = await response.json()
+        assert response.status == 200
+        assert 'assigned-'+b not in [row['name'] for row in data['profiles']]
     store.update_user(users[1]['id'], template_ids=[a], provider_ids=[provider])
     async with alice.get(server.make_url('/api/sessions')) as response:
         assert response.status == 401

@@ -319,7 +319,16 @@
     });
   }
   async function applySelection(profileId, providerId) {
-    const value = await request('/multiuser/api/selection', {template_id:profileId, provider_id:providerId});
+    const value = await request('/multiuser/api/selection', {template_id:profileId, provider_id:providerId, native:true});
+    if (value.native_profile) {
+      // Reuse upstream's guarded in-page transition: streams keep their owning
+      // profile, while sessions/files/models/skills refresh for the new one.
+      if (typeof switchToProfile !== 'function') throw new Error('Profile controls are not ready. Please retry.');
+      if (!await switchToProfile(value.native_profile)) throw new Error('Profile switch did not complete. Please retry.');
+      await refreshIdentity();
+      if (typeof loadProfilesPanel === 'function') await loadProfilesPanel();
+      return false;
+    }
     const personalProfile = typeof S !== 'undefined' && S.activeProfile && S.activeProfile !== 'default';
     if (value.changed || personalProfile) {
       localStorage.clear(); sessionStorage.clear(); location.assign('/');
@@ -363,7 +372,7 @@
     const header = element('div', undefined, 'mu-dialog-header');
     header.append(title, button('Close', () => modal.close())); modal.append(header);
     const content = element('div', undefined, 'mu-selection-body'); modal.append(content);
-    content.append(element('p', 'Choose from the access assigned to you. Switching restarts your private agent setup; saved chats and files stay available.', 'mu-help'));
+    content.append(element('p', 'Profiles open in place. Changing your account default provider prepares the workspace again; saved chats and files stay available.', 'mu-help'));
     const profiles = picker(content, 'active-profile', 'Profile', identity.choices.profiles.map(p => ({id:p.id, name:p.name, description:'Agent instructions and skills'})),
       [profileId || identity.profile?.id], profileId || identity.profile?.id, false);
     const providers = picker(content, 'active-provider', 'AI provider', identity.choices.providers,
@@ -400,8 +409,9 @@
     const profile = data && assignedProfiles(data).find(p => p.id === id);
     if (!profile || typeof _renderProfileDetail !== 'function') return false;
     const current = id === data.account_profile_id;
-    const active = current && (data.active || 'default') === 'default';
-    const local = current && Array.isArray(data.profiles) ? data.profiles.find(p => p.is_default) : null;
+    const native = profile.native_profile || 'default';
+    const active = current && (data.active || 'default') === native;
+    const local = (current || profile.native_profile) && Array.isArray(data.profiles) ? data.profiles.find(p => p.name === native) : null;
     const detail = {...local, name:profile.name, is_default:false, account_profile_id:id,
       account_profile_active:active, provider_managed:true, provider_configured:data.account_provider_configured,
       provider_label:data.account_provider_label, account_runtime_state:current ? data.account_runtime_state : 'inactive'};
@@ -420,7 +430,7 @@
     section.dataset.catalog = JSON.stringify([data.account_profiles, data.account_profile_id, data.active]);
     section.append(element('div', 'Assigned profiles', 'mu-profile-section-label'));
     for (const profile of assignedProfiles(data)) {
-      const active = profile.id === data.account_profile_id && (data.active || 'default') === 'default';
+      const active = profile.id === data.account_profile_id && (data.active || 'default') === (profile.native_profile || 'default');
       const card = element('div', undefined, 'profile-card'); card.dataset.accountProfile = profile.id;
       card.tabIndex = 0; card.setAttribute('role', 'button');
       const name = element('div', profile.name, 'profile-card-name' + (active ? ' is-active' : ''));
@@ -433,7 +443,7 @@
       });
       section.append(card);
     }
-    if (data.profiles?.some(p => !p.is_default)) section.append(element('div', 'Personal profiles', 'mu-profile-section-label'));
+    if (data.profiles?.some(p => !p.is_default && !p.account_profile_id)) section.append(element('div', 'Personal profiles', 'mu-profile-section-label'));
     panel.append(section);
     return true;
   }
@@ -448,14 +458,22 @@
       });
       row.className = 'profile-opt mu-assigned-profile-option'; row.dataset.accountProfile = profile.id;
       row.append(element('div', profile.name, 'profile-opt-name'));
-      const active = profile.id === data.account_profile_id && (data.active || 'default') === 'default';
+      const active = profile.id === data.account_profile_id && (data.active || 'default') === (profile.native_profile || 'default');
       if (active) { row.classList.add('active'); row.append(element('small', 'Active', 'profile-opt-meta')); }
       container.append(row);
     }
     return true;
   }
+  function syncProfileLabels(name) {
+    const native = name || (typeof S !== 'undefined' && S.activeProfile) || 'default';
+    const profile = identity?.choices.profiles.find(p => p.native_profile === native);
+    if (profile) for (const id of ['profileChipLabel', 'titlebarProfileLabel']) {
+      const node = document.getElementById(id);
+      if (node) node.textContent = profile.name;
+    }
+  }
   window.HermesAccountProfiles = Object.freeze({render:renderAssignedProfiles, renderDropdown:renderAssignedDropdown,
-    refresh:id => selectAssignedProfile(id, undefined, false), activate:activateAssignedProfile});
+    refresh:id => selectAssignedProfile(id, undefined, false), activate:activateAssignedProfile, syncLabels:syncProfileLabels});
   function syncAssignedNavigation() {
     const panel = document.getElementById('profilesPanel');
     if (!panel || !identity?.choices) return;
@@ -482,6 +500,7 @@
         'Your private workspace is starting. You can keep this page open.';
     }
     syncAssignedNavigation();
+    syncProfileLabels();
   }
   async function boot() {
     try {

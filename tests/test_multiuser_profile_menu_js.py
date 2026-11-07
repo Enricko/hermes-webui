@@ -103,3 +103,30 @@ vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'
     config = dict(current=current, preferred=preferred, allowed=allowed, expected=expected)
     result = subprocess.run([node, '-e', script, str(source), json.dumps(config)], capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == {'posts': 1 if expected else 0}
+
+
+def test_prepared_profile_uses_native_transition_without_navigation_or_storage_reset():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the real frontend lifecycle helper')
+    source = Path(__file__).resolve().parents[1] / 'multiuser/static/client.js'
+    script = r'''
+const fs=require('fs'),vm=require('vm'),a='a'.repeat(32),b='b'.repeat(32),p='c'.repeat(32);
+let active=a,switches=0,refreshes=0;
+const fail=()=>{throw Error('Native switch reloaded the document or reset browser preferences');};
+const context={window:{},document:{readyState:'loading',addEventListener(){},getElementById:()=>null},
+  S:{activeProfile:'default'},localStorage:{clear:fail},sessionStorage:{clear:fail},location:{assign:fail,replace:fail},
+  fetch:async path=>({ok:true,json:async()=>path==='/multiuser/api/me'?{
+    csrf_token:'csrf',profile:{id:active},provider:{id:p},runtime:{state:'ready'},
+    choices:{profiles:[{id:a,name:'A',native_profile:'default'},{id:b,name:'B',native_profile:'assigned-'+b}],providers:[{id:p}]}
+  }:{changed:true,native_profile:'assigned-'+b}}),
+  switchToProfile:async name=>{if(name!=='assigned-'+b)throw Error('Wrong native target');switches++;active=b;context.S.activeProfile=name;return true;},
+  loadProfilesPanel:async()=>refreshes++};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+context.window.HermesAccountProfiles.activate(b).then(()=>{
+ if(switches!==1||refreshes!==1)throw Error('Native state refresh was skipped');
+ console.log('pass');
+}).catch(e=>{console.error(e);process.exitCode=1;});
+'''
+    result = subprocess.run([node, '-e', script, str(source)], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'pass'

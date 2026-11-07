@@ -15561,6 +15561,7 @@ function syncTopbar(){
     if(_profileLabel) _profileLabel.textContent=S.activeProfile||'default';
     const _titleLabel=$('titlebarProfileLabel');
     if(_titleLabel) _titleLabel.textContent=S.activeProfile||'default';
+    if(typeof window!=='undefined') window.HermesAccountProfiles?.syncLabels?.();
     if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
     return;
   }
@@ -15689,6 +15690,7 @@ function syncTopbar(){
   if(profileLabel) profileLabel.textContent=S.activeProfile||'default';
   const titleLabel=$('titlebarProfileLabel');
   if(titleLabel) titleLabel.textContent=S.activeProfile||'default';
+  if(typeof window!=='undefined') window.HermesAccountProfiles?.syncLabels?.();
   if(typeof _syncProviderQuotaForActiveContext==='function') _syncProviderQuotaForActiveContext();
 }
 

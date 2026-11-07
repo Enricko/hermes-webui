@@ -26,6 +26,7 @@ async def run():
     lab = Lab(os.environ['HERMES_MULTIUSER_TEST_IMAGES'], evidence)
     failures = []
     statuses = []
+    profile_switch_seconds = []
     try:
         await lab.start()
         # Reproduce the real report: an admin has a second assigned profile,
@@ -87,6 +88,24 @@ async def run():
                     await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').wait_for(state='visible')
                     assert await page.locator('#profilesPanel [data-account-profile]').count() == 2
                     assert await page.locator('#profilesPanel [data-name="default"]').count() == 0
+                    # Both directions use the same document, browser preferences
+                    # and admitted worker. No reconcile call may hide a restart.
+                    before_runtime = lab.runtime('administrator')['runtime_id']
+                    before_version = lab.store.user(lab.users['administrator']['id'])['auth_version']
+                    await page.evaluate('() => {window.__nativeSwitchCanary="same-document";localStorage.setItem("native-switch-preference","keep");}')
+                    for target, name in [(lab.discovered_template, 'writer'), (lab.template, 'default')]:
+                        if width <= 640 and not await page.evaluate('() => document.querySelector(".sidebar").classList.contains("mobile-open")'):
+                            await page.locator('#btnHamburger').click()
+                        started = time.monotonic()
+                        await page.locator(f'#profilesPanel [data-account-profile="{target}"]').click()
+                        await page.locator('#profileDetailTitle').get_by_text('Installed Hermes / '+name, exact=True).wait_for()
+                        duration = time.monotonic() - started
+                        profile_switch_seconds.append({'viewport':width, 'target':name, 'seconds':round(duration,3)})
+                        assert duration < 10
+                        assert await page.evaluate('() => window.__nativeSwitchCanary === "same-document" && localStorage.getItem("native-switch-preference") === "keep"')
+                        assert lab.runtime('administrator')['runtime_id'] == before_runtime
+                        assert lab.store.user(lab.users['administrator']['id'])['auth_version'] == before_version
+                        assert await page.locator('#mu-waiting-title').count() == 0
                     await page.goto(lab.origin + '/')
                     if not await page.locator('.nav-tab[data-panel="chat"]:visible').count():
                         await page.locator('#btnHamburger').click()
@@ -294,14 +313,14 @@ async def run():
                 async with page.expect_response(lambda r: '/multiuser/api/selection' in r.url) as switched:
                     await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
                 assert (await switched.value).status == 200
-                assert (await switched.value).request.post_data_json == {'template_id':lab.discovered_template, 'provider_id':lab.provider}
-                await lab.ready(['alice'])
+                assert (await switched.value).request.post_data_json == {'template_id':lab.discovered_template, 'provider_id':lab.provider, 'native':True}
                 await page.wait_for_function('() => Boolean(document.querySelector("#mu-base-profile")?.textContent.includes("Installed Hermes / writer"))', timeout=60000)
-                await page.locator('#msg').wait_for(state='visible')
+                await page.locator('#profileDetailTitle').get_by_text('Installed Hermes / writer', exact=True).wait_for()
                 assert '/login' not in page.url
                 assert await page.locator('.mu-selection-dialog').count() == 0
                 assert 'my saved work' in await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/profile-switch-canary").read_text())')
-                await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
+                if not await page.locator('#profilesPanel').is_visible():
+                    await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
                 current_profile = page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]')
                 await current_profile.locator('.mu-profile-active').wait_for(state='visible')
                 await current_profile.click()
@@ -312,6 +331,16 @@ async def run():
                 status, bob_profiles = await lab.api('bobby', '/api/profiles')
                 assert status == 200 and [p['id'] for p in bob_profiles['account_profiles']] == [lab.template]
                 await page.screenshot(path=str(evidence / 'regular-user-switched-profile.png'))
+                await page.locator('.nav-tab[data-panel="chat"]:visible').first.click()
+                before_requests = len(lab.model.requests)
+                await page.locator('#msg').fill('Chat with the prepared writer profile')
+                await page.locator('#btnSend').click()
+                await page.locator('#messages').get_by_text('Hello from your private Hermes runtime.', exact=True).first.wait_for(timeout=60000)
+                # Title/summary calls can follow a chat reply. Check the actual
+                # tool-capable Agent request rather than whichever auxiliary
+                # request happens to finish last.
+                turns = [r for r in lab.model.requests[before_requests:] if r['tools']]
+                assert turns and all(r['temperature'] == 0.45 and r['user_id'] == lab.users['alice']['id'] for r in turns)
                 await context.close()
                 assert not failures, failures
                 assert not statuses, statuses
@@ -330,6 +359,8 @@ async def run():
             'assigned_profiles_in_primary_panel_and_dropdown': True,
             'one_click_activation_preserves_current_provider_without_picker': True,
             'identity_restores_full_assigned_catalog_after_late_native_render': True,
+            'native_switch_keeps_document_preferences_container_and_auth_generation': True,
+            'native_profile_switch_seconds': profile_switch_seconds,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

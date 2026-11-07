@@ -278,13 +278,61 @@ async def test_independent_multi_profile_provider_grants_in_real_workers(lab):
         status, _ = await lab.api('bobby', '/multiuser/api/selection', {'template_id':lab.discovered_template, 'provider_id':first})
         assert status == 400
         await lab.execute('alice', 'from pathlib import Path;Path("/workspace/multi-access-canary").write_text("private A")')
-        status, _ = await lab.api('alice', '/multiuser/api/selection', {'template_id':lab.discovered_template, 'provider_id':first})
+        before = lab.runtime('alice'); version = lab.store.user(lab.users['alice']['id'])['auth_version']
+        status, selected = await lab.api('alice', '/multiuser/api/selection', {'template_id':lab.discovered_template, 'provider_id':first, 'native':True})
+        assert status == 200 and selected['native_profile'] == 'assigned-'+lab.discovered_template
+        status, _ = await lab.api('alice', '/api/profile/switch', {'name':selected['native_profile']})
         assert status == 200
-        await lab.ready(['alice'])
+        assert lab.runtime('alice')['runtime_id'] == before['runtime_id']
+        assert lab.store.user(lab.users['alice']['id'])['auth_version'] == version
         status, me = await lab.api('alice', '/multiuser/api/me')
         assert status == 200 and me['profile']['id'] == lab.discovered_template and me['provider']['id'] == first
         assert 'Original named writer profile' in await lab.execute('alice', 'from pathlib import Path;'
-            'assert Path("/workspace/multi-access-canary").read_text()=="private A";print(Path("/state/hermes/SOUL.md").read_text())')
+            'assert Path("/workspace/multi-access-canary").read_text()=="private A";print(Path("/state/hermes/profiles/'+selected['native_profile']+'/SOUL.md").read_text())')
+        # A real running inference stays bound to its old native profile while
+        # the browser changes context; cancellation still resolves its owner.
+        status, _ = await lab.api('alice', '/api/profile/switch', {'name':'default'})
+        assert status == 200
+        lab.model.waiting.pop(lab.users['alice']['id'], None); lab.model.release.pop(lab.users['alice']['id'], None)
+        sid = await lab.session('alice'); stream = await lab.start_chat('alice', sid, 'BLOCK_FOR_CANCEL')
+        for _ in range(60):
+            if lab.model.waiting.get(lab.users['alice']['id'], asyncio.Event()).is_set():
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AssertionError('Agent did not start the old-profile stream')
+        status, _ = await lab.api('alice', '/api/profile/switch', {'name':selected['native_profile']})
+        assert status == 200
+        status, running = await lab.api('alice', '/api/chat/stream/status?stream_id='+stream)
+        assert status == 409 and running['code'] == 'session_profile_mismatch'
+        status, _ = await lab.api('alice', '/api/profile/switch', {'name':'default'})
+        assert status == 200
+        status, running = await lab.api('alice', '/api/chat/stream/status?stream_id='+stream)
+        assert status == 200 and running['active']
+        status, cancelled = await lab.api('bobby', '/api/chat/cancel?stream_id='+stream)
+        assert status == 200 and not cancelled['cancelled']
+        status, cancelled = await lab.api('alice', '/api/chat/cancel?stream_id='+stream)
+        assert status == 200 and cancelled['cancelled']
+        lab.model.release[lab.users['alice']['id']].set()
+        assert lab.runtime('alice')['runtime_id'] == before['runtime_id']
+        # The immutable worker starts an official scheduler process for each
+        # provisioned profile, with a fixed home per process (no shared env).
+        code = '''from pathlib import Path
+import json
+rows=[]
+for proc in Path('/proc').iterdir():
+ try:
+  args=(proc/'cmdline').read_bytes().split(b'\\0')
+  if b'--cron' not in args or b'--profile' not in args: continue
+  name=args[args.index(b'--profile')+1].decode()
+  env=dict(part.split(b'=',1) for part in (proc/'environ').read_bytes().split(b'\\0') if b'=' in part)
+  rows.append({'profile':name,'home':env[b'HERMES_HOME'].decode()})
+ except (OSError,KeyError,ValueError): pass
+print(json.dumps(rows))'''
+        scopes = json.loads(await lab.execute('alice', code))
+        assert {'profile':'default','home':'/state/hermes'} in scopes
+        assert {'profile':selected['native_profile'],'home':'/state/hermes/profiles/'+selected['native_profile']} in scopes
+        lab.results['native_switch_same_runtime_live_stream_cancel_and_fixed_scheduler_homes'] = True
         status, _ = await lab.api('bobby', '/multiuser/api/selection', {'template_id':lab.template, 'provider_id':second})
         assert status == 200
         await lab.ready(['bobby'])
@@ -359,11 +407,15 @@ async def test_discovered_named_profile_assignment_keeps_private_state_and_origi
     await lab.ready(['bobby'])
     await lab.login('bobby', fresh=True)
     try:
+        status, info = await lab.api('bobby', '/multiuser/api/me')
+        assert status == 200
+        native = next(p['native_profile'] for p in info['choices']['profiles'] if p['id'] == lab.discovered_template)
+        home = '/state/hermes' if native == 'default' else '/state/hermes/profiles/'+native
         proof = await lab.execute('bobby', 'from pathlib import Path;'
             'assert Path("/workspace/before-profile-assignment").read_text()=="my-private-work";'
-            'assert not Path("/state/hermes/USER.md").exists();'
-            'assert "original private" not in Path("/state/hermes/SOUL.md").read_text();'
-            'print(Path("/state/hermes/SOUL.md").read_text())')
+            'assert not Path('+repr(home+'/USER.md')+').exists();'
+            'assert "original private" not in Path('+repr(home+'/SOUL.md')+').read_text();'
+            'print(Path('+repr(home+'/SOUL.md')+').read_text())')
         assert 'Original named writer profile' in proof
         assert (lab.profile_source / 'profiles/writer/state.db').read_text().startswith('original private conversations')
         sid = await lab.session('bobby')

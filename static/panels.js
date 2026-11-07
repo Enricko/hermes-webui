@@ -7389,7 +7389,7 @@ async function loadProfilesPanel() {
       ? S.activeProfile
       : (data.active || 'default');
     for (const p of data.profiles || []) {
-      if (accountProfiles && p.is_default) continue;
+      if (accountProfiles && (p.is_default || p.account_profile_id)) continue;
       const card = document.createElement('div');
       card.className = 'profile-card';
       card.dataset.name = p.name;
@@ -7586,7 +7586,7 @@ function renderProfileDropdown(data) {
     : (data.active || 'default');
   const profiles = allProfiles.filter(p => p && (p.visible !== false || p.name === active));
   for (const p of profiles) {
-    if (accountProfiles && p.is_default) continue;
+    if (accountProfiles && (p.is_default || p.account_profile_id)) continue;
     const opt = document.createElement('div');
     opt.className = 'profile-opt' + (p.name === active ? ' active' : '');
     const meta = [];
@@ -7615,6 +7615,7 @@ function renderProfileDropdown(data) {
   // Sync titlebar label to the resolved active profile
   const tbl = $('titlebarProfileLabel');
   if (tbl) tbl.textContent = active;
+  if (typeof window !== 'undefined') window.HermesAccountProfiles?.syncLabels?.(active);
 }
 
 function toggleProfileDropdown(e) {
@@ -8095,6 +8096,7 @@ async function switchToProfile(name) {
     return false;
   } finally {
     if (_reasoningSwitchHeld) _endReasoningProfileSwitch();
+    if (_switchGen === _profileSwitchGeneration && typeof window !== 'undefined') window.HermesAccountProfiles?.syncLabels?.();
     // Always remove loading indicator regardless of success or failure
     if (_switchGen === _profileSwitchGeneration && _chip) { _chip.classList.remove('switching'); _chip.disabled = false; }
     if (_switchGen === _profileSwitchGeneration && _titlebarBtn) { _titlebarBtn.classList.remove('switching'); _titlebarBtn.disabled = false; }

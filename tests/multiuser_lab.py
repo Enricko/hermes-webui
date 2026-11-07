@@ -132,7 +132,8 @@ class Lab:
             'custom_providers': configured, 'agent': {'max_turns': 20}}
         (self.profile_source / 'config.yaml').write_text(yaml.safe_dump(source_config))
         named = self.profile_source / 'profiles' / 'writer'; named.mkdir(parents=True)
-        (named / 'config.yaml').write_text(yaml.safe_dump(source_config))
+        writer_config = {**source_config, 'model':{**source_config['model'], 'temperature':0.45}}
+        (named / 'config.yaml').write_text(yaml.safe_dump(writer_config))
         (named / 'SOUL.md').write_text('Original named writer profile')
         (named / 'state.db').write_text('original private conversations must never be imported')
         (named / 'USER.md').write_text('original private user information')
@@ -213,8 +214,10 @@ class Lab:
         return data['session']['session_id']
 
     async def start_chat(self, name, sid, text):
+        status, profiles = await self.api(name, '/api/profiles')
+        assert status == 200
         status, data = await self.api(name, '/api/chat/start', {'session_id': sid, 'message': text,
-            'model': 'fixture-model', 'model_provider': 'custom', 'profile': 'default', 'workspace': '/workspace'})
+            'model': 'fixture-model', 'model_provider': 'custom', 'profile': profiles['active'], 'workspace': '/workspace'})
         assert status == 200, data
         return data['stream_id']
 

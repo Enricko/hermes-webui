@@ -22,7 +22,7 @@ class ModelFixture:
         uid = payload.get('user')
         self.requests.append({'user_id': uid, 'model': payload.get('model'),
                               'tools': [t.get('function', {}).get('name') for t in payload.get('tools', [])],
-                              'store': payload.get('store')})
+                              'store': payload.get('store'), 'temperature':payload.get('temperature')})
         messages = payload.get('messages', [])
         last_user = max((i for i, message in enumerate(messages) if message.get('role') == 'user'), default=-1)
         text = str(messages[last_user].get('content', '')) if last_user >= 0 else ''

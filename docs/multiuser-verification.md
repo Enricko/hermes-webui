@@ -237,3 +237,41 @@ the JSON acceptance report are saved in the operator's evidence directory.
 No schema, dependencies, runtime images or account grants change in this update.
 Switching a profile still reconciles the account's isolated agent; it does not
 run multiple capability profiles inside a shared process.
+
+## Native profile switching without workspace restart — 2026-11-07
+
+Ordinary profile switches now reuse the account's existing isolated runtime and
+upstream's guarded in-page transition. All granted profiles are prepared by the
+trusted operator; their configurations, model routes, skills and scheduler homes
+are distinct. Existing account root history/memory stays in place. The WebUI
+process has no global `HERMES_CONFIG_PATH` pinning it to the default profile;
+each separate scheduler receives its own fixed configuration at process start.
+
+**220 host checks passed**, with 10 reported skips: two explicit operator setup
+gates and eight tests needing Agent modules absent from the isolated host test
+environment. All **10 real Docker acceptance tests passed** against the pinned
+official Agent. They cover credentials/roles, model/provider routing, private
+file/terminal/network boundaries, concurrent read-only converter execution,
+stream/cancel ownership, restart persistence, disablement, discovered profiles,
+and independent grants. A stream survives switching away: querying/controlling
+it from the wrong profile is still refused with the native 409 response;
+switching back exposes the same live stream for its rightful owner to cancel.
+Actual scheduler processes prove separate fixed Hermes homes.
+
+Chromium passed at **1440, 760 and 390 px**, with no JavaScript or HTTP errors.
+Six switches in both directions took **0.109–0.619 seconds** in the disposable
+installation. A document sentinel, browser preference canary, container ID and
+account generation remain unchanged through every switch. Regular-user chat
+after activation reaches the actual Agent with the destination profile's
+distinct temperature policy. The previous client fails the new no-navigation/
+no-storage-reset regression. Other chat/upload/account checks remain green.
+
+Gateway checks also reject forged/double-encoded profile cookies, direct
+unassigned selectors and disabled capabilities before old mounts are replaced;
+revoked native capability directories are hidden from the visible catalog while
+their private files remain preserved. Legacy clients retain their selection
+protocol until a fresh page loads the native-switch controls. No control schema
+or Agent dependency/version change is required; the new immutable runtime image
+adds the per-profile schedulers and removes the WebUI's global config override.
+Admin grant/credential changes and changing the account default provider remain
+separate reconciliation operations.

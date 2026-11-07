@@ -109,6 +109,18 @@ class Gateway:
     def principal(self, request):
         return self.store.session(request.cookies.get(self.cookie_name, ''))
 
+    def validate_native_profile(self, plan, name):
+        if name.startswith(PREFIX) or name == 'default':
+            tid = next((tid for tid, native in plan['profiles'].items() if native == name), None)
+            if tid is None:
+                raise web.HTTPForbidden(text='Profile is not assigned to this account')
+            # An operator mapping cannot keep a disabled capability available
+            # while the reconciler is replacing the account's mounts.
+            try:
+                self.store.template(tid)
+            except PolicyError as exc:
+                raise web.HTTPForbidden(text='Profile is unavailable') from exc
+
     def session_current(self, principal):
         current = self.store.session_by_hash(principal.token_hash)
         return current is not None and current.auth_version == principal.auth_version
@@ -451,6 +463,7 @@ class Gateway:
         _active, native_profile = selected_profile(user, plan, request.cookies.get('hermes_profile'))
         buffered_body = None
         if plan:
+            self.validate_native_profile(plan, native_profile)
             # Reserved capability names are not personal profile creation input.
             # Every selector is checked against this authenticated account's map.
             selector_keys = ('profile', 'source_profile', 'target_profile', 'clone_from')
@@ -465,8 +478,8 @@ class Gateway:
                     if path.startswith('/api/profile/') and path != '/api/profile/switch' and str(data.get('name', '')).startswith(PREFIX):
                         raise web.HTTPForbidden(text='Assigned profiles are managed by the account administrator')
             for selector in selectors:
-                if isinstance(selector, str) and selector.startswith(PREFIX) and selector not in plan['profiles'].values():
-                    raise web.HTTPForbidden(text='Profile is not assigned to this account')
+                if isinstance(selector, str):
+                    self.validate_native_profile(plan, selector)
         if request.headers.get('Upgrade') or request.headers.get('Content-Encoding'):
             raise web.HTTPBadRequest(text='Unsupported proxy framing')
         if request.content_length is not None and request.content_length > self.settings.max_upload_bytes + 1024 * 1024:
@@ -537,6 +550,10 @@ class Gateway:
                                      account_profile_id=active_id, account_provider_id=None,
                                      account_provider_label='Unavailable', account_provider_configured=False,
                                      account_runtime_state=runtime['state'])
+                        if plan:
+                            allowed = {p['native_profile'] for p in choices['profiles'] if 'native_profile' in p}
+                            value['profiles'] = [row for row in value.get('profiles', []) if
+                                (not str(row.get('name', '')).startswith(PREFIX) and not row.get('is_default')) or row.get('name') in allowed]
                         if user['template_id']:
                             template = self.store.template(user['template_id'])
                             selected = user['provider_id'] or template['document']['provider_id']
