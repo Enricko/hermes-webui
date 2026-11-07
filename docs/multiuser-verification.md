@@ -122,7 +122,7 @@ and relay image
 with the same pinned Agent revision. Discovery/UI changes run in the trusted
 host control plane and do not require rebuilding those worker images.
 
-- The official test runner passed **47 tests** across account, discovery,
+- The official test runner passed **48 tests** across account, discovery,
   gateway, broker, catalog, connection, policy and neighboring profile suites;
   **11 optional Agent-dependent neighboring cases skipped** in the sanitized
   no-Agent host environment.
@@ -131,7 +131,9 @@ host control plane and do not require rebuilding those worker images.
   real chat after named-profile assignment, private workspace preservation and
   exclusion of the original profile's private state. Existing direct API,
   namespace, shared converter, streams/cancel and restart acceptance still pass.
-- **1 real root CLI setup test passed** with synthetic homes/passwords. Fresh
+- **2 real root CLI setup tests passed** with synthetic homes/passwords and
+  data roots under `/tmp` and `/srv`. Skill bundles publish atomically on the
+  destination filesystem, including hosts with `/tmp` on another filesystem. Fresh
   setup imports main/named profiles and assigns the first administrator;
   rerunning retains the same template IDs and original login password.
 - Native Chromium passed at **1440, 760 and 390 px** with no uncaught JavaScript

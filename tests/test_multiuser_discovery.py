@@ -189,3 +189,21 @@ def test_missing_source_does_not_hide_another_registered_installation(installati
     catalog = settings.store().discovered_profiles()
     assert {p['status'] for p in catalog if p['name'].startswith('First')} == {'missing'}
     assert len(settings.store().templates()) == 3
+
+
+def test_skill_publication_is_atomic_on_destination_filesystem(installation, monkeypatch):
+    from pathlib import Path
+    settings, home, backups = installation
+    rename = os.rename
+    published = []
+    def destination_rename(source_path, destination_path):
+        src, dst = Path(source_path), Path(destination_path)
+        assert src.parent == dst.parent == settings.root / 'shared/profiles'
+        assert src.name.startswith('.publish-')
+        assert (src / 'skills/base/SKILL.md').is_file()
+        published.append(dst)
+        return rename(src, dst)
+    monkeypatch.setattr(os, 'rename', destination_rename)
+    assert all(p['status'] == 'ready' for p in connect(settings, home, 'Installed', backups)['profiles'])
+    assert published
+    assert not list((settings.root / 'shared/profiles').glob('.publish-*'))

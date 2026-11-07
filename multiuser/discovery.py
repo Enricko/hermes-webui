@@ -363,13 +363,24 @@ def stage_capabilities(settings, home, path, config, staging):
         raise PolicyError('Invalid shared profile directory')
     parent.chmod(0o755)
     final = parent / bundle
+    # An older interrupted/non-atomic attempt may have left an empty directory.
+    # Remove only that exact empty operator-owned destination, never its data.
+    if final.exists() and not final.is_symlink() and final.stat().st_uid == os.geteuid() and not any(final.iterdir()):
+        final.rmdir()
     if not final.exists():
-        final.mkdir(mode=0o755)
-        os.rename(staging / 'skills', final / 'skills')
-        (final / 'manifest.json').write_text(json.dumps(hashes, sort_keys=True))
-        final.chmod(0o755)
-        for directory, _dirs, _files in os.walk(final / 'skills'):
-            Path(directory).chmod(0o755)
+        # /tmp may be tmpfs or a different disk from /srv. Publication must be
+        # atomic on the destination filesystem, including on interrupted syncs.
+        publishing = Path(tempfile.mkdtemp(prefix='.publish-', dir=parent))
+        try:
+            shutil.copytree(staging / 'skills', publishing / 'skills')
+            (publishing / 'manifest.json').write_text(json.dumps(hashes, sort_keys=True))
+            publishing.chmod(0o755)
+            for directory, _dirs, _files in os.walk(publishing / 'skills'):
+                Path(directory).chmod(0o755)
+            os.rename(publishing, final)
+        finally:
+            if publishing.exists():
+                shutil.rmtree(publishing)
     else:
         from multiuser.profile import bundle_path
         bundle_path(settings, bundle)
