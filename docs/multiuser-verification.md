@@ -111,3 +111,42 @@ imported from the main account and need an independently reviewed per-user
 namespace. Account disk/billing quotas are not implemented. Existing external
 scripts require an explicitly selected reviewed source file for publishing;
 the bundled converter and both publishing mechanisms are implemented.
+
+## Portable installed-profile discovery — 2026-11-07
+
+This additional gate exercises the trusted `setup`, `connect-hermes` and
+`sync-profiles` flow. It uses the later verified worker image
+`sha256:2ad401659e258e14a5d0e203689258b5c440bf390d2b42fec730dde28e051858`
+and relay image
+`sha256:fa6c499a140f2073ca88ec936a26e542192d83c832c8086d30e5b685f4b17cc0`,
+with the same pinned Agent revision. Discovery/UI changes run in the trusted
+host control plane and do not require rebuilding those worker images.
+
+- The official test runner passed **47 tests** across account, discovery,
+  gateway, broker, catalog, connection, policy and neighboring profile suites;
+  **11 optional Agent-dependent neighboring cases skipped** in the sanitized
+  no-Agent host environment.
+- **9 real Docker tests passed**, including main/named source discovery,
+  explicit adoption of an existing template identity, unchanged-sync stability,
+  real chat after named-profile assignment, private workspace preservation and
+  exclusion of the original profile's private state. Existing direct API,
+  namespace, shared converter, streams/cancel and restart acceptance still pass.
+- **1 real root CLI setup test passed** with synthetic homes/passwords. Fresh
+  setup imports main/named profiles and assigns the first administrator;
+  rerunning retains the same template IDs and original login password.
+- Native Chromium passed at **1440, 760 and 390 px** with no uncaught JavaScript
+  errors or HTTP failures. Evidence includes the discovered-profile catalog,
+  account creation with an explicit profile, independent provider assignment,
+  regular-user streamed chat/upload and account-switch storage isolation.
+- Ruff, runtime JavaScript lint, syntax checks and whitespace checks passed.
+
+The profile unit suite also covers native provider mapping identity and legacy
+precedence, profile-local credential resolution, keyless localhost, unsupported
+OAuth profiles remaining visible, source/config symlinks, unavailable sources,
+new/deleted profiles, admin conflicts and explicit conflict resolution. The
+gateway rejects source-path/import POSTs even from an administrator; only the
+trusted operator can register source authority.
+
+The deterministic external model fixture remains separate from the real Agent,
+WebUI and containers. These results do not claim automatic migration of native
+OAuth providers, stateful external integrations, or personal historical data.

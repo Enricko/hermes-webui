@@ -61,7 +61,7 @@
       const header = element('div', undefined, 'mu-dialog-header');
       header.append(element('h2', 'Accounts & shared capabilities'), button('Close', () => dialog.close()));
       const nav = element('nav', undefined, 'mu-dialog-nav');
-      for (const [key, label] of [['users', 'Accounts'], ['providers', 'Providers'], ['templates', 'Templates'], ['tools', 'Shared tools']]) {
+      for (const [key, label] of [['users', 'Accounts'], ['profiles', 'Hermes profiles'], ['providers', 'Providers'], ['templates', 'Templates'], ['tools', 'Shared tools']]) {
         nav.append(button(label, () => panel(key).catch(error => message(error.message, true))));
       }
       dialog.append(header, nav, element('div', undefined, 'mu-dialog-body'));
@@ -85,7 +85,7 @@
       select(form, 'role', 'Role', [['user', 'User'], ['admin', 'Admin']], 'user');
       select(form, 'template_id', 'Base profile', [['', 'Assign later'], ...available.map(t => [t.id, t.name])], available.length === 1 ? available[0].id : '');
       select(form, 'provider_id', 'AI provider', providerOptions);
-      form.append(element('p', 'Reuse the same base profile for all accounts. Each account has private conversations, memory and workspace; its AI provider can be assigned independently.', 'mu-help'));
+      form.append(element('p', 'Select an installed Hermes profile. Profiles can be shared by several accounts; conversations, memory and workspace stay private. Provider overrides are optional.', 'mu-help'));
       submit = async () => {
         const data = Object.fromEntries(new FormData(form)); data.template_id ||= null; data.provider_id ||= null;
         await request('/multiuser/api/users', data);
@@ -110,6 +110,21 @@
         }));
         record.append(actions); list.append(record);
       }
+    } else if (tab === 'profiles') {
+      const value = await request('/multiuser/api/hermes-profiles');
+      grid.style.gridTemplateColumns = '1fr'; form.hidden = true;
+      list.append(element('p', 'Profiles discovered from the Hermes installation. Create an account in Accounts and select its Base profile; existing accounts use Assign profile. Shared capabilities and provider catalogs are reused with private state for each account.', 'mu-help'));
+      if (!value.profiles.length) {
+        list.append(element('p', 'No Hermes installation connected. Run the operator connect-hermes setup described in docs/multiuser.md. Source folders can only be registered by the server operator.', 'mu-help'));
+      }
+      for (const profile of value.profiles) {
+        const record = element('div', undefined, 'mu-record');
+        record.append(element('strong', profile.name), element('small', `${profile.status} · ${profile.message}`));
+        record.append(element('small', `Last checked: ${new Date(profile.updated * 1000).toLocaleString()}`));
+        if (profile.template_id) record.append(button('Assign to an account', () => panel('users').catch(e => message(e.message, true))));
+        list.append(record);
+      }
+      return;
     } else if (tab === 'providers') {
       const value = await request('/multiuser/api/providers');
       field(form, 'name', 'Provider name').required = true;

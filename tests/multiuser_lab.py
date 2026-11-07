@@ -12,6 +12,8 @@ import socket
 import sys
 import tempfile
 
+import yaml
+
 import aiohttp
 from aiohttp import web
 
@@ -118,6 +120,29 @@ class Lab:
             '---\nname: reviewed-base\ndescription: Existing shared profile skill\n---\nUse the existing shared converter before recreating it.\n')
         await self.operator('reuse-profile', '--source', str(self.profile_source), '--template', self.template,
                             '--backup', str(self.evidence / 'profile-reuse-backup'))
+        # Exercise portable discovery against installed main/named profiles,
+        # while explicitly adopting the already-used capability identity.
+        configured = []
+        for connection in self.connections:
+            provider = self.store.provider(connection['provider_id'])
+            configured.append({'name': connection['name'], 'model': connection['model'],
+                               'base_url': provider['base_url'], 'api_key': provider['secret']})
+        source_config = {'model': {'default': 'fixture-model', 'provider': 'custom',
+            'base_url': self.store.provider(self.provider)['base_url'], 'api_key': self.provider_secret},
+            'custom_providers': configured, 'agent': {'max_turns': 20}}
+        (self.profile_source / 'config.yaml').write_text(yaml.safe_dump(source_config))
+        named = self.profile_source / 'profiles' / 'writer'; named.mkdir(parents=True)
+        (named / 'config.yaml').write_text(yaml.safe_dump(source_config))
+        (named / 'SOUL.md').write_text('Original named writer profile')
+        (named / 'state.db').write_text('original private conversations must never be imported')
+        (named / 'USER.md').write_text('original private user information')
+        discovered = await self.operator('connect-hermes', '--hermes-home', str(self.profile_source),
+            '--name', 'Installed Hermes', '--backup-root', str(self.evidence / 'discovery-backups'),
+            '--adopt-template', 'default=' + self.template)
+        assert all(p['status'] == 'ready' for p in discovered['profiles']), discovered
+        assert discovered['profiles'][0]['template_id'] == self.template
+        self.discovered_template = discovered['profiles'][1]['template_id']
+        assert (await self.operator('sync-profiles'))['profiles'] == discovered['profiles']
         self.template_document = self.store.template(self.template)['document']
         for name in ('alice', 'bobby'):
             status, value = await self.api('administrator', '/multiuser/api/users', {'username': name,

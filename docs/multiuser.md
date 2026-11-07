@@ -51,6 +51,132 @@ image IDs; the reconciler creates containers, verifies the actual namespace,
 mount, UID, security and resource policy **before starting them**, and admits
 the worker only after real Agent imports pass its upstream health check.
 
+## Connect an existing Hermes installation
+
+After preparing the reviewed release, Python environment, immutable Docker image
+manifest and dedicated gateway UID as below, run this **operator** command:
+
+```bash
+sudo /opt/hermes-multiuser/.venv/bin/python -m multiuser.manage --root /srv/hermes setup \
+  --public-url https://hermes.example.com --images /var/tmp/hermes-images.json \
+  --hermes-home /home/operator/.hermes --username administrator
+```
+
+Setup initializes a new multi-user data root, prompts twice for the first admin
+password, discovers `config.yaml` in the Hermes home and each immediate named
+`profiles/<name>` directory, and imports reusable capabilities as assignable base
+profiles. The new administrator inherits the discovered main profile. It never
+sets a default password. Rerunning on the same installation preserves existing
+accounts, passwords and assignments. Use `upgrade --backup /private/new-path`
+before setup when upgrading an older account schema. No containers are created
+until the trusted reconciler is started.
+
+`--hermes-home` is recommended under sudo. When omitted, discovery uses
+`HERMES_BASE_HOME`, then `HERMES_HOME` (unwrapping an active named profile), then
+the invoking/SUDO user's `~/.hermes`. It never scans other home directories.
+Supported Linux Docker deployment does not require the source Agent's Python
+environment to be imported into the gateway. Workers use the tested pinned
+Agent revision described below.
+
+For an already-initialized installation, connect a source without bootstrapping
+again:
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes discover-profiles \
+  --hermes-home /home/operator/.hermes
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes connect-hermes \
+  --hermes-home /home/operator/.hermes --name Hermes \
+  --backup-root /var/backups/hermes-profiles
+```
+
+The first command is read-only. The second explicitly authorizes capability and
+API-key reuse from that installation. It snapshots the control database and
+source configuration privately **outside both data roots** before publications.
+If a main profile was imported previously, add
+`--adopt-template default=<existing-template-id>` at first registration to reuse
+its identity and account assignments. Adoption retains already-approved local
+endpoint aliases and connection defaults. Further syncs retain those choices
+while the corresponding source setting is unchanged. Ordinary new setups do not
+need adoption IDs or a JSON template document.
+
+In the WebUI, open **Accounts → Hermes profiles** to see the discovered profiles
+and status. Open **Accounts**, create a username/password, and choose its **Base
+profile**. For an existing account, select the profile and click **Assign
+profile**. Several users may share a base profile, and an optional provider
+override selects a different primary connection per account. The **Providers**
+tab manages gateway-held credentials; the advanced **Templates** editor remains
+available for custom capability policies. Regular users cannot see either
+control catalog or provider secrets.
+
+Discovery imports model/response/Agent parameters, SOUL instructions and reusable
+skills, including `skills.external_dirs` located **inside the registered Hermes
+home**. Local skills take precedence. Source files are never modified. Skill
+symlinks, credential-like files/content, USER.md, caches, memories and session
+files are filtered. Conversation databases, personal memory, OAuth/browser/MCP
+state, uploads, workspace files, cron jobs and source `.env` contents are never
+seeded into users' homes. Only resolved provider API keys enter the private
+control database; workers receive broker URLs and dummy keys. Stateful
+integrations and skill roots outside the registered home require separate
+reviewed per-user setup. They are not silently enabled.
+
+Legacy `custom_providers` lists and native `providers` mappings with compatible
+base URLs are recognized, as are configured OpenAI, OpenRouter, Groq, DeepSeek,
+Together, Fireworks, xAI and NVIDIA API-key providers. Credentials resolve only
+from that profile's config and `.env`, never the gateway's process environment.
+Keyless localhost-compatible servers are supported. Native-only/OAuth-only or
+incomplete profiles stay visible as **needs-provider**; configure a compatible
+provider in Hermes, then sync. Discovery preserves source model IDs; it does not
+claim that every saved model is still served by its router. Runtime discovery
+and inference are both checked against the provider's live catalog.
+
+### Follow profile additions and updates
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes sync-profiles
+sudo install -m 644 multiuser/deployment/hermes-profile-sync.service /etc/systemd/system/
+sudo install -m 644 multiuser/deployment/hermes-profile-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hermes-profile-sync.timer
+```
+
+The optional oneshot/timer reads only root-registered sources every minute. It
+needs read-only access to those homes and write access to the data/backup roots;
+it has no network access or Docker socket. Match `ConditionPathExists` and
+`ReadWritePaths` to a custom data/backup root in a systemd override. The gateway
+cannot register paths, write the root-owned `profile-sources.json`, or submit
+import jobs. The provisioner's stronger home restrictions remain unchanged.
+No extra daemon is needed when using explicit CLI syncs.
+
+Unchanged source content does not bump template versions or restart accounts.
+Added profiles appear as new assignment options. Removed/unavailable sources are
+marked **missing** and leave accounts/data intact. Admin-edited imported
+templates or providers produce **conflict** and are preserved. An operator can
+resolve a conflict using the source ID shown in the admin catalog API:
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes resolve-profile-sync \
+  --source-id <id> --profile default --keep-admin
+# Or explicitly resume source-managed updates instead:
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes resolve-profile-sync \
+  --source-id <id> --profile default --use-source
+```
+
+Both choices take a private backup. `--keep-admin` freezes automatic updates for
+that profile. `--use-source` republishes capabilities using the same identity.
+Existing per-user three-way seeding still preserves private edits/deletions and
+reports a runtime template conflict if an update needs review. Use the existing
+`resolve-template --user <id> --keep-private` flow for those personal conflicts.
+
+To roll back discovery, stop/disable the timer, stop gateway and provisioner,
+save current state, restore `accounts-before.sqlite` and the matching
+`profile-sources-before.json` from one private snapshot with correct gateway DB
+ownership, then restart the prior reviewed release. With all DB writers stopped,
+remove stale SQLite `-wal`/`-shm` sidecars belonging to that DB before replacing
+it. Never remove user data or original Hermes homes. Disable the timer before
+rolling back to code that predates discovery. Source-only rollback can leave the
+additive schema v3 table in place; the old release must not run its older schema
+initializer against v3. See the existing deployment rollback procedure below.
+
 ## Install an independent release
 
 These are deployment commands for a new installation, not authorization to

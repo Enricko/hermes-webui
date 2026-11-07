@@ -290,3 +290,33 @@ async def test_private_state_survives_restart_and_disable_stops_only_its_jobs(la
     await lab.login('alice', fresh=True)
     lab.results['conversation_memory_workspace_persistence'] = True
     lab.results['disable_revokes_sessions_and_stops_only_owned_processes'] = True
+
+
+async def test_discovered_named_profile_assignment_keeps_private_state_and_original_home(lab):
+    status, catalog = await lab.api('administrator', '/multiuser/api/hermes-profiles')
+    assert status == 200 and {p['profile_key'] for p in catalog['profiles']} == {'default', 'writer'}
+    assert all(p['status'] == 'ready' for p in catalog['profiles'])
+    status, _ = await lab.api('alice', '/multiuser/api/hermes-profiles')
+    assert status == 403
+    await lab.execute('bobby', 'from pathlib import Path;Path("/workspace/before-profile-assignment").write_text("my-private-work")')
+    status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users['bobby']['id'],
+                              {'template_id': lab.discovered_template})
+    assert status == 200
+    await lab.ready(['bobby'])
+    await lab.login('bobby', fresh=True)
+    try:
+        proof = await lab.execute('bobby', 'from pathlib import Path;'
+            'assert Path("/workspace/before-profile-assignment").read_text()=="my-private-work";'
+            'assert not Path("/state/hermes/USER.md").exists();'
+            'assert "original private" not in Path("/state/hermes/SOUL.md").read_text();'
+            'print(Path("/state/hermes/SOUL.md").read_text())')
+        assert 'Original named writer profile' in proof
+        assert (lab.profile_source / 'profiles/writer/state.db').read_text().startswith('original private conversations')
+        sid = await lab.session('bobby')
+        stream = await lab.start_chat('bobby', sid, 'Hello with assigned installed profile')
+        assert any(event == 'done' for event, _ in await lab.events('bobby', stream))
+        lab.results['installed_profile_discovery_and_real_runtime_assignment'] = True
+    finally:
+        await lab.api('administrator', '/multiuser/api/users/' + lab.users['bobby']['id'], {'template_id': lab.template})
+        await lab.ready(['bobby'])
+        await lab.login('bobby', fresh=True)

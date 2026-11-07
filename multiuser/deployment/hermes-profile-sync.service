@@ -1,0 +1,22 @@
+[Unit]
+Description=Discover capabilities from operator-registered Hermes installations
+After=hermes-accounts.service
+ConditionPathExists=/srv/hermes/profile-sources.json
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/hermes-multiuser
+EnvironmentFile=/etc/hermes-multiuser.env
+ExecStart=/opt/hermes-multiuser/.venv/bin/python -m multiuser.manage --root ${HERMES_MULTIUSER_ROOT} sync-profiles
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+InaccessiblePaths=-/var/run/docker.sock
+ReadWritePaths=/srv/hermes /var/backups/hermes-profiles
