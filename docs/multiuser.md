@@ -319,6 +319,20 @@ the runtime and opens chat automatically. An unassigned account instead shows
 an explicit template-assignment message. Admin account management remains
 available while the admin's own runtime is preparing.
 
+The page, readiness poll and private APIs use the same admission check: a ready
+database row is insufficient when the operator's profile map still belongs to
+an older account generation. After an access/credential change, the preparing
+page waits for the matching map and opens chat automatically. Ordinary sign-ins
+to an already prepared account reuse its running container.
+
+If provisioning or a relay restart interrupts chat initialization, the account
+shell polls readiness and actual API reachability, then reloads the application
+automatically once. It never replays refused writes. An open draft, attachment,
+unsaved file edit, active turn or account dialog delays reconnection to preserve
+work; finish or clear the draft, save file edits and close the dialog to allow
+automatic reconnection. Ordinary
+native profile switching still stays in place without reloading the workspace.
+
 Account discovery retries temporary permission/socket failures during trusted
 directory creation, without interrupting existing account brokers. `/health`
 reports `account_discovery: running`; if its discovery task stops it returns
@@ -638,6 +652,15 @@ With Playwright/Chromium installed, the same image/evidence variables can run
 `.venv/bin/python tests/browser_multiuser.py`. It starts another private lab and
 checks login, admin CRUD/tabs, logout and preserved chat chrome at desktop,
 narrow and mobile widths, saving screenshots and browser error evidence.
+
+For startup recovery, run `.venv/bin/python tests/browser_multiuser_startup.py`
+with those variables and a fresh evidence directory. It verifies a new account,
+an existing account with a stale operator map after an admin edit, automatic
+chat/file initialization, and a real Agent reply/upload. At desktop, narrow and
+mobile widths it also injects one boot API interruption, checks automatic
+reconnection, preserves an unsent draft/live attachment, and confirms warm
+sign-ins retain the same worker. `tests/test_api_timeout.py` separately proves a
+typed unavailable response is reported without replaying a chat POST.
 
 ## Rollback
 

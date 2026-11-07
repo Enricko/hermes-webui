@@ -7,6 +7,50 @@
   let panelGeneration = 0;
   let pickerSequence = 0;
   let activationPending = false;
+  let recoveryNeeded = false;
+  let recoveryTimer;
+  let recoveryChecking = false;
+  let recoveryReloading = false;
+  function scheduleRecovery() {
+    if (recoveryTimer || recoveryReloading) return;
+    recoveryTimer = setTimeout(checkRecovery, 1500);
+  }
+  function canReconnect() {
+    // An interrupted boot has no draft. If provisioning interrupts an already
+    // open tab, retain live File objects, edits and runs until it is safe.
+    return !dialog?.open && !document.getElementById('msg')?.value &&
+      (typeof _previewHasUnsavedEdits !== 'function' || !_previewHasUnsavedEdits()) &&
+      (typeof S === 'undefined' || (!S.busy && !S.pendingFiles?.length));
+  }
+  async function checkRecovery() {
+    recoveryTimer = undefined;
+    if (recoveryChecking || recoveryReloading) return;
+    recoveryChecking = true;
+    try {
+      await refreshIdentity();
+      if (identity.runtime.state === 'ready' && canReconnect()) {
+        // Check actual API reachability too: a ready DB row alone is not proof
+        // that the relay has finished reconnecting after a process restart.
+        const response = await fetch('/api/settings', {cache:'no-store', signal:AbortSignal.timeout(5000)});
+        if (response.status === 401) { location.replace('/login'); return; }
+        if (response.ok && canReconnect()) {
+          recoveryReloading = true;
+          location.reload();
+        }
+        if (response.body) await response.body.cancel();
+      }
+    } catch (_) {
+      // The next bounded poll checks again; failed writes are never replayed.
+    } finally {
+      recoveryChecking = false;
+      if (recoveryNeeded && !recoveryReloading) scheduleRecovery();
+    }
+  }
+  window.addEventListener?.('hermes:runtime-unavailable', () => {
+    recoveryNeeded = true;
+    scheduleRecovery();
+  });
+  window.addEventListener?.('pagehide', () => clearTimeout(recoveryTimer));
   const element = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -457,12 +501,19 @@
   }
   async function refreshIdentity() {
     identity = await request('/multiuser/api/me');
+    if (identity.runtime.state !== 'ready' && document.getElementById('msg')) {
+      recoveryNeeded = true;
+      scheduleRecovery();
+    }
     const profile = document.getElementById('mu-base-profile');
     if (profile) profile.textContent = identity.profile ? `Profile: ${identity.profile.name} · Provider: ${identity.provider?.name || 'unavailable'}` : 'No base profile assigned';
     const notice = document.getElementById('mu-runtime-notice');
     if (notice) {
-      notice.hidden = identity.runtime.state === 'ready';
-      notice.textContent = identity.runtime.state === 'unassigned' ? 'Ask your administrator to assign a capability template.' :
+      notice.hidden = identity.runtime.state === 'ready' && !recoveryNeeded;
+      notice.textContent = identity.runtime.state === 'ready' ?
+        (canReconnect() ? 'Reconnecting your workspace automatically…' :
+          'Workspace is ready. Finish your draft, save file edits and close any account dialog to reconnect automatically.') :
+        identity.runtime.state === 'unassigned' ? 'Ask your administrator to assign a capability template.' :
         identity.runtime.state === 'template_conflict' ? 'A template update needs review; your private edits were preserved.' :
         'Your private workspace is starting. You can keep this page open.';
     }

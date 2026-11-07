@@ -66,6 +66,15 @@ checks reserved profile names against authenticated grants; a cookie is never
 account identity. Stale operator mappings close proxy admission until reconciled.
 Admin credential/grant changes and changing the account default provider still
 revoke sessions/reconcile the runtime; these are separate from browsing profiles.
+HTML admission, identity readiness polling and private API admission all apply
+the same current-generation operator-map check. They cannot report a runtime
+ready while its previous profile mapping is being replaced. If admission closes
+between HTML and boot requests, a typed API failure triggers bounded readiness
+and reachability polling followed by automatic application reinitialization.
+No rejected command is replayed, and live drafts, attachments, unsaved file edits
+(even in a hidden editor), active turns and account edits defer that navigation.
+No account or conversation state is mutated
+by readiness checks.
 The legacy selection path retains only its initiating session with unchanged
 expiry/CSRF. Concurrent revocation cannot be undone by a stale selection.
 

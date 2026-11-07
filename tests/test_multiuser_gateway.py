@@ -406,6 +406,45 @@ async def test_pending_runtime_does_not_boot_chat_until_ready(gateway):
 
 
 @pytest.mark.asyncio
+async def test_stale_profile_generation_gates_html_identity_and_private_apis_together(gateway, monkeypatch):
+    settings, store, server, login, users, received = gateway
+    uid = users[1]['id']
+    provider = store.put_provider('Fixture provider', 'http://127.0.0.1:1/v1', 'fixture-secret')
+    template = store.put_template('Fixture profile', {'provider_id':provider, 'model':'approved'})
+    store.update_user(uid, template_id=template, assign_template=True)
+    user = store.user(uid)
+    plan = settings.runtime_dir(uid) / 'profiles.json'
+    plan.write_text(json.dumps({'auth_version':user['auth_version'] - 1,
+                               'anchor':template, 'profiles':{template:'default'}}))
+    # This HTTP regression is unprivileged; actual operator-owned publication
+    # and container replacement are exercised by browser_multiuser_startup.py.
+    monkeypatch.setattr('multiuser.runtime_profiles.operator_plan', lambda *_:json.loads(plan.read_text()))
+    alice, _ = await login('alice')
+    for route in ['/', '/session/private-session']:
+        async with alice.get(server.make_url(route)) as response:
+            html = await response.text()
+            assert response.status == 200 and '/multiuser/static/waiting.js' in html
+            assert 'static/boot.js' not in html
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        assert (await response.json())['runtime']['state'] == 'starting'
+    for route in ['/api/settings', '/api/sessions', '/api/workspaces', '/api/sessions/events']:
+        async with alice.get(server.make_url(route)) as response:
+            assert response.status == 503
+            assert (await response.json())['runtime_state'] == 'starting'
+    assert uid not in received
+    # The operator finishes publication. The existing session's next poll may
+    # open the full application; login itself never changes this generation.
+    plan.write_text(json.dumps({'auth_version':user['auth_version'],
+                               'anchor':template, 'profiles':{template:'default'}}))
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        assert (await response.json())['runtime']['state'] == 'ready'
+    async with alice.get(server.make_url('/')) as response:
+        assert 'static/boot.js' in await response.text()
+    async with alice.get(server.make_url('/api/settings')) as response:
+        assert response.status == 200 and (await response.json())['owner'] == uid
+
+
+@pytest.mark.asyncio
 async def test_unassigned_admin_keeps_account_management_available(gateway):
     _settings, store, server, login, users, _received = gateway
     admin, _ = await login('administrator')

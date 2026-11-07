@@ -262,14 +262,30 @@ class Gateway:
                      if p['enabled'] and p['id'] in user['provider_ids']]
         return {'profiles':profiles, 'providers':providers}
 
+    def runtime_status(self, user):
+        """Use the proxy's admission decision for HTML and readiness polling too.
+
+        A ready DB row can still describe the previous account generation while
+        the trusted operator stops/replaces its containers. Never boot native
+        initializers against that stale profile map. A missing mapping retains
+        compatibility with runtimes created before native assigned profiles.
+        """
+        runtime = self.store.runtime(user['id'])
+        plan = read_plan(self.settings, user)
+        status = {'state':runtime['state'] if runtime else 'pending',
+                  'message':runtime['error'] if runtime else ''}
+        if status['state'] == 'ready' and plan is None and (self.settings.runtime_dir(user['id']) / 'profiles.json').exists():
+            status = {'state':'starting', 'message':'Assigned profiles are being updated'}
+        return status, plan
+
     async def me(self, request):
         session = self.require(request)
-        runtime = self.store.runtime(session.user_id)
         user = self.store.user(session.user_id)
+        runtime, plan = self.runtime_status(user)
         choices = self.account_choices(user)
         labels = {p['id']:p['name'] for p in choices['profiles']}
         profile, provider = None, None
-        active_id, _native = selected_profile(user, read_plan(self.settings, user), request.cookies.get('hermes_profile'))
+        active_id, _native = selected_profile(user, plan, request.cookies.get('hermes_profile'))
         if user['template_id']:
             # Identity/account controls must remain available even when a
             # disabled capability/provider prevents the Agent from starting.
@@ -282,9 +298,7 @@ class Gateway:
                 if configured:
                     provider = {'id': configured['id'], 'name': configured['name']}
         return json_response({**session.public(), 'profile': profile, 'provider': provider,
-            'choices': choices, 'runtime': {
-            'state': runtime['state'] if runtime else 'pending',
-            'message': runtime['error'] if runtime else ''}})
+            'choices': choices, 'runtime': runtime})
 
     async def select_access(self, request):
         principal = self.require(request)
@@ -372,8 +386,8 @@ class Gateway:
         session = self.principal(request)
         if session is None:
             raise web.HTTPFound('/login')
-        runtime = self.store.runtime(session.user_id)
-        if not runtime or runtime['state'] != 'ready':
+        runtime, _plan = self.runtime_status(self.store.user(session.user_id))
+        if runtime['state'] != 'ready':
             # Do not boot upstream with a cascade of 503 settings/model/file
             # requests: those initializers do not replay when provisioning ends.
             html = (ASSETS / 'waiting.html').read_text()
@@ -453,13 +467,11 @@ class Gateway:
         if (request.headers.get('Service-Worker') or
                 request.headers.get('Sec-Fetch-Dest') in ('serviceworker', 'sharedworker', 'worker', 'script', 'style')):
             raise web.HTTPForbidden(text='Executable frontend resources must come from the trusted gateway')
-        runtime = self.store.runtime(uid)
-        if not runtime or runtime['state'] != 'ready':
-            return json_response({'error': 'Your private runtime is not ready', 'runtime_state': runtime['state'] if runtime else 'pending'}, status=503)
         user = self.store.user(uid)
-        plan = read_plan(self.settings, user)
-        if plan is None and (self.settings.runtime_dir(uid) / 'profiles.json').exists():
-            return json_response({'error':'Assigned profiles are being updated', 'runtime_state':'starting'}, status=503)
+        runtime, plan = self.runtime_status(user)
+        if runtime['state'] != 'ready':
+            return json_response({'error': runtime['message'] or 'Your private runtime is not ready',
+                                  'runtime_state': runtime['state']}, status=503)
         _active, native_profile = selected_profile(user, plan, request.cookies.get('hermes_profile'))
         buffered_body = None
         if plan:
@@ -616,7 +628,7 @@ class Gateway:
                 with contextlib.suppress(ConnectionError):
                     await response.write_eof()
                 return response
-            return json_response({'error': 'Your private runtime is unavailable'}, status=503)
+            return json_response({'error': 'Your private runtime is unavailable', 'runtime_state':'starting'}, status=503)
 
 
 def create_app(settings):

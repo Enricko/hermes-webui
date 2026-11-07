@@ -93,6 +93,34 @@ def _node_eval(script: str, timeout: float = 2.0) -> subprocess.CompletedProcess
     )
 
 
+def test_runtime_unavailable_signals_recovery_without_replaying_a_write():
+    api_fn = _extract_js_function(_source(WORKSPACE_JS), 'api')
+    script = """
+const events=[], requests=[];
+global.document={baseURI:'https://example.test/'};
+global.location={href:document.baseURI,pathname:'/',search:''};
+global.CustomEvent=class {constructor(type){this.type=type;}};
+global.window={location,dispatchEvent:event=>events.push(event.type)};
+global.fetch=async (url,opts)=>{
+  requests.push({url,method:opts.method,body:opts.body});
+  return {ok:false,status:503,statusText:'Service Unavailable',
+    text:async()=>JSON.stringify({error:'Assigned profiles are being updated',runtime_state:'starting'})};
+};
+""" + api_fn + """
+(async()=>{
+  let error;
+  try{await api('/api/chat/start',{method:'POST',body:'{"message":"only once"}'});}catch(e){error=e;}
+  if(!error||error.status!==503||!error.body.includes('runtime_state'))throw Error('Lost HTTP error context');
+  if(requests.length!==1||requests[0].method!=='POST')throw Error('Replayed a refused write');
+  if(JSON.stringify(events)!=='["hermes:runtime-unavailable"]')throw Error('Recovery was not notified exactly once');
+  console.log('pass');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = _node_eval(script)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == 'pass'
+
+
 def test_api_rejects_hung_fetch_with_timeout_and_toast():
     """A hung fetch must reject quickly and surface a recognizable timeout toast."""
     api_fn = _extract_js_function(_source(WORKSPACE_JS), "api")

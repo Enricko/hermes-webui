@@ -69,7 +69,14 @@ async function api(path,opts={}){
           // Parse JSON error body and surface the human-readable message,
           // rather than showing raw JSON like {"error":"Profile 'x' does not exist."}
           let message=text;
-          try{const j=JSON.parse(text);message=j.error||j.message||text;}catch(e){}
+          try{
+            const j=JSON.parse(text);message=j.error||j.message||text;
+            // Provisioning may start between HTML admission and a boot API.
+            // Notify the account shell; never replay this request (it may POST).
+            if(res.status===503&&typeof j.runtime_state==='string'){
+              window.dispatchEvent(new CustomEvent('hermes:runtime-unavailable'));
+            }
+          }catch(e){}
           // Attach the raw HTTP context so callers can branch on status (404 stale-session
           // cleanup, 401 redirect, 503 retry, etc.) without re-parsing the message string.
           const err=new Error(message);

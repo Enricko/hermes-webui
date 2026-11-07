@@ -8,6 +8,49 @@ import subprocess
 import pytest
 
 
+def test_automatic_reconnection_waits_for_unsaved_work_and_does_not_loop():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node is required for the real frontend lifecycle helper')
+    source = Path(__file__).resolve().parents[1] / 'multiuser/static/client.js'
+    script = r'''
+const fs=require('fs'),vm=require('vm'),events={},timers=new Map();
+let sequence=0,reloads=0,probes=0,unsaved=true;
+const msg={value:''};
+const context={window:{addEventListener:(key,callback)=>events[key]=callback},
+  document:{readyState:'loading',addEventListener(){},getElementById:id=>id==='msg'?msg:null},
+  S:{busy:false,pendingFiles:[]},_previewHasUnsavedEdits:()=>unsaved,
+  setTimeout:callback=>{timers.set(++sequence,callback);return sequence;},clearTimeout:id=>timers.delete(id),
+  AbortSignal,location:{reload:()=>reloads++},fetch:async path=>{
+    if(path==='/multiuser/api/me')return {ok:true,json:async()=>({runtime:{state:'ready'},choices:{profiles:[]}})};
+    if(path!=='/api/settings')throw Error('Unexpected recovery endpoint');
+    probes++;return {ok:true,body:{cancel:async()=>{}}};
+  }};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+async function tick(){
+  if(timers.size!==1)throw Error('Recovery polling multiplied');
+  const [id,callback]=timers.entries().next().value;timers.delete(id);await callback();
+}
+(async()=>{
+  events['hermes:runtime-unavailable']();await tick();
+  if(reloads||probes)throw Error('Discarded unsaved editor contents');
+  unsaved=false;context.S.busy=true;await tick();
+  if(reloads||probes)throw Error('Interrupted an active turn');
+  context.S.busy=false;context.S.pendingFiles=[{}];await tick();
+  if(reloads||probes)throw Error('Discarded an attachment');
+  context.S.pendingFiles=[];msg.value='Unsent text';await tick();
+  if(reloads||probes)throw Error('Discarded a draft');
+  msg.value='';await tick();
+  if(reloads!==1||probes!==1||timers.size)throw Error('Did not reconnect once after work was safe');
+  events['hermes:runtime-unavailable']();
+  if(timers.size)throw Error('Started a repeated reload');
+  console.log('pass');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+    result = subprocess.run([node, '-e', script, str(source)], capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'pass'
+
+
 def test_refresh_keeps_drawer_open_and_only_user_selection_closes_it():
     node = shutil.which('node')
     if not node:
