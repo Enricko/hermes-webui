@@ -62,6 +62,29 @@ async def test_distinct_credentials_roles_and_native_agent_chat(lab):
     lab.results['shared_profile_skill_count_and_nondefault_provider_model'] = True
 
 
+async def test_three_named_routers_keep_identical_model_ids_bound_to_correct_keys(lab):
+    status, catalog = await lab.api('alice', '/api/models')
+    assert status == 200
+    groups = {group['provider_id']: group for group in catalog['groups']}
+    for name in ('Router One', 'Router Two', 'Router Three'):
+        provider = 'custom:' + name.lower().replace(' ', '-')
+        assert provider in groups
+        advertised = groups[provider]['models'] + groups[provider].get('extra_models', [])
+        assert any('fixture-extra' in model['id'] for model in advertised)
+        for user in ('alice', 'bobby'):
+            before = len(lab.named_models[name].requests)
+            sid = await lab.session(user)
+            status, started = await lab.api(user, '/api/chat/start', {'session_id': sid,
+                'message': 'Check the selected named router', 'model': 'fixture-extra',
+                'model_provider': provider, 'profile': 'default', 'workspace': '/workspace'})
+            assert status == 200
+            events = await lab.events(user, started['stream_id'])
+            assert any(event == 'done' for event, _ in events), events
+            requests = lab.named_models[name].requests
+            assert len(requests) > before and requests[-1]['user_id'] == lab.users[user]['id']
+    lab.results['three_named_routers_same_model_ids_correct_credentials_and_owners'] = True
+
+
 async def test_private_api_ids_profiles_files_download_and_archive_containment(lab):
     a, b = await asyncio.gather(lab.session('alice'), lab.session('bobby'))
     marker_a, marker_b = secrets.token_hex(20), secrets.token_hex(20)

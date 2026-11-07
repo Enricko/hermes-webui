@@ -48,11 +48,11 @@ async def test_provider_catalog_http_is_account_scoped_single_flight_and_revocab
                 if state['fail']:
                     return web.json_response({'error': state['secret']}, status=503)
                 return web.json_response({'data': [{'id': 'base'}, {'id': name + '-extra'}]})
-            async def completion(request, state=state):
+            async def completion(request, state=state, name=name):
                 assert request.headers['Authorization'] == 'Bearer ' + state['secret']
                 payload = await request.json()
                 state['posted_models'].append(payload['model'])
-                return web.json_response({'model': payload['model'], 'owner': payload['user']})
+                return web.json_response({'model': payload['model'], 'owner': payload['user'], 'provider': name})
             app = web.Application()
             app.router.add_get('/v1/models', models)
             app.router.add_post('/v1/chat/completions', completion)
@@ -97,6 +97,44 @@ async def test_provider_catalog_http_is_account_scoped_single_flight_and_revocab
         states['alpha']['hold'].set()
         assert (await pending)[0] == 403
         assert {m['id'] for m in (await catalog(a))[1]['data']} == {'base', 'bravo-extra'}
+        alpha_route = 'http://broker/providers/' + states['alpha']['id'] + '/v1'
+        bravo_route = 'http://broker/providers/' + states['bravo']['id'] + '/v1'
+        async with a.get(alpha_route + '/models') as response:
+            assert response.status == 403
+        document = store.template(template)['document']
+        document['connections'] = [{'provider_id': state['id'], 'name': name, 'model': 'base'} for name, state in states.items()]
+        store.put_template('Common profile', document, template_id=template)
+        for route, name in [(alpha_route, 'alpha'), (bravo_route, 'bravo')]:
+            async with a.get(route + '/models') as response:
+                assert response.status == 200
+                assert {m['id'] for m in (await response.json())['data']} == {'base', name + '-extra'}
+            async with a.post(route + '/chat/completions', json={'model': 'base', 'messages': []},
+                    headers={'X-User-Id': bob['id']}) as response:
+                assert response.status == 200
+                value = await response.json()
+                assert value['provider'] == name and value['owner'] == alice['id']
+        before = {name: state['catalog_requests'] for name, state in states.items()}
+        for route in (alpha_route, bravo_route, alpha_route, bravo_route):
+            async with a.get(route + '/models') as response:
+                assert response.status == 200
+        assert before == {name: state['catalog_requests'] for name, state in states.items()}
+        private_provider = store.put_provider('B private provider', str(servers[0].make_url('/v1')), states['alpha']['secret'])
+        store.update_user(bob['id'], provider_id=private_provider, assign_provider=True)
+        async with a.get('http://broker/providers/' + private_provider + '/v1/models',
+                         headers={'X-User-Id': bob['id'], 'X-Forwarded-User': 'bobby'}) as response:
+            assert response.status == 403
+        async with a.get('http://broker/providers/' + 'f' * 32 + '/v1/models') as response:
+            assert response.status == 403
+        service.catalog_cache.clear()
+        states['alpha']['started'].clear(); states['alpha']['hold'] = asyncio.Event()
+        pending = asyncio.create_task(a.get(alpha_route + '/models'))
+        await asyncio.wait_for(states['alpha']['started'].wait(), timeout=5)
+        document['connections'] = [entry for entry in document['connections'] if entry['provider_id'] != states['alpha']['id']]
+        store.put_template('Common profile', document, template_id=template)
+        states['alpha']['hold'].set()
+        removed = await pending
+        assert removed.status == 403
+        await removed.read(); removed.release()
         service.catalog_cache.clear(); states['bravo']['fail'] = True
         status, failure = await catalog(a)
         assert status == 502 and states['bravo']['secret'] not in str(failure)

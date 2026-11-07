@@ -173,6 +173,12 @@ def main(argv=None):
     reuse.add_argument('--source', type=Path, required=True)
     reuse.add_argument('--template', required=True, help='Existing shared template ID to update in place')
     reuse.add_argument('--backup', type=Path, required=True)
+    connections = sub.add_parser('import-providers', help='Privately import selected custom connections from an existing profile')
+    connections.add_argument('--source', type=Path, required=True)
+    connections.add_argument('--template', required=True)
+    connections.add_argument('--name', action='append', required=True)
+    connections.add_argument('--backup', type=Path, required=True)
+    connections.add_argument('--reuse-provider', action='append', default=[], help='NAME=existing provider ID; retain that endpoint')
     args = parser.parse_args(argv)
     try:
         if args.command == 'init':
@@ -260,6 +266,10 @@ def main(argv=None):
             elif args.command == 'reuse-profile':
                 from multiuser.profile import reuse_profile
                 result = reuse_profile(settings, args.source, args.template, args.backup)
+            elif args.command == 'import-providers':
+                from multiuser.connections import import_connections
+                reused = dict(value.split('=', 1) for value in args.reuse_provider)
+                result = import_connections(settings, args.source, args.name, args.template, args.backup, reused)
             else:
                 raise PolicyError('Unsupported command')
         print(json.dumps(result, indent=2))

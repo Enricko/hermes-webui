@@ -79,6 +79,22 @@ class Lab:
             'name': 'Deterministic acceptance model', 'base_url': f'http://127.0.0.1:{model_port}/v1', 'secret': self.provider_secret})
         assert status == 200
         self.provider = value['id']
+        self.named_models = {'Router One': self.model}
+        self.connections = [{'provider_id': self.provider, 'name': 'Router One', 'model': 'fixture-model'}]
+        for name in ('Router Two', 'Router Three'):
+            secret = secrets.token_urlsafe(32)
+            model = module.ModelFixture(secret)
+            runner = web.AppRunner(model.app(), access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, '127.0.0.1', 0)
+            await site.start()
+            self.runners.append(runner)
+            self.named_models[name] = model
+            provider_port = site._server.sockets[0].getsockname()[1]
+            status, result = await self.api('administrator', '/multiuser/api/providers', {
+                'name': name, 'base_url': f'http://127.0.0.1:{provider_port}/v1', 'secret': secret})
+            assert status == 200
+            self.connections.append({'provider_id': result['id'], 'name': name, 'model': 'fixture-model'})
         status, value = await self.api('administrator', '/multiuser/api/tools', {
             'name': 'PNG to JPEG', 'filename': 'png_to_jpg.py',
             'description': 'Use python /shared/tools/png_to_jpg.py --input /workspace/same.png --output /workspace/same.jpg --tmp-dir /tmp. Use private workspace job paths; do not recreate the converter.',
@@ -87,6 +103,7 @@ class Lab:
         self.tool = value['id']
         self.template_document = {'provider_id': self.provider, 'model': 'fixture-model', 'models': ['fixture-model'],
             'model_catalog': 'provider',
+            'connections': self.connections,
             'parameters': {'context_length': 128000, 'max_tokens': 4096}, 'agent': {'max_iterations': 20},
             'soul': 'You are Hermes. Use the provided read-only shared tools before implementing a converter.',
             'tools': [self.tool], 'skills': {}, 'egress_hosts': []}

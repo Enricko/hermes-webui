@@ -352,6 +352,9 @@ class Store:
         with self.connection(write=True) as db:
             if not db.execute("SELECT 1 FROM providers WHERE id=? AND enabled=1", (document["provider_id"],)).fetchone():
                 raise PolicyError("Select an enabled provider")
+            for connection in document['connections']:
+                if not db.execute('SELECT 1 FROM providers WHERE id=? AND enabled=1', (connection['provider_id'],)).fetchone():
+                    raise PolicyError('Selected named provider is unavailable')
             for tool in document["tools"]:
                 if not db.execute("SELECT 1 FROM tools WHERE id=? AND enabled=1", (tool,)).fetchone():
                     raise PolicyError("Selected tool is unavailable")
@@ -374,12 +377,19 @@ class Store:
             raise PolicyError("Template is unavailable")
         return {**dict(row), "document": validate_template(json.loads(row["document"]))}
 
-    def effective_template(self, user):
+    def effective_template(self, user, selected_provider=None):
         """One shared capability profile, with a server-owned provider per account."""
         template = self.template(user['template_id'])
-        if user.get('provider_id') is not None:
-            template['document']['provider_id'] = identifier(user['provider_id'])
-        self.provider(template['document']['provider_id'])
+        document = template['document']
+        primary = user.get('provider_id') or document['provider_id']
+        selected = identifier(selected_provider) if selected_provider is not None else primary
+        connection = next((entry for entry in document['connections'] if entry['provider_id'] == selected), None)
+        if selected != primary and not connection:
+            raise PolicyError('Provider is not assigned to this account profile')
+        document['provider_id'] = selected
+        if connection and (selected_provider is not None or user.get('provider_id') is not None):
+            document.update(model=connection['model'], models=[connection['model']])
+        self.provider(selected)
         return template
 
     def put_tool(self, name, description, filename, content, *, tool_id=None, enabled=True):

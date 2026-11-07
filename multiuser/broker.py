@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from multiuser.store import PolicyError
+from multiuser.store import PolicyError, identifier
 
 MODEL_ROUTES = {'/v1/chat/completions', '/v1/responses', '/v1/messages', '/v1/embeddings'}
 MAX_MODEL_BODY = 16 * 1024 * 1024
@@ -41,11 +41,11 @@ def catalog_models(value, secret=''):
     return list(models.values())
 
 
-def entitlement(store, uid):
+def entitlement(store, uid, selected_provider=None):
     user = store.user(uid)
     if not user['enabled'] or not user['template_id']:
         raise PolicyError('Account is not enabled for model/network access')
-    template = store.effective_template(user)['document']
+    template = store.effective_template(user, selected_provider)['document']
     provider = store.provider(template['provider_id'])
     return user, template, provider
 
@@ -146,15 +146,17 @@ class Brokers:
     def catalog_key(user, template, provider):
         return (user['id'], user['auth_version'], provider['id'], provider['base_url'],
                 hashlib.sha256(provider['secret'].encode()).digest(),
-                template.get('model_catalog', 'allowlist'), tuple(template['models']))
+                template.get('model_catalog', 'allowlist'),
+                tuple(template['models']) if template.get('model_catalog', 'allowlist') == 'allowlist' else ())
 
-    async def models(self, uid, user, template, provider):
+    async def models(self, uid, user, template, provider, selected_provider=None):
         if template.get('model_catalog', 'allowlist') == 'allowlist':
             return [{'id': name, 'object': 'model', 'owned_by': 'assigned-template'} for name in template['models']]
         key = self.catalog_key(user, template, provider)
-        lock = self.catalog_locks.setdefault(uid, asyncio.Lock())
+        slot = (uid, provider['id'])
+        lock = self.catalog_locks.setdefault(slot, asyncio.Lock())
         async with lock:
-            cached = self.catalog_cache.get(uid)
+            cached = self.catalog_cache.get(slot)
             if cached and cached[0] == key and cached[1] > time.monotonic():
                 return cached[2]
             async with self.client.get(provider['base_url'] + '/models',
@@ -173,14 +175,15 @@ class Brokers:
                     raise CatalogUnavailable() from exc
             # A late response from a former provider/account generation must
             # never become another assignment's cached authority.
-            current = entitlement(self.store, uid)
+            current = entitlement(self.store, uid, selected_provider)
             if self.catalog_key(*current) != key:
                 raise PolicyError('Provider assignment changed during model discovery')
-            self.catalog_cache[uid] = (key, time.monotonic() + 30, models)
+            self.catalog_cache[slot] = (key, time.monotonic() + 30, models)
             return models
 
     async def start(self):
         self.client = aiohttp.ClientSession(trust_env=False, auto_decompress=False,
+            headers={'User-Agent': 'Hermes-WebUI/1.0'},
             timeout=aiohttp.ClientTimeout(total=None, connect=15, sock_read=180))
         self.task = asyncio.create_task(self.watch())
 
@@ -263,22 +266,28 @@ class Brokers:
     async def model(self, uid, request):
         response = None
         try:
-            _user, template, provider = entitlement(self.store, uid)
-            if request.method == 'GET' and request.path == '/v1/models':
+            route, selected = request.path, None
+            if route.startswith('/providers/'):
+                parts = route.split('/', 3)
+                if len(parts) != 4:
+                    raise PolicyError('Invalid named provider route')
+                selected, route = identifier(parts[2]), '/' + parts[3]
+            _user, template, provider = entitlement(self.store, uid, selected)
+            if request.method == 'GET' and route == '/v1/models':
                 if request.query_string:
                     raise PolicyError('Provider catalog query is not available')
-                return web.json_response({'object': 'list', 'data': await self.models(uid, _user, template, provider)})
-            if request.method != 'POST' or request.path not in MODEL_ROUTES or request.query_string:
+                return web.json_response({'object': 'list', 'data': await self.models(uid, _user, template, provider, selected)})
+            if request.method != 'POST' or route not in MODEL_ROUTES or request.query_string:
                 raise PolicyError('Provider route is not available')
-            models = await self.models(uid, _user, template, provider)
+            models = await self.models(uid, _user, template, provider, selected)
             policy = {**template, 'models': [model['id'] for model in models]}
-            value = model_payload(await request.json(), policy, uid, request.path)
-            suffix = request.path[len('/v1'):]
+            value = model_payload(await request.json(), policy, uid, route)
+            suffix = route[len('/v1'):]
             endpoint = provider['base_url'] + suffix
             # No browser/worker cookies, authorization or identity headers pass.
             headers = {'Content-Type': 'application/json', 'Accept-Encoding': 'identity',
                        'Authorization': 'Bearer ' + provider['secret']}
-            if request.path == '/v1/messages':
+            if route == '/v1/messages':
                 headers.update({'x-api-key': provider['secret'], 'anthropic-version': '2023-06-01'})
             async with self.limits[uid]:
                 async with self.client.post(endpoint, json=value, headers=headers, allow_redirects=False) as upstream:
@@ -293,8 +302,8 @@ class Brokers:
                     try:
                         while True:
                             done, _ = await asyncio.wait({pending}, timeout=0.5)
-                            current, _template, _provider = entitlement(self.store, uid)
-                            if current['auth_version'] != _user['auth_version']:
+                            current, _template, _provider = entitlement(self.store, uid, selected)
+                            if self.catalog_key(current, _template, _provider) != self.catalog_key(_user, template, provider):
                                 raise PolicyError('Account assignment changed')
                             if not done:
                                 continue

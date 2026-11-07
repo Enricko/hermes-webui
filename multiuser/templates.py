@@ -8,7 +8,7 @@ import re
 
 from multiuser.store import PolicyError, identifier
 
-FIELDS = {"provider_id", "model", "models", "parameters", "agent", "soul", "skills", "tools", "egress_hosts", "skill_bundle_id", "model_catalog"}
+FIELDS = {"provider_id", "model", "models", "parameters", "agent", "soul", "skills", "tools", "egress_hosts", "skill_bundle_id", "model_catalog", "connections"}
 PARAMETERS = {"temperature", "top_p", "max_tokens", "reasoning_effort", "service_tier", "context_length"}
 AGENT_FIELDS = {"max_iterations", "max_turns", "max_tokens", "reasoning_effort", "system_message"}
 SECRET_WORDS = re.compile(r"(?:password|secret|token|credential|api_key|auth\.json|user\.md)", re.I)
@@ -36,6 +36,25 @@ def validate_template(value):
         identifier(out['skill_bundle_id'])
     if out.setdefault('model_catalog', 'allowlist') not in ('allowlist', 'provider'):
         raise PolicyError('Model catalog must be allowlist or provider')
+    connections = out.setdefault('connections', [])
+    if not isinstance(connections, list) or len(connections) > 16:
+        raise PolicyError('Select at most 16 named provider connections')
+    seen_ids, seen_names = set(), set()
+    for connection in connections:
+        if not isinstance(connection, dict) or set(connection) != {'provider_id', 'name', 'model'}:
+            raise PolicyError('Connections contain only an assigned provider ID, name and default model')
+        pid = identifier(connection['provider_id'])
+        name, model = connection['name'], connection['model']
+        if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}', name):
+            raise PolicyError('Invalid provider display name')
+        slug = re.sub(r'[^a-z0-9._-]+', '-', name.lower()).strip('-')
+        if slug == 'account-primary':
+            raise PolicyError('The account primary provider name is reserved')
+        if not isinstance(model, str) or not 1 <= len(model) <= 200 or any(ord(c) < 32 for c in model):
+            raise PolicyError('Select a default model for each connection')
+        if pid in seen_ids or slug in seen_names:
+            raise PolicyError('Duplicate provider connection or name')
+        seen_ids.add(pid); seen_names.add(slug)
     models = out.get('models', [out.get('model')])
     if not isinstance(models, list) or not 1 <= len(models) <= 64 or any(not isinstance(m, str) or not 1 <= len(m) <= 200 for m in models):
         raise PolicyError("Select 1–64 explicit models")
@@ -117,4 +136,14 @@ def worker_config(template):
               'max_turns': agent['max_turns']}
     if document.get('skill_bundle_id'):
         config['skills'] = {'external_dirs': ['/shared/skills']}
+    if document['connections']:
+        # Bind the default lane to an explicit account-primary identity.
+        # Otherwise a named router advertising the same model ID can win the
+        # Agent's legacy model-based connection lookup.
+        model['provider'] = 'custom:account-primary'
+        config['custom_providers'] = [{'name': 'Account primary', 'model': document['model'],
+            'base_url': model['base_url'], 'api_key': 'tenant-broker', 'discover_models': True}]
+        config['custom_providers'] += [{'name': entry['name'], 'model': entry['model'],
+            'base_url': 'http://127.0.0.1:8000/providers/' + entry['provider_id'] + '/v1',
+            'api_key': 'tenant-broker', 'discover_models': True} for entry in document['connections']]
     return config

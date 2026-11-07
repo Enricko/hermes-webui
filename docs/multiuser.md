@@ -306,6 +306,61 @@ External changes participate in the existing invalidation/mtime cache. Account
 profile cards identify the assigned provider and managed connection without
 copying its API key or inventing a local `.env` file.
 
+### Restore multiple custom routers from an existing profile
+
+One shared profile can offer several named provider connections in the ordinary
+Hermes model picker. Under **Templates**, its `connections` list contains only
+`provider_id`, display `name`, and the connection's default `model`; external URLs
+and API keys remain in **Providers**. For example:
+
+```json
+{"connections":[
+  {"provider_id":"ACTUAL_PROVIDER_ID","name":"First Router","model":"its-default-model"},
+  {"provider_id":"ANOTHER_PROVIDER_ID","name":"Second Router","model":"its-default-model"}
+]}
+```
+
+Use the actual IDs returned by provider creation. Duplicate IDs or normalized
+names are rejected. Each connection gets its own provider group; selecting the
+same model ID under two groups retains two distinct destinations. The account's
+**AI provider** assignment selects its primary connection, while the profile's
+approved named connections remain available. To restrict an account to a subset,
+assign a profile whose connections list contains only that subset.
+
+The generated **Account primary** entry is an internal alias for the account's
+selected primary connection, not another external router. Its explicit identity
+prevents a named router with the same model ID from taking over default requests.
+That display name is reserved. Per-account assignment to a named connection also
+uses that connection's own default model, preserving the shared SOUL and skills.
+
+To restore reviewed connections and their existing credentials explicitly,
+stop the provisioner and use the root-only importer:
+
+```bash
+sudo .venv/bin/python -m multiuser.manage --root /srv/hermes import-providers \
+  --source /path/to/existing-hermes-home --template EXISTING_TEMPLATE_ID \
+  --name 'First Router' --name 'Second Router' \
+  --backup /private/backups/providers-before-import
+```
+
+Add `--reuse-provider 'First Router=EXISTING_PROVIDER_ID'` to update an existing
+control-plane connection without duplicating it; this retains its endpoint
+(useful for an existing loopback connection to the same router). Credentials are
+resolved only from that source profile, never the operator process environment.
+The importer privately backs up source config/environment and a consistent
+control database, verifies each live catalog without following redirects, then
+publishes all provider records and profile authorization in one transaction.
+The original source is untouched. A saved default absent from the live catalog
+is recorded in the import report and replaced by an advertised model for the
+new connection. Review the private report before restarting the provisioner.
+
+Workers receive only dummy credentials and `127.0.0.1` broker URLs. Ordinary
+users cannot add connection IDs, select another account's broker, bypass a
+removed connection, or forward arbitrary URLs through a guessed provider ID.
+Rotating a provider key invalidates that connection's catalog cache without
+copying keys into worker environments. Existing conversations and workspace
+folders are preserved during this import.
+
 For rollback, older source can retain the additive database column. Restore an old
 control database only with services stopped and only when intentionally discarding
 later account-control changes. Restore profile capabilities from the private

@@ -46,6 +46,15 @@ Cache authority includes account generation, provider/credential identity and
 policy; a response fetched under an old assignment cannot authorize a new one.
 Provider failures fail closed without forwarding provider error text or keys.
 
+A profile may also authorize named provider connections. Their worker-side
+OpenAI-compatible URLs use fixed per-account broker paths containing opaque
+connection IDs, never external URLs or real keys. The broker checks the ID
+against the authenticated account's effective profile before resolving a server
+endpoint. Same-named models remain distinct by provider. Catalog caches are
+separate for each account/connection; removing a connection rejects late catalog
+responses and closes its active inference streams. Per-account primary-provider
+selection remains independent and uses a named connection's own default model.
+
 Authorities and lifecycle invariants:
 
 - The control database is authoritative for role, enablement, session expiry,
