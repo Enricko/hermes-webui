@@ -130,8 +130,11 @@ this release against an existing installation. Passwords, account IDs, active
 selections and existing data remain unchanged by migration.
 
 Assigned profiles also appear directly in **Profiles → Assigned profiles** and
-the composer profile menu. Select a profile, click **Activate**, confirm its
-provider with **Use selection**, and wait for the private agent to restart.
+the composer profile menu as soon as you sign in. Click a profile to open it
+directly, keeping your current assigned provider; no confirmation picker is
+required. If that provider is unavailable, the profile's allowed default (or
+first assigned provider) is used. Wait for the private agent to restart.
+**Profile & provider** remains an optional way to change the provider explicitly.
 Both entries use the same account grants as **Profile & provider**. The current
 profile shows its real skill/runtime details; inactive profiles load those
 details after activation. Shared source profiles are read-only in this view;

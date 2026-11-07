@@ -311,6 +311,8 @@ async def test_frontend_cannot_be_poisoned_by_runtime_or_untrusted_code(gateway)
     async with alice.get(server.make_url('/api/settings')) as response:
         settings = await response.json()
         assert settings['webui_version'] in html
+        for asset in ('client.js', 'style.css'):
+            assert f'/multiuser/static/{asset}?v={settings["webui_version"]}' in html
         assert settings['auth_enabled'] is True and settings['password_auth_enabled'] is True
     async with aiohttp.ClientSession() as anonymous:
         async with anonymous.get(server.make_url('/'), allow_redirects=False) as response:
@@ -416,6 +418,9 @@ async def test_trusted_assets_support_compression_validation_and_version_caching
         assert 'immutable' in response.headers['Cache-Control']
     async with alice.get(server.make_url('/static/ui.js?v=unknown')) as response:
         assert response.headers['Cache-Control'] == 'no-cache'
+    for asset in ('client.js', 'style.css'):
+        async with alice.get(server.make_url('/multiuser/static/' + asset + '?v=' + service.version)) as response:
+            assert 'immutable' in response.headers['Cache-Control']
     async with alice.get(server.make_url('/static/ui.js'), headers={'Accept-Encoding': 'gzip;q=0'}) as response:
         assert 'Content-Encoding' not in response.headers
 

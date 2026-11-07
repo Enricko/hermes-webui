@@ -8,6 +8,7 @@
   let pickerSequence = 0;
   let selectionBusy = false;
   let selectionDialog;
+  let activationPending = false;
   const element = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -317,6 +318,37 @@
       finally { save.disabled = false; }
     });
   }
+  async function applySelection(profileId, providerId) {
+    const value = await request('/multiuser/api/selection', {template_id:profileId, provider_id:providerId});
+    const personalProfile = typeof S !== 'undefined' && S.activeProfile && S.activeProfile !== 'default';
+    if (value.changed || personalProfile) {
+      localStorage.clear(); sessionStorage.clear(); location.assign('/');
+      return true;
+    }
+    return false;
+  }
+  async function activateAssignedProfile(profileId) {
+    if (activationPending) return;
+    activationPending = true;
+    try {
+      // Refresh grants before choosing a provider; the POST revalidates them
+      // transactionally against the authenticated server session as well.
+      await refreshIdentity();
+      const profile = identity.choices.profiles.find(p => p.id === profileId);
+      if (!profile) throw new Error('Profile is not assigned to this account.');
+      const allowed = identity.choices.providers;
+      const provider = [identity.provider?.id, profile.provider_id, allowed[0]?.id]
+        .find(id => allowed.some(p => p.id === id));
+      if (!provider) throw new Error('Ask your administrator to assign an AI provider.');
+      if (typeof showToast === 'function') showToast('Opening ' + profile.name + '…');
+      if (!await applySelection(profileId, provider)) selectAssignedProfile(profileId);
+    } finally { activationPending = false; }
+  }
+  function openAssignedProfile(profileId) {
+    activateAssignedProfile(profileId).catch(error => {
+      if (typeof showToast === 'function') showToast(error.message);
+    });
+  }
   async function switchAccess(profileId) {
     if (selectionDialog?.open) { selectionDialog.focus(); return; }
     if (selectionBusy) return;
@@ -340,10 +372,7 @@
     const apply = button('Use selection', async () => {
       apply.disabled = true;
       try {
-        const value = await request('/multiuser/api/selection', {template_id:profiles.active(), provider_id:providers.active()});
-        const personalProfile = typeof S !== 'undefined' && S.activeProfile && S.activeProfile !== 'default';
-        if (value.changed || personalProfile) { localStorage.clear(); sessionStorage.clear(); location.assign('/'); }
-        else modal.close();
+        if (!await applySelection(profiles.active(), providers.active())) modal.close();
       } catch (error) { status.textContent = error.message; status.classList.add('mu-error'); apply.disabled = false; }
     });
     apply.classList.add('primary'); apply.disabled = !profiles.active() || !providers.active();
@@ -354,6 +383,16 @@
   // The native menus retain filesystem profile names for sessions/files/cron.
   // Assigned account profiles use opaque IDs and the gateway activation path.
   let assignedMenuData;
+  function accountMenuData(data = {}) {
+    // Identity is gateway-owned and available independently of worker metadata.
+    // A late native render must not replace the full grant list with 'default'.
+    if (!identity?.choices) return data;
+    return {...data, account_profiles:identity.choices.profiles,
+      account_profile_id:identity.profile?.id, account_provider_id:identity.provider?.id,
+      account_provider_label:identity.provider?.name,
+      account_provider_configured:identity.choices.providers.some(p => p.id === identity.provider?.id),
+      account_runtime_state:identity.runtime.state};
+  }
   const assignedProfiles = data => Array.isArray(data.account_profiles) ? data.account_profiles.filter(p =>
     p && /^[0-9a-f]{32}$/.test(p.id) && typeof p.name === 'string' && p.name.length <= 200).slice(0, 32) : [];
   function selectAssignedProfile(id, card, closeDrawer = true) {
@@ -374,9 +413,11 @@
     return true;
   }
   function renderAssignedProfiles(panel, data) {
+    data = accountMenuData(data);
     if (!Array.isArray(data.account_profiles)) return false;
     assignedMenuData = data;
     const section = element('div', undefined, 'mu-assigned-profile-list');
+    section.dataset.catalog = JSON.stringify([data.account_profiles, data.account_profile_id, data.active]);
     section.append(element('div', 'Assigned profiles', 'mu-profile-section-label'));
     for (const profile of assignedProfiles(data)) {
       const active = profile.id === data.account_profile_id && (data.active || 'default') === 'default';
@@ -384,24 +425,26 @@
       card.tabIndex = 0; card.setAttribute('role', 'button');
       const name = element('div', profile.name, 'profile-card-name' + (active ? ' is-active' : ''));
       if (active) name.append(element('span', 'ACTIVE', 'mu-profile-active'));
-      card.append(name, element('div', active ? 'Current profile' : 'Assigned to your account', 'profile-card-meta'));
-      card.addEventListener('click', () => selectAssignedProfile(profile.id, card));
+      card.append(name, element('div', active ? 'Current profile' : 'Click to open', 'profile-card-meta'));
+      const open = () => active ? selectAssignedProfile(profile.id, card) : openAssignedProfile(profile.id);
+      card.addEventListener('click', open);
       card.addEventListener('keydown', event => {
-        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectAssignedProfile(profile.id, card); }
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
       });
       section.append(card);
     }
+    if (data.profiles?.some(p => !p.is_default)) section.append(element('div', 'Personal profiles', 'mu-profile-section-label'));
     panel.append(section);
-    if (data.profiles?.some(p => !p.is_default)) panel.append(element('div', 'Personal profiles', 'mu-profile-section-label'));
     return true;
   }
   function renderAssignedDropdown(container, data) {
+    data = accountMenuData(data);
     if (!Array.isArray(data.account_profiles)) return false;
     container.append(element('div', 'Assigned profiles', 'mu-profile-section-label'));
     for (const profile of assignedProfiles(data)) {
       const row = button('', () => {
         if (typeof closeProfileDropdown === 'function') closeProfileDropdown();
-        switchAccess(profile.id).catch(error => { if (typeof showToast === 'function') showToast(error.message); });
+        openAssignedProfile(profile.id);
       });
       row.className = 'profile-opt mu-assigned-profile-option'; row.dataset.accountProfile = profile.id;
       row.append(element('div', profile.name, 'profile-opt-name'));
@@ -412,7 +455,21 @@
     return true;
   }
   window.HermesAccountProfiles = Object.freeze({render:renderAssignedProfiles, renderDropdown:renderAssignedDropdown,
-    refresh:id => selectAssignedProfile(id, undefined, false), activate:switchAccess});
+    refresh:id => selectAssignedProfile(id, undefined, false), activate:activateAssignedProfile});
+  function syncAssignedNavigation() {
+    const panel = document.getElementById('profilesPanel');
+    if (!panel || !identity?.choices) return;
+    const data = accountMenuData(typeof _profilesCache !== 'undefined' && _profilesCache ? _profilesCache : assignedMenuData);
+    assignedMenuData = data;
+    const catalog = JSON.stringify([data.account_profiles, data.account_profile_id, data.active]);
+    const existing = panel.querySelector('.mu-assigned-profile-list');
+    if (existing?.dataset.catalog === catalog) return;
+    existing?.remove();
+    // Only the visible default card is replaced. Filesystem profile names and
+    // their native cache remain intact for session/file/cron callers.
+    panel.querySelector('.profile-card[data-name="default"]')?.remove();
+    renderAssignedProfiles(panel, data);
+  }
   async function refreshIdentity() {
     identity = await request('/multiuser/api/me');
     const profile = document.getElementById('mu-base-profile');
@@ -424,10 +481,17 @@
         identity.runtime.state === 'template_conflict' ? 'A template update needs review; your private edits were preserved.' :
         'Your private workspace is starting. You can keep this page open.';
     }
+    syncAssignedNavigation();
   }
   async function boot() {
     try {
       await refreshIdentity();
+      const profilesPanel = document.getElementById('profilesPanel');
+      if (profilesPanel) {
+        // Upstream redraws this panel asynchronously. Observe just this list,
+        // not the whole document, and restore the authenticated catalog once.
+        new MutationObserver(syncAssignedNavigation).observe(profilesPanel, {childList:true});
+      }
       const bar = element('div', undefined, 'mu-account');
       bar.id = 'mu-account';
       bar.append(element('span', identity.username + (identity.role === 'admin' ? ' · Admin' : ''), 'mu-account-name'));

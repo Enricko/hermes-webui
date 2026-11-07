@@ -349,7 +349,7 @@ class Gateway:
             # Do not boot upstream with a cascade of 503 settings/model/file
             # requests: those initializers do not replay when provisioning ends.
             html = (ASSETS / 'waiting.html').read_text()
-            controls = ('<script defer src="/multiuser/static/client.js"></script>'
+            controls = (f'<script defer src="/multiuser/static/client.js?v={self.version}"></script>'
                         if request.path == '/multiuser/admin' and session.role == 'admin' else '')
             html = html.replace('__ACCOUNT_CONTROLS__', controls)
             return web.Response(text=html, content_type='text/html', headers={'Cache-Control': 'no-store'})
@@ -361,8 +361,8 @@ class Gateway:
                     .replace('__MAX_UPLOAD_BYTES__', str(self.settings.max_upload_bytes))
                     .replace('__CSRF_TOKEN_JSON__', json.dumps(session.csrf))
                     .replace('__CSP_IMG_EXTRA_JSON__', '[]'))
-        html = html.replace('</head>', '<link rel="stylesheet" href="/multiuser/static/style.css">'
-                            '<script defer src="/multiuser/static/client.js"></script></head>')
+        html = html.replace('</head>', f'<link rel="stylesheet" href="/multiuser/static/style.css?v={self.version}">'
+                            f'<script defer src="/multiuser/static/client.js?v={self.version}"></script></head>')
         return web.Response(text=html, content_type='text/html', headers={'Cache-Control': 'no-store'})
 
     async def static(self, request):

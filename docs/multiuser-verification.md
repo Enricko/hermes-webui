@@ -207,3 +207,33 @@ stream/upload and account-switch checks pass with no browser or HTTP errors.
 The native filesystem profile list remains separate for session/file/cron
 callers. This change adds no schema migration, dependency or worker image, and
 does not copy or alter original Hermes profile data or account grants.
+
+## Immediate assigned menus and one-click activation — 2026-11-07
+
+Assigned profiles now populate directly from the authenticated identity catalog,
+including after a late native render replaces the menu with only its physical
+`default` row. A click or keyboard activation opens an inactive assigned profile
+with the current allowed provider, without the separate selection dialog. The
+optional provider picker remains available. Account assets use the release
+fingerprint so a fresh page loads matching native and account controls.
+
+**108 focused host tests passed.** New frontend regressions cover keeping an
+independently assigned provider, allowed fallback choices, missing providers,
+duplicate clicks and refreshed revocation. All four new activation cases fail
+against the previous client and pass with the change. HTTP checks verify that
+the served account asset URLs carry the release version and support immutable
+caching only for that version. Existing authorization, generation/stream,
+broker, account/catalog and neighboring native profile tests remain green.
+
+The real Docker WebUI/Agent browser harness passed at **1440, 760 and 390 px**
+with no uncaught JavaScript or HTTP errors. It verifies automatic menu recovery
+after a simulated late default-only render, both assigned menu locations,
+single-click regular-user activation, preservation of its chosen provider and
+login, and a saved workspace canary surviving the runtime replacement. Another
+user still receives only its own profile. Chat, streaming, attachments, account
+management and same-browser user switching continue to pass. Screenshots and
+the JSON acceptance report are saved in the operator's evidence directory.
+
+No schema, dependencies, runtime images or account grants change in this update.
+Switching a profile still reconciles the account's isolated agent; it does not
+run multiple capability profiles inside a shared process.

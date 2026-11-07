@@ -74,14 +74,19 @@ async def run():
                     await page.evaluate('() => loadProfilesPanel()')
                     if width <= 640:
                         assert await page.evaluate('() => document.querySelector(".sidebar").classList.contains("mobile-open")')
-                    await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
-                    await page.locator('#profileDetailTitle').get_by_text('Installed Hermes / writer', exact=True).wait_for()
+                    assert await page.locator('#profilesPanel [data-account-profile]').count() == 2
                     assert not await page.locator('#btnDeleteProfileDetail').is_visible()
-                    await page.locator('#btnActivateProfileDetail').click()
-                    preview = page.locator('.mu-selection-dialog'); await preview.wait_for(state='visible')
-                    assert await preview.locator(f'[name=active-profile][value="{lab.discovered_template}"]').is_checked()
-                    await preview.get_by_role('button', name='Close', exact=True).click()
+                    assert await page.locator('.mu-selection-dialog').count() == 0
                     await page.screenshot(path=str(evidence / (label + '-profile-shared-skills.png')))
+                    # Simulate a late legacy native render that only knows the
+                    # physical default. The identity catalog restores both
+                    # grants automatically, without another selection dialog.
+                    await page.evaluate('''() => {
+                        document.querySelector('#profilesPanel').innerHTML = '<div class="profile-card" data-name="default">default</div>';
+                    }''')
+                    await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').wait_for(state='visible')
+                    assert await page.locator('#profilesPanel [data-account-profile]').count() == 2
+                    assert await page.locator('#profilesPanel [data-name="default"]').count() == 0
                     await page.goto(lab.origin + '/')
                     if not await page.locator('.nav-tab[data-panel="chat"]:visible').count():
                         await page.locator('#btnHamburger').click()
@@ -284,21 +289,17 @@ async def run():
                 # Activate through the primary Profiles menu, not a separate
                 # shortcut that could mask a missing assigned-profile entry.
                 await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
-                await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
-                await page.locator('#btnActivateProfileDetail').click()
-                switcher = page.locator('.mu-selection-dialog')
-                await switcher.wait_for(state='visible')
-                assert await switcher.locator('[name=active-profile]').count() == 2
-                assert await switcher.locator('[name=active-provider]').count() == 1
-                await switcher.locator(f'[name=active-profile][value="{lab.discovered_template}"]').check()
+                assert await page.locator('#profilesPanel [data-account-profile]').count() == 2
                 await page.screenshot(path=str(evidence / 'regular-user-assigned-switcher.png'))
                 async with page.expect_response(lambda r: '/multiuser/api/selection' in r.url) as switched:
-                    await switcher.get_by_role('button', name='Use selection', exact=True).click()
+                    await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
                 assert (await switched.value).status == 200
+                assert (await switched.value).request.post_data_json == {'template_id':lab.discovered_template, 'provider_id':lab.provider}
                 await lab.ready(['alice'])
                 await page.wait_for_function('() => Boolean(document.querySelector("#mu-base-profile")?.textContent.includes("Installed Hermes / writer"))', timeout=60000)
                 await page.locator('#msg').wait_for(state='visible')
                 assert '/login' not in page.url
+                assert await page.locator('.mu-selection-dialog').count() == 0
                 assert 'my saved work' in await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/profile-switch-canary").read_text())')
                 await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
                 current_profile = page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]')
@@ -327,6 +328,8 @@ async def run():
             'profile_shared_skill_counts_and_complete_provider_catalog': True,
             'independent_multiple_profile_provider_assignments_and_self_switch': True,
             'assigned_profiles_in_primary_panel_and_dropdown': True,
+            'one_click_activation_preserves_current_provider_without_picker': True,
+            'identity_restores_full_assigned_catalog_after_late_native_render': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

@@ -7375,7 +7375,7 @@ async function loadProfilesPanel() {
       panel.appendChild(explainer);
     }
 
-    const accountProfiles = Array.isArray(data.account_profiles) && typeof window !== 'undefined' &&
+    const accountProfiles = typeof window !== 'undefined' &&
       window.HermesAccountProfiles?.render(panel, data);
     if ((!data.profiles || !data.profiles.length) && !accountProfiles) {
       const emptyMsg = document.createElement('div');
@@ -7578,7 +7578,7 @@ function renderProfileDropdown(data) {
   const dd = $('profileDropdown');
   if (!dd) return;
   dd.innerHTML = '';
-  const accountProfiles = Array.isArray(data.account_profiles) && typeof window !== 'undefined' &&
+  const accountProfiles = typeof window !== 'undefined' &&
     window.HermesAccountProfiles?.renderDropdown(dd, data);
   const allProfiles = (Array.isArray(data.profiles) ? data.profiles : []).filter(p => p && typeof p.name === 'string');
   const active = (S.activeProfile && allProfiles.some(p => p.name === S.activeProfile))

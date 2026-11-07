@@ -67,6 +67,13 @@ name or identity cookie. Shared assigned profiles have no native delete action;
 personal subprofiles remain separate. The active assigned profile's detail uses
 actual worker skill counts. Inactive profiles do not invent runtime statistics.
 
+All assigned profiles are visible immediately from the gateway identity catalog,
+including after late native menu rendering. Clicking a profile activates it
+directly with the current allowed provider; an unavailable provider falls back
+only within the account's current grants. The optional profile/provider dialog
+is not an activation prerequisite. Gateway account assets carry the same release
+fingerprint as native assets to avoid mixing cached UI revisions.
+
 Model access may use an explicit allowlist (the compatibility default) or the
 live catalog of the account's assigned provider. In provider-catalog mode the
 same validated, bounded catalog authorizes inference and feeds discovery.
