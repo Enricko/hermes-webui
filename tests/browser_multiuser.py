@@ -53,6 +53,7 @@ async def run():
                     await page.locator('#mu-sign-in').click()
                     await page.wait_for_url(lab.origin + '/')
                     await page.locator('#mu-account').wait_for(state='attached')
+                    assert await page.get_by_role('button', name='Profile & provider', exact=True).count() == 0
                     await page.wait_for_timeout(2000)
                     assert await page.locator('#msg').count() == 1
                     assert not await page.get_by_text('This tab is running a different WebUI version.', exact=False).is_visible()

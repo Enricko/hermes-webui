@@ -6,8 +6,6 @@
   let selectedAccount;
   let panelGeneration = 0;
   let pickerSequence = 0;
-  let selectionBusy = false;
-  let selectionDialog;
   let activationPending = false;
   const element = (tag, text, className) => {
     const node = document.createElement(tag);
@@ -358,37 +356,6 @@
       if (typeof showToast === 'function') showToast(error.message);
     });
   }
-  async function switchAccess(profileId) {
-    if (selectionDialog?.open) { selectionDialog.focus(); return; }
-    if (selectionBusy) return;
-    selectionBusy = true;
-    try { await refreshIdentity(); }
-    finally { selectionBusy = false; }
-    if (profileId && !identity.choices.profiles.some(p => p.id === profileId)) throw new Error('Profile is not assigned to this account.');
-    const modal = element('dialog', undefined, 'mu-dialog mu-selection-dialog');
-    selectionDialog = modal;
-    const title = element('h2', 'Your profiles & providers'); title.id = `mu-selection-${++pickerSequence}`;
-    modal.setAttribute('aria-labelledby', title.id);
-    const header = element('div', undefined, 'mu-dialog-header');
-    header.append(title, button('Close', () => modal.close())); modal.append(header);
-    const content = element('div', undefined, 'mu-selection-body'); modal.append(content);
-    content.append(element('p', 'Profiles open in place. Changing your account default provider prepares the workspace again; saved chats and files stay available.', 'mu-help'));
-    const profiles = picker(content, 'active-profile', 'Profile', identity.choices.profiles.map(p => ({id:p.id, name:p.name, description:'Agent instructions and skills'})),
-      [profileId || identity.profile?.id], profileId || identity.profile?.id, false);
-    const providers = picker(content, 'active-provider', 'AI provider', identity.choices.providers,
-      [identity.provider?.id], identity.provider?.id, false);
-    const status = element('p', '', 'mu-status'); status.setAttribute('role', 'status'); content.append(status);
-    const apply = button('Use selection', async () => {
-      apply.disabled = true;
-      try {
-        if (!await applySelection(profiles.active(), providers.active())) modal.close();
-      } catch (error) { status.textContent = error.message; status.classList.add('mu-error'); apply.disabled = false; }
-    });
-    apply.classList.add('primary'); apply.disabled = !profiles.active() || !providers.active();
-    content.append(apply);
-    modal.addEventListener('close', () => modal.remove(), {once:true});
-    document.body.append(modal); modal.showModal();
-  }
   // The native menus retain filesystem profile names for sessions/files/cron.
   // Assigned account profiles use opaque IDs and the gateway activation path.
   let assignedMenuData;
@@ -515,7 +482,6 @@
       bar.id = 'mu-account';
       bar.append(element('span', identity.username + (identity.role === 'admin' ? ' · Admin' : ''), 'mu-account-name'));
       if (identity.role === 'admin') bar.append(button('Accounts', () => panel().catch(e => message(e.message, true))));
-      if (identity.choices.profiles.length && identity.choices.providers.length) bar.append(button('Profile & provider', () => switchAccess().catch(() => {})));
       bar.append(button('Sign out', () => logout().catch(() => location.replace('/login'))));
       const profile = element('small', '', 'mu-base-profile'); profile.id = 'mu-base-profile'; bar.append(profile);
       const sidebar = document.querySelector('.sidebar');

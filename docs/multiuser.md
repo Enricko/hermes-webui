@@ -114,8 +114,9 @@ with an explicit access list. Defaults choose the initial setup, rather than
 granting access to an unchecked option. Removing a provider immediately blocks
 its broker route, including requests from an old worker awaiting reconciliation.
 
-Users click **Profile & provider** in the sidebar to activate any assigned
-combination. A prepared profile switches in place using the native Hermes
+Users switch assigned profiles from the chat composer or the **Profiles** menu,
+and choose an allowed provider/model in the composer's model controls.
+A prepared profile switches in place using the native Hermes
 transition: no page reload, container restart, browser preference reset or
 another login. Running sessions/jobs stay with their original profile. Source
 profiles are shared capabilities; switching them does not import original
@@ -138,9 +139,9 @@ directly, keeping your current assigned provider; no confirmation picker is
 required. If that provider is unavailable, the profile's allowed default (or
 first assigned provider) is used. All granted profiles are provisioned together
 so ordinary switches reuse the already running private workspace.
-**Profile & provider** remains an optional way to change the provider explicitly.
-Both entries use the same account grants as **Profile & provider**. Prepared
-profiles show their real skill/runtime details. Shared source profiles are read-only in this view;
+Both profile menus use the same authenticated account grants. There is no
+separate sidebar selection dialog. Prepared profiles show their real
+skill/runtime details. Shared source profiles are read-only in this view;
 administrators change their assignments in Accounts. Additional personal
 subprofiles are listed separately and remain inside the user's private runtime.
 

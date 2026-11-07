@@ -70,7 +70,7 @@ The legacy selection path retains only its initiating session with unchanged
 expiry/CSRF. Concurrent revocation cannot be undone by a stale selection.
 
 The native Profiles panel and profile menu use the same authenticated assigned
-catalog as the account switcher. `/api/profiles` keeps its worker filesystem
+catalog from the account gateway. `/api/profiles` keeps its worker filesystem
 `profiles` list unchanged for sessions, files and cron, and adds a separate
 `account_profiles` list containing only server-authorized IDs and labels. Worker
 responses cannot supply that account catalog. Assigned-profile activation uses
@@ -82,9 +82,10 @@ actual worker skill counts for each prepared profile.
 All assigned profiles are visible immediately from the gateway identity catalog,
 including after late native menu rendering. Clicking a profile activates it
 directly with the current allowed provider; an unavailable provider falls back
-only within the account's current grants. The optional profile/provider dialog
-is not an activation prerequisite. Gateway account assets carry the same release
-fingerprint as native assets to avoid mixing cached UI revisions.
+only within the account's current grants. The composer and Profiles menu are
+the user-facing switching controls; assignments/defaults belong to Accounts.
+Gateway account assets carry the same release fingerprint as native assets to
+avoid mixing cached UI revisions.
 
 Model access may use an explicit allowlist (the compatibility default) or the
 live catalog of the account's assigned provider. In provider-catalog mode the
