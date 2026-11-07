@@ -276,13 +276,15 @@ class Gateway:
 
     async def select_access(self, request):
         principal = self.require(request)
-        body = await object_body(request, {'template_id', 'provider_id'})
+        body = await object_body(request, {'template_id', 'provider_id', 'native'})
+        if 'native' in body and not isinstance(body['native'], bool):
+            raise PolicyError('Invalid native switch request')
         self.store.select_access(principal, body.get('template_id'), body.get('provider_id'), validate_only=True)
         user = self.store.user(principal.user_id)
         plan = read_plan(self.settings, user)
         base = self.store.template(user['template_id'])
         primary = user['provider_id'] or base['document']['provider_id']
-        if plan and body.get('template_id') in plan['profiles'] and body.get('provider_id') == primary:
+        if body.get('native') and plan and body.get('template_id') in plan['profiles'] and body.get('provider_id') == primary:
             _active, current = selected_profile(user, plan, request.cookies.get('hermes_profile'))
             native = plan['profiles'][body['template_id']]
             return json_response({'changed':native != current, 'native_profile':native})

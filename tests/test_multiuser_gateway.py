@@ -263,7 +263,7 @@ async def test_prepared_profile_switch_preserves_runtime_sessions_and_old_stream
     headers = {'Origin':settings.origin, 'X-Hermes-CSRF-Token':csrf}
     stream = await alice.get(server.make_url('/api/stream'))
     await stream.content.readuntil(b'\n\n')
-    async with alice.post(server.make_url('/multiuser/api/selection'), json={'template_id':b,'provider_id':provider}, headers=headers) as response:
+    async with alice.post(server.make_url('/multiuser/api/selection'), json={'template_id':b,'provider_id':provider,'native':True}, headers=headers) as response:
         assert response.status == 200 and (await response.json()) == {'changed':True,'native_profile':'assigned-'+b}
     async with alice.post(server.make_url('/api/profile/switch'), json={'name':'assigned-'+b}, headers=headers) as response:
         assert response.status == 200 and (await response.json())['active'] == 'assigned-'+b

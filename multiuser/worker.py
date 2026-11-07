@@ -34,7 +34,6 @@ def main():
     private_home = base_home if profile == 'default' else base_home + '/profiles/' + profile
     os.environ.update({
         'HOME': private_home, 'HERMES_HOME': private_home, 'HERMES_BASE_HOME': base_home,
-        'HERMES_CONFIG_PATH': private_home + '/config.yaml',
         'HERMES_WEBUI_STATE_DIR': private_home + '/webui',
         'HERMES_WEBUI_DEFAULT_WORKSPACE': '/workspace',
         'HERMES_WEBUI_AGENT_DIR': '/opt/hermes',
@@ -49,8 +48,13 @@ def main():
         'OPENAI_API_KEY': 'tenant-broker', 'OPENAI_BASE_URL': 'http://127.0.0.1:8000/v1',
         'AWS_EC2_METADATA_DISABLED': 'true',
     })
+    # A global config override pins every request to the root YAML and defeats
+    # upstream's request-local native profile routing. Only fixed-home cron
+    # processes need an explicit override; the WebUI resolves it per request.
+    os.environ.pop('HERMES_CONFIG_PATH', None)
     os.chdir('/workspace')
     if '--cron' in sys.argv[1:]:
+        os.environ['HERMES_CONFIG_PATH'] = private_home + '/config.yaml'
         cron_loop()
         return
     # Fail at startup if the actual Agent cannot import. An agent-free UI is
@@ -68,7 +72,15 @@ def main():
     # Each scheduler imports the official Agent in a fresh process with its
     # own fixed home/config. Profile switching never changes a shared env.
     commands += [[sys.executable, '-m', 'multiuser.worker', '--cron', '--profile', name] for name in profiles]
-    children = [subprocess.Popen(command, start_new_session=True) for command in commands]
+    children = []
+    for command in commands:
+        env = dict(os.environ)
+        if '--profile' in command:
+            name = command[command.index('--profile') + 1]
+            home = base_home if name == 'default' else base_home + '/profiles/' + name
+            env.update(HOME=home, HERMES_HOME=home, HERMES_CONFIG_PATH=home+'/config.yaml',
+                       HERMES_WEBUI_STATE_DIR=home+'/webui', XDG_CACHE_HOME=home+'/cache')
+        children.append(subprocess.Popen(command, start_new_session=True, env=env))
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda _sig, _frame: stopping.set())
