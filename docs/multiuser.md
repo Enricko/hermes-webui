@@ -129,6 +129,15 @@ Schema v4 is additive; use `upgrade --backup /private/new-path` before launching
 this release against an existing installation. Passwords, account IDs, active
 selections and existing data remain unchanged by migration.
 
+Assigned profiles also appear directly in **Profiles → Assigned profiles** and
+the composer profile menu. Select a profile, click **Activate**, confirm its
+provider with **Use selection**, and wait for the private agent to restart.
+Both entries use the same account grants as **Profile & provider**. The current
+profile shows its real skill/runtime details; inactive profiles load those
+details after activation. Shared source profiles are read-only in this view;
+administrators change their assignments in Accounts. Additional personal
+subprofiles are listed separately and remain inside the user's private runtime.
+
 Discovery imports model/response/Agent parameters, SOUL instructions and reusable
 skills, including `skills.external_dirs` located **inside the registered Hermes
 home**. Local skills take precedence. Source files are never modified. Skill

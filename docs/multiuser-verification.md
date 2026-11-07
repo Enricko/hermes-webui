@@ -179,3 +179,31 @@ OAuth providers, stateful external integrations, or personal historical data.
 Before/after screenshots and JSON results are stored in the operator-selected
 evidence directory. The user-facing controls remain native HTML with the
 existing Hermes theme; no frontend framework or additional dependency is used.
+
+## Assigned profiles in native navigation — 2026-11-07
+
+An account with two granted profiles previously saw only its worker's local
+`default` profile in the native Profiles panel. The new HTTP regression fails
+against the previous gateway and passes with the authenticated assigned catalog.
+It also verifies that worker-supplied account IDs/catalog entries are overwritten,
+and an account granted one profile receives only that profile.
+
+**104 focused host tests passed**, covering gateway/access, account/broker/catalog
+behavior, assigned-menu lifecycle and neighboring native profile/dropdown,
+recovery and workspace-copy behavior. JavaScript lifecycle coverage verifies
+that metadata refresh keeps an open drawer open, while an actual click/keyboard
+selection closes it; active statistics come from the worker and inactive
+profiles do not invent counts.
+
+The real WebUI/Agent Docker browser harness passed at **1440, 760 and 390 px**:
+two admin-assigned profiles appear in the native panel and composer menu;
+selecting an inactive profile reveals Activate and preselects its granted ID;
+shared-profile deletion is unavailable; regular-user activation through the
+primary Profiles panel completes a real runtime restart without another login
+or losing a saved workspace file. The active badge follows the selected account
+profile, and the second user's catalog remains restricted. Existing chat,
+stream/upload and account-switch checks pass with no browser or HTTP errors.
+
+The native filesystem profile list remains separate for session/file/cron
+callers. This change adds no schema migration, dependency or worker image, and
+does not copy or alter original Hermes profile data or account grants.

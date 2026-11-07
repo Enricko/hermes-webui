@@ -31,6 +31,9 @@
 .mu-person small{font-size:12px;color:var(--text-muted,#a0a0b0)}.mu-person[aria-pressed=true]{border-color:var(--accent,#c6ac8f);background:var(--input-bg,#1c1c30)}
 .mu-account-editor{min-width:0}.mu-picker{min-inline-size:0;margin:20px 0!important;padding:0!important;border:0!important;border-radius:0!important}
 .mu-back-to-people{display:none}.mu-dialog-body{scroll-padding-bottom:70px}
+.mu-profile-section-label{padding:9px 6px 6px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.mu-profile-active{font-size:10px;margin-left:8px;color:var(--link);font-weight:600}.mu-assigned-profile-list .profile-card:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.mu-assigned-profile-option{display:block;width:100%;text-align:left;background:transparent;border:0;color:inherit;font:inherit;cursor:pointer}
 .mu-picker legend{font-size:14px;font-weight:600;margin-bottom:8px;padding:0}.mu-picker-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}.mu-picker-toolbar small{margin-right:auto}.mu-picker-toolbar button{background:transparent;border:0;color:var(--text-muted,#a0a0b0);font:inherit;text-decoration:underline;text-underline-offset:3px;padding:0 3px}
 .mu-choices{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.mu-choice{display:flex;align-items:flex-start;flex-direction:column;border:1px solid var(--border,#37374b);border-radius:7px;min-width:0;background:transparent}
 .mu-choice.is-selected{border-color:var(--accent,#c6ac8f);background:var(--input-bg,#1c1c30)}

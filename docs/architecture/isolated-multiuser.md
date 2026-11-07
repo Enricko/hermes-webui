@@ -57,6 +57,16 @@ reconciled. Concurrent admin revocation cannot be undone by a stale selection.
 Profiles are reusable capabilities; private saved state stays with the account
 when changing its active base profile. No original source-home history is copied.
 
+The native Profiles panel and profile menu use the same authenticated assigned
+catalog as the account switcher. `/api/profiles` keeps its worker filesystem
+`profiles` list unchanged for sessions, files and cron, and adds a separate
+`account_profiles` list containing only server-authorized IDs and labels. Worker
+responses cannot supply that account catalog. Assigned-profile activation uses
+the gateway selection endpoint, never a template ID as a filesystem profile
+name or identity cookie. Shared assigned profiles have no native delete action;
+personal subprofiles remain separate. The active assigned profile's detail uses
+actual worker skill counts. Inactive profiles do not invent runtime statistics.
+
 Model access may use an explicit allowlist (the compatibility default) or the
 live catalog of the account's assigned provider. In provider-catalog mode the
 same validated, bounded catalog authorizes inference and feeds discovery.

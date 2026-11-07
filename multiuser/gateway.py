@@ -234,11 +234,25 @@ class Gateway:
                               'csrf_token': session.csrf if session else None,
                               'multiuser': True, 'username': session.username if session else None})
 
+    def account_choices(self, user):
+        """One server-owned catalog for identity controls and profile menus."""
+        labels = {p['template_id']:p['name'] for p in self.store.discovered_profiles() if p['template_id']}
+        profiles = []
+        for tid in user['template_ids']:
+            with contextlib.suppress(PolicyError):
+                template = self.store.template(tid)
+                profiles.append({'id':tid, 'name':labels.get(tid, template['name']), 'model':template['document']['model'],
+                                 'provider_id':template['document']['provider_id']})
+        providers = [{'id':p['id'], 'name':p['name']} for p in self.store.providers()
+                     if p['enabled'] and p['id'] in user['provider_ids']]
+        return {'profiles':profiles, 'providers':providers}
+
     async def me(self, request):
         session = self.require(request)
         runtime = self.store.runtime(session.user_id)
         user = self.store.user(session.user_id)
-        labels = {p['template_id']:p['name'] for p in self.store.discovered_profiles() if p['template_id']}
+        choices = self.account_choices(user)
+        labels = {p['id']:p['name'] for p in choices['profiles']}
         profile, provider = None, None
         if user['template_id']:
             # Identity/account controls must remain available even when a
@@ -250,16 +264,8 @@ class Gateway:
                 configured = next((p for p in self.store.providers() if p['id'] == selected), None)
                 if configured:
                     provider = {'id': configured['id'], 'name': configured['name']}
-        profiles = []
-        for tid in user['template_ids']:
-            with contextlib.suppress(PolicyError):
-                template = self.store.template(tid)
-                profiles.append({'id': tid, 'name': labels.get(tid, template['name']), 'model': template['document']['model'],
-                                 'provider_id': template['document']['provider_id']})
-        providers = [{'id': p['id'], 'name': p['name']} for p in self.store.providers()
-                     if p['enabled'] and p['id'] in user['provider_ids']]
         return json_response({**session.public(), 'profile': profile, 'provider': provider,
-            'choices': {'profiles': profiles, 'providers': providers}, 'runtime': {
+            'choices': choices, 'runtime': {
             'state': runtime['state'] if runtime else 'pending',
             'message': runtime['error'] if runtime else ''}})
 
@@ -268,8 +274,9 @@ class Gateway:
         body = await object_body(request, {'template_id', 'provider_id'})
         changed = self.store.select_access(principal, body.get('template_id'), body.get('provider_id'))
         response = json_response({'changed': changed})
-        if changed:
-            response.del_cookie('hermes_profile', path='/')
+        # An assigned base profile always activates the worker's default home,
+        # including a no-op selection made while a personal subprofile is open.
+        response.del_cookie('hermes_profile', path='/')
         return response
 
     async def users(self, request):
@@ -479,14 +486,27 @@ class Gateway:
                                      passkeys_enabled=False, passwordless_enabled=False)
                     else:
                         user = self.store.user(uid)
+                        choices = self.account_choices(user)
+                        # Do not turn assigned IDs into filesystem profile names.
+                        # Existing session/cron/file clients keep the worker list;
+                        # navigation renders this separate authenticated catalog.
+                        value.update(account_profiles=[{'id':p['id'], 'name':p['name']} for p in choices['profiles']],
+                                     account_profile_id=user['template_id'], account_provider_id=None,
+                                     account_provider_label='Unavailable', account_provider_configured=False,
+                                     account_runtime_state=runtime['state'])
                         if user['template_id']:
                             template = self.store.template(user['template_id'])
                             selected = user['provider_id'] or template['document']['provider_id']
                             provider = next((p for p in self.store.providers() if p['id'] == selected), None)
+                            value.update(account_provider_id=selected,
+                                account_provider_label=provider['name'] if provider else 'Unavailable',
+                                account_provider_configured=bool(provider and provider['enabled']))
                             for row in value.get('profiles', []):
                                 if row.get('is_default'):
                                     row.update(provider_managed=True, provider_configured=bool(provider and provider['enabled']),
                                         provider_label=provider['name'] if provider else 'Unavailable', account_runtime_state=runtime['state'])
+                    if not self.session_current(principal):
+                        raise web.HTTPForbidden()
                     return json_response(value)
                 out_headers = {key: value for key, value in upstream.headers.items() if key.lower() not in HOP_HEADERS}
                 out_headers['Cache-Control'] = 'no-store'

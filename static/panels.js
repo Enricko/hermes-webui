@@ -7375,7 +7375,9 @@ async function loadProfilesPanel() {
       panel.appendChild(explainer);
     }
 
-    if (!data.profiles || !data.profiles.length) {
+    const accountProfiles = Array.isArray(data.account_profiles) && typeof window !== 'undefined' &&
+      window.HermesAccountProfiles?.render(panel, data);
+    if ((!data.profiles || !data.profiles.length) && !accountProfiles) {
       const emptyMsg = document.createElement('div');
       emptyMsg.style.cssText = 'padding:16px;color:var(--muted);font-size:12px';
       emptyMsg.textContent = t('profiles_no_profiles');
@@ -7386,7 +7388,8 @@ async function loadProfilesPanel() {
     const activeName = (S.activeProfile && data.profiles.some(p => p.name === S.activeProfile))
       ? S.activeProfile
       : (data.active || 'default');
-    for (const p of data.profiles) {
+    for (const p of data.profiles || []) {
+      if (accountProfiles && p.is_default) continue;
       const card = document.createElement('div');
       card.className = 'profile-card';
       card.dataset.name = p.name;
@@ -7414,9 +7417,13 @@ async function loadProfilesPanel() {
     }
     // Re-render detail with fresh data if we have one and we're not in a form
     if (_currentProfileDetail && _profileMode !== 'create') {
-      const refreshed = data.profiles.find(p => p.name === _currentProfileDetail.name);
-      if (refreshed) _renderProfileDetail(refreshed, data.active);
-      else _clearProfileDetail();
+      if (_currentProfileDetail.account_profile_id) {
+        if (!window.HermesAccountProfiles?.refresh(_currentProfileDetail.account_profile_id)) _clearProfileDetail();
+      } else {
+        const refreshed = data.profiles.find(p => p.name === _currentProfileDetail.name);
+        if (refreshed) _renderProfileDetail(refreshed, data.active);
+        else _clearProfileDetail();
+      }
     }
   } catch (e) {
     panel.innerHTML = `<div style="color:var(--accent);font-size:12px;padding:12px">${esc(t('error_prefix'))}${esc(e.message)}</div>`;
@@ -7453,13 +7460,15 @@ function _renderProfileDetail(p, activeName){
   const empty = $('profileDetailEmpty');
   if (!title || !body) return;
   title.textContent = p.name;
-  const isActive = p.name === activeName;
+  const isActive = p.account_profile_id ? p.account_profile_active : p.name === activeName;
   const isDefault = !!p.is_default;
   const statusBadge = isActive
     ? `<span class="detail-badge active">${esc(t('profile_active'))}</span>`
     : `<span class="detail-badge">Inactive</span>`;
   const defaultBadge = isDefault ? ` <span class="detail-badge">${esc(t('profile_default_label'))}</span>` : '';
-  const gwBadge = p.provider_managed
+  const gwBadge = p.account_profile_id && !p.account_profile_active
+    ? '<span class="detail-badge">Starts when activated</span>'
+    : p.provider_managed
     ? `<span class="detail-badge${p.account_runtime_state === 'ready' ? ' ok' : ''}">${esc(p.account_runtime_state === 'ready' ? 'Workspace ready' : 'Workspace ' + p.account_runtime_state)}</span>`
     : p.gateway_running
     ? `<span class="detail-badge ok">${esc(t('profile_gateway_running'))}</span>`
@@ -7496,11 +7505,11 @@ function _setProfileHeaderButtons(mode, p, activeName){
   const hide = b => b && (b.style.display = 'none');
   if (mode === 'read') {
     if (header) header.style.display = 'flex';
-    const isActive = p && p.name === activeName;
+    const isActive = p && (p.account_profile_id ? p.account_profile_active : p.name === activeName);
     const isDefault = !!(p && p.is_default);
     const singleProfileMode = !!(_profilesCache && _profilesCache.single_profile_mode);
-    if (isActive || singleProfileMode) hide(actBtn); else show(actBtn);
-    if (isDefault || singleProfileMode) hide(delBtn); else show(delBtn);
+    if (isActive || (singleProfileMode && !p?.account_profile_id)) hide(actBtn); else show(actBtn);
+    if (isDefault || singleProfileMode || p?.account_profile_id) hide(delBtn); else show(delBtn);
     hide(cancelBtn); hide(saveBtn);
   } else if (mode === 'create') {
     if (header) header.style.display = 'flex';
@@ -7542,11 +7551,16 @@ function _clearProfileDetail(){
 
 async function activateCurrentProfile(){
   if (!_currentProfileDetail) return;
+  if (_currentProfileDetail.account_profile_id) {
+    try { await window.HermesAccountProfiles.activate(_currentProfileDetail.account_profile_id); }
+    catch (e) { showToast(e.message); }
+    return;
+  }
   await switchToProfile(_currentProfileDetail.name);
 }
 
 async function deleteCurrentProfile(){
-  if (!_currentProfileDetail) return;
+  if (!_currentProfileDetail || _currentProfileDetail.account_profile_id) return;
   const name = _currentProfileDetail.name;
   const _ok = await showConfirmDialog({title:t('profile_delete_confirm_title',name),message:t('profile_delete_confirm_message'),confirmLabel:t('delete_title'),danger:true,focusCancel:true});
   if(!_ok) return;
@@ -7564,12 +7578,15 @@ function renderProfileDropdown(data) {
   const dd = $('profileDropdown');
   if (!dd) return;
   dd.innerHTML = '';
+  const accountProfiles = Array.isArray(data.account_profiles) && typeof window !== 'undefined' &&
+    window.HermesAccountProfiles?.renderDropdown(dd, data);
   const allProfiles = (Array.isArray(data.profiles) ? data.profiles : []).filter(p => p && typeof p.name === 'string');
   const active = (S.activeProfile && allProfiles.some(p => p.name === S.activeProfile))
     ? S.activeProfile
     : (data.active || 'default');
   const profiles = allProfiles.filter(p => p && (p.visible !== false || p.name === active));
   for (const p of profiles) {
+    if (accountProfiles && p.is_default) continue;
     const opt = document.createElement('div');
     opt.className = 'profile-opt' + (p.name === active ? ' active' : '');
     const meta = [];

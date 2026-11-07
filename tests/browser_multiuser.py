@@ -28,6 +28,14 @@ async def run():
     statuses = []
     try:
         await lab.start()
+        # Reproduce the real report: an admin has a second assigned profile,
+        # while the worker itself still has only its default filesystem profile.
+        status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users['administrator']['id'],
+            {'template_ids':[lab.template, lab.discovered_template], 'provider_ids':[p['provider_id'] for p in lab.connections],
+             'template_id':lab.template, 'provider_id':lab.provider})
+        assert status == 200
+        await lab.login('administrator', fresh=True)
+        await lab.ready(['administrator'])
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
             try:
@@ -56,10 +64,36 @@ async def run():
                     if not await page.locator('.nav-tab[data-panel="profiles"]:visible').count():
                         await page.locator('#btnHamburger').click()
                     await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
-                    await page.locator('#profilesPanel .profile-card[data-name="default"]').click()
+                    await page.locator(f'#profilesPanel [data-account-profile="{lab.template}"]').click()
                     await page.locator('#profileDetailBody').get_by_text('Configured by account administrator', exact=True).wait_for()
                     assert '2 / 2' in await page.locator('#profileDetailBody').inner_text()
+                    # Selecting a profile closes the phone drawer immediately;
+                    # its closing animation can still make is_visible() true.
+                    if width <= 640 or not await page.locator('#profilesPanel').is_visible():
+                        await page.locator('#btnHamburger').click()
+                    await page.evaluate('() => loadProfilesPanel()')
+                    if width <= 640:
+                        assert await page.evaluate('() => document.querySelector(".sidebar").classList.contains("mobile-open")')
+                    await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
+                    await page.locator('#profileDetailTitle').get_by_text('Installed Hermes / writer', exact=True).wait_for()
+                    assert not await page.locator('#btnDeleteProfileDetail').is_visible()
+                    await page.locator('#btnActivateProfileDetail').click()
+                    preview = page.locator('.mu-selection-dialog'); await preview.wait_for(state='visible')
+                    assert await preview.locator(f'[name=active-profile][value="{lab.discovered_template}"]').is_checked()
+                    await preview.get_by_role('button', name='Close', exact=True).click()
                     await page.screenshot(path=str(evidence / (label + '-profile-shared-skills.png')))
+                    await page.goto(lab.origin + '/')
+                    if not await page.locator('.nav-tab[data-panel="chat"]:visible').count():
+                        await page.locator('#btnHamburger').click()
+                    await page.locator('.nav-tab[data-panel="chat"]:visible').first.click()
+                    if width <= 640 and await page.evaluate('() => document.querySelector(".sidebar").classList.contains("mobile-open")'):
+                        await page.get_by_role('button', name='Close menu', exact=True).click()
+                    await page.locator('#profileChip').click()
+                    dropdown = page.locator('#profileDropdown')
+                    await dropdown.locator(f'[data-account-profile="{lab.discovered_template}"]').wait_for(state='visible')
+                    assert await dropdown.locator('[data-account-profile]').count() == 2
+                    await page.screenshot(path=str(evidence / (label + '-assigned-profile-dropdown.png')))
+                    await page.keyboard.press('Escape')
                     catalog = await page.evaluate('fetch("/api/models/live").then(response=>response.json())')
                     assert {model['id'] for model in catalog['models']} >= {'fixture-model', 'fixture-extra'}
                     await page.goto(lab.origin + '/multiuser/admin')
@@ -126,8 +160,21 @@ async def run():
                     await page.locator('#mu-account').wait_for(state='attached')
                     await page.wait_for_function('() => typeof S !== "undefined" && S._bootReady')
                     sidebar_closed = await page.evaluate('innerWidth <= 640 ? !document.querySelector(".sidebar").classList.contains("mobile-open") : document.querySelector(".layout").classList.contains("sidebar-collapsed")')
-                    if sidebar_closed and await page.locator('#btnHamburger').is_visible():
-                        await page.locator('#btnHamburger').click()
+                    if sidebar_closed:
+                        if await page.locator('#btnHamburger').is_visible():
+                            await page.locator('#btnHamburger').click()
+                        else:
+                            # Desktop uses the active Chat rail button to reopen
+                            # its collapsed sidebar; the phone menu is hidden.
+                            await page.locator('.nav-tab[data-panel="chat"]:visible').first.click()
+                    if not await page.get_by_role('button', name='Sign out', exact=True).is_visible():
+                        await page.screenshot(path=str(evidence / (label + '-logout-state.png')))
+                        print('Logout state:', await page.evaluate('''() => ({url:location.href,
+                          sidebar:document.querySelector('.sidebar')?.className,
+                          inert:document.querySelector('.sidebar')?.inert,
+                          layout:document.querySelector('.layout')?.className,
+                          dialogs:Array.from(document.querySelectorAll('dialog[open]')).map(n=>n.className),
+                          account:document.querySelector('#mu-account')?.innerText})'''))
                     await page.get_by_role('button', name='Sign out', exact=True).click()
                     await page.wait_for_url(lambda url: urlsplit(str(url)).path == '/login')
                     await context.close()
@@ -234,7 +281,11 @@ async def run():
                 await page.goto(lab.origin + '/login')
                 await page.locator('#mu-username').fill('alice'); await page.locator('#mu-password').fill(lab.passwords['alice'])
                 await page.locator('#mu-sign-in').click(); await page.wait_for_url(lab.origin + '/')
-                await page.get_by_role('button', name='Profile & provider', exact=True).click()
+                # Activate through the primary Profiles menu, not a separate
+                # shortcut that could mask a missing assigned-profile entry.
+                await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
+                await page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]').click()
+                await page.locator('#btnActivateProfileDetail').click()
                 switcher = page.locator('.mu-selection-dialog')
                 await switcher.wait_for(state='visible')
                 assert await switcher.locator('[name=active-profile]').count() == 2
@@ -249,6 +300,16 @@ async def run():
                 await page.locator('#msg').wait_for(state='visible')
                 assert '/login' not in page.url
                 assert 'my saved work' in await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/profile-switch-canary").read_text())')
+                await page.locator('.nav-tab[data-panel="profiles"]:visible').first.click()
+                current_profile = page.locator(f'#profilesPanel [data-account-profile="{lab.discovered_template}"]')
+                await current_profile.locator('.mu-profile-active').wait_for(state='visible')
+                await current_profile.click()
+                assert not await page.locator('#btnActivateProfileDetail').is_visible()
+                assert not await page.locator('#btnDeleteProfileDetail').is_visible()
+                # B has only the first profile. Its API must not gain A's grant.
+                await lab.login('bobby', fresh=True)
+                status, bob_profiles = await lab.api('bobby', '/api/profiles')
+                assert status == 200 and [p['id'] for p in bob_profiles['account_profiles']] == [lab.template]
                 await page.screenshot(path=str(evidence / 'regular-user-switched-profile.png'))
                 await context.close()
                 assert not failures, failures
@@ -265,6 +326,7 @@ async def run():
             'shared_base_profile_and_independent_account_provider_ui': True,
             'profile_shared_skill_counts_and_complete_provider_catalog': True,
             'independent_multiple_profile_provider_assignments_and_self_switch': True,
+            'assigned_profiles_in_primary_panel_and_dropdown': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

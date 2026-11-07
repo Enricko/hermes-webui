@@ -59,6 +59,13 @@ async def gateway(unused_tcp_port):
                 assert request.content_length is not None
                 assert request.headers.get('Transfer-Encoding') is None
                 return web.json_response({'owner': owner, 'body': await request.json()})
+            if request.path == '/api/profiles':
+                # A worker cannot supply account identity or an assigned catalog.
+                return web.json_response({'active':'default', 'profiles':[
+                    {'name':'default', 'is_default':True, 'total_skills':3, 'enabled_skills':3},
+                    {'name':'private-work', 'is_default':False}],
+                    'account_profiles':[{'id':'f'*32, 'name':'Forged worker profile'}],
+                    'account_profile_id':'f'*32})
             return web.json_response({'owner': owner, 'sessions': [{'id': 'private-' + owner}]},
                                      headers={'Cache-Control': 'public, max-age=31536000'})
         backend.router.add_route('*', '/{path:.*}', handler)
@@ -231,6 +238,50 @@ async def test_independent_grants_self_selection_and_old_stream_generation_are_e
         assert response.status == 503  # No admission of the previous active runtime.
     assert store.user(users[2]['id'])['template_id'] == ta
     stream_a.close(); stream_b.close()
+
+
+@pytest.mark.asyncio
+async def test_native_profile_menu_uses_server_grants_and_keeps_filesystem_names_separate(gateway):
+    settings, store, server, login, users, _received = gateway
+    provider = store.put_provider('Selected provider', 'http://127.0.0.1:1/v1', 'synthetic-menu-key')
+    first = store.put_template('Profile A', {'provider_id':provider, 'model':'a', 'soul':'Shared A instructions'})
+    second = store.put_template('Profile B', {'provider_id':provider, 'model':'b', 'soul':'Shared B instructions'})
+    store.put_template('Unassigned profile', {'provider_id':provider, 'model':'secret-name'})
+    store.update_user(users[1]['id'], template_ids=[first, second], provider_ids=[provider],
+                      template_id=first, assign_template=True)
+    store.update_user(users[2]['id'], template_ids=[first], provider_ids=[provider],
+                      template_id=first, assign_template=True)
+    for name, expected in [('alice', {first, second}), ('bobby', {first})]:
+        client, _ = await login(name)
+        async with client.get(server.make_url('/api/profiles?user_id=' + users[2]['id']),
+            headers={'X-User-Id':users[2]['id'], 'X-Forwarded-User':'bobby'}) as response:
+            assert response.status == 200
+            data = await response.json()
+            assert {p['id'] for p in data['account_profiles']} == expected
+            assert data['account_profile_id'] == first and data['account_provider_id'] == provider
+            assert [p['name'] for p in data['profiles']] == ['default', 'private-work']
+            assert data['profiles'][0]['total_skills'] == 3
+            assert 'Forged worker profile' not in json.dumps(data)
+            assert 'synthetic-menu-key' not in json.dumps(data)
+            assert 'Shared A instructions' not in json.dumps(data)
+            assert response.headers['Cache-Control'] == 'no-store'
+        async with client.get(server.make_url('/multiuser/api/me')) as response:
+            assert {p['id'] for p in (await response.json())['choices']['profiles']} == expected
+
+
+@pytest.mark.asyncio
+async def test_reselecting_assigned_base_resets_personal_profile_cookie_without_restarting(gateway):
+    settings, store, server, login, users, _ = gateway
+    provider = store.put_provider('Provider', 'http://127.0.0.1:1/v1', '')
+    profile = store.put_template('Profile', {'provider_id':provider, 'model':'a'})
+    store.update_user(users[1]['id'], template_ids=[profile], provider_ids=[provider], template_id=profile, assign_template=True)
+    client, csrf = await login('alice')
+    before = store.runtime(users[1]['id'])
+    async with client.post(server.make_url('/multiuser/api/selection'), json={'template_id':profile, 'provider_id':provider},
+        headers={'Origin':settings.origin, 'X-Hermes-CSRF-Token':csrf}) as response:
+        assert response.status == 200 and (await response.json())['changed'] is False
+        assert 'hermes_profile=' in response.headers['Set-Cookie'] and 'Max-Age=0' in response.headers['Set-Cookie']
+    assert store.runtime(users[1]['id']) == before
 
 
 @pytest.mark.asyncio
