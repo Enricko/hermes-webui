@@ -108,6 +108,10 @@ class Gateway:
     def principal(self, request):
         return self.store.session(request.cookies.get(self.cookie_name, ''))
 
+    def session_current(self, principal):
+        current = self.store.session_by_hash(principal.token_hash)
+        return current is not None and current.auth_version == principal.auth_version
+
     def require(self, request, *, admin=False):
         session = self.principal(request)
         if session is None:
@@ -234,20 +238,39 @@ class Gateway:
         session = self.require(request)
         runtime = self.store.runtime(session.user_id)
         user = self.store.user(session.user_id)
+        labels = {p['template_id']:p['name'] for p in self.store.discovered_profiles() if p['template_id']}
         profile, provider = None, None
         if user['template_id']:
             # Identity/account controls must remain available even when a
             # disabled capability/provider prevents the Agent from starting.
             with contextlib.suppress(PolicyError):
                 template = self.store.template(user['template_id'])
-                profile = {'id': template['id'], 'name': template['name'], 'version': template['version']}
+                profile = {'id': template['id'], 'name': labels.get(template['id'], template['name']), 'version': template['version']}
                 selected = user['provider_id'] or template['document']['provider_id']
                 configured = next((p for p in self.store.providers() if p['id'] == selected), None)
                 if configured:
                     provider = {'id': configured['id'], 'name': configured['name']}
-        return json_response({**session.public(), 'profile': profile, 'provider': provider, 'runtime': {
+        profiles = []
+        for tid in user['template_ids']:
+            with contextlib.suppress(PolicyError):
+                template = self.store.template(tid)
+                profiles.append({'id': tid, 'name': labels.get(tid, template['name']), 'model': template['document']['model'],
+                                 'provider_id': template['document']['provider_id']})
+        providers = [{'id': p['id'], 'name': p['name']} for p in self.store.providers()
+                     if p['enabled'] and p['id'] in user['provider_ids']]
+        return json_response({**session.public(), 'profile': profile, 'provider': provider,
+            'choices': {'profiles': profiles, 'providers': providers}, 'runtime': {
             'state': runtime['state'] if runtime else 'pending',
             'message': runtime['error'] if runtime else ''}})
+
+    async def select_access(self, request):
+        principal = self.require(request)
+        body = await object_body(request, {'template_id', 'provider_id'})
+        changed = self.store.select_access(principal, body.get('template_id'), body.get('provider_id'))
+        response = json_response({'changed': changed})
+        if changed:
+            response.del_cookie('hermes_profile', path='/')
+        return response
 
     async def users(self, request):
         actor = self.require(request, admin=True)
@@ -257,15 +280,16 @@ class Gateway:
                 runtime = self.store.runtime(user['id'])
                 user['runtime_state'] = runtime['state'] if runtime else 'pending'
             return json_response({'users': users})
-        body = await object_body(request, {'username', 'password', 'role', 'template_id', 'provider_id'})
+        body = await object_body(request, {'username', 'password', 'role', 'template_id', 'provider_id', 'template_ids', 'provider_ids'})
         user = await asyncio.to_thread(self.store.create_user, body['username'], body['password'],
                     role=body.get('role', 'user'), template_id=body.get('template_id'),
-                    provider_id=body.get('provider_id'), actor=actor.user_id)
+                    provider_id=body.get('provider_id'), template_ids=body.get('template_ids'),
+                    provider_ids=body.get('provider_ids'), actor=actor.user_id)
         return json_response({'user': user}, status=201)
 
     async def update_user(self, request):
         actor = self.require(request, admin=True)
-        body = await object_body(request, {'role', 'enabled', 'password', 'template_id', 'provider_id'})
+        body = await object_body(request, {'role', 'enabled', 'password', 'template_id', 'provider_id', 'template_ids', 'provider_ids'})
         changes = {k: v for k, v in body.items() if k not in ('template_id', 'provider_id')}
         if 'template_id' in body:
             changes.update(template_id=body['template_id'], assign_template=True)
@@ -444,7 +468,7 @@ class Gateway:
                         raw.extend(chunk)
                         if len(raw) > 2 * 1024 * 1024:
                             raise web.HTTPBadGateway()
-                    if not self.store.session_by_hash(principal.token_hash):
+                    if not self.session_current(principal):
                         raise web.HTTPForbidden()
                     value = json.loads(raw)
                     if not isinstance(value, dict):
@@ -491,7 +515,7 @@ class Gateway:
                 try:
                     while True:
                         done, _ = await asyncio.wait({pending}, timeout=0.5)
-                        if self.store.session_by_hash(principal.token_hash) is None:
+                        if not self.session_current(principal):
                             break
                         if not done:
                             continue
@@ -528,6 +552,7 @@ def create_app(settings):
     app.router.add_get('/api/auth/status', gateway.auth_status)
     app.router.add_get('/multiuser/api/me', gateway.me)
     app.router.add_get('/multiuser/api/users', gateway.users)
+    app.router.add_post('/multiuser/api/selection', gateway.select_access)
     app.router.add_post('/multiuser/api/users', gateway.users)
     app.router.add_post('/multiuser/api/users/{uid}', gateway.update_user)
     app.router.add_get('/multiuser/api/hermes-profiles', gateway.discovered_profiles)

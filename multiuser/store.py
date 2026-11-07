@@ -114,7 +114,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise PolicyError("Unsupported control database schema")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -165,10 +165,14 @@ class Store:
                     status TEXT NOT NULL, message TEXT NOT NULL, updated REAL NOT NULL,
                     PRIMARY KEY(source_id,profile_key)
                 );
+                CREATE TABLE IF NOT EXISTS account_access (
+                    user_id TEXT PRIMARY KEY REFERENCES users(id),
+                    template_ids TEXT NOT NULL, provider_ids TEXT NOT NULL
+                );
             """)
             if 'provider_id' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
                 db.execute('ALTER TABLE users ADD COLUMN provider_id TEXT REFERENCES providers(id)')
-            db.execute('PRAGMA user_version=3')
+            db.execute('PRAGMA user_version=4')
         self.path.chmod(0o600)
 
     @staticmethod
@@ -177,7 +181,7 @@ class Store:
                    (time.time(), actor, action, subject))
 
     def create_user(self, name, password, *, role="user", template_id=None, provider_id=None,
-                    bootstrap=False, actor=None):
+                    bootstrap=False, actor=None, template_ids=None, provider_ids=None):
         name = username(name)
         if role not in ("admin", "user"):
             raise PolicyError("Invalid role")
@@ -199,6 +203,14 @@ class Store:
                            (uid, name, encoded, role, template_id, time.time(), provider_id))
             except sqlite3.IntegrityError as exc:
                 raise PolicyError("Username or template is invalid/unavailable") from exc
+            if template_ids is not None or provider_ids is not None:
+                from multiuser.access import configure, read
+                legacy = read(db, {'id': uid, 'template_id': template_id, 'provider_id': provider_id})
+                selected_template, selected_provider = configure(db, uid, template_id, provider_id,
+                    template_ids=template_ids if template_ids is not None else legacy['template_ids'],
+                    provider_ids=provider_ids if provider_ids is not None else legacy['provider_ids'],
+                    explicit_template=template_id is not None, explicit_provider=provider_id is not None)
+                db.execute('UPDATE users SET template_id=?,provider_id=? WHERE id=?', (selected_template, selected_provider, uid))
             self._event(db, "user.created", uid, actor)
         return self.user(uid)
 
@@ -206,16 +218,19 @@ class Store:
         identifier(uid)
         with self.connection() as db:
             row = db.execute("SELECT id,username,role,enabled,auth_version,template_id,provider_id,created FROM users WHERE id=?", (uid,)).fetchone()
-        if row is None:
-            raise PolicyError("Account not found")
-        return dict(row)
+            if row is None:
+                raise PolicyError("Account not found")
+            from multiuser.access import read
+            return {**dict(row), **read(db, row)}
 
     def users(self):
         with self.connection() as db:
-            return [dict(r) for r in db.execute("SELECT id,username,role,enabled,auth_version,template_id,provider_id,created FROM users ORDER BY username")]
+            from multiuser.access import read
+            return [{**dict(r), **read(db, r)} for r in db.execute("SELECT id,username,role,enabled,auth_version,template_id,provider_id,created FROM users ORDER BY username")]
 
     def update_user(self, uid, *, role=None, enabled=None, password=None,
-                    template_id=None, assign_template=False, provider_id=None, assign_provider=False, actor=None):
+                    template_id=None, assign_template=False, provider_id=None, assign_provider=False, actor=None,
+                    template_ids=None, provider_ids=None):
         identifier(uid)
         if role is not None and role not in ("admin", "user"):
             raise PolicyError("Invalid role")
@@ -238,6 +253,30 @@ class Store:
                     raise PolicyError("The last enabled administrator cannot be removed")
             new_template = template_id if assign_template else old["template_id"]
             new_provider = provider_id if assign_provider else old['provider_id']
+            if template_ids is not None or provider_ids is not None:
+                from multiuser.access import configure, read
+                access = read(db, old)
+                new_template, new_provider = configure(db, uid, new_template, new_provider,
+                    template_ids=template_ids if template_ids is not None else access['template_ids'],
+                    provider_ids=provider_ids if provider_ids is not None else access['provider_ids'],
+                    explicit_template=assign_template, explicit_provider=assign_provider)
+            elif assign_template:
+                # The legacy operator/API action selects a single inherited
+                # profile. Explicit multi-grant calls above retain their list.
+                db.execute('DELETE FROM account_access WHERE user_id=?', (uid,))
+            elif assign_provider:
+                from multiuser.access import read
+                access = read(db, old)
+                selected = new_provider
+                if selected is None and new_template:
+                    base = db.execute('SELECT document FROM templates WHERE id=?', (new_template,)).fetchone()
+                    if base:
+                        selected = json.loads(base['document'])['provider_id']
+                if access['access_managed'] and selected and selected not in access['provider_ids']:
+                    from multiuser.access import identifiers
+                    providers = identifiers([*access['provider_ids'], selected], 'providers', 16)
+                    db.execute('UPDATE account_access SET provider_ids=? WHERE user_id=?',
+                        (json.dumps(providers), uid))
             if assign_provider and new_provider is not None and not db.execute(
                     'SELECT 1 FROM providers WHERE id=? AND enabled=1', (new_provider,)).fetchone():
                 raise PolicyError('Select an enabled provider')
@@ -390,6 +429,9 @@ class Store:
 
     def effective_template(self, user, selected_provider=None):
         """One shared capability profile, with a server-owned provider per account."""
+        if user.get('access_managed'):
+            from multiuser.access import document
+            return document(self, user, selected_provider)
         template = self.template(user['template_id'])
         document = template['document']
         primary = user.get('provider_id') or document['provider_id']
@@ -402,6 +444,44 @@ class Store:
             document.update(model=connection['model'], models=[connection['model']])
         self.provider(selected)
         return template
+
+    def select_access(self, principal, template_id, provider_id):
+        """Self-service activation can only select existing grants, atomically.
+
+        Rotate the account generation, retain only this authenticated session,
+        and close proxy admission until the trusted reconciler is ready.
+        """
+        from multiuser.access import read
+        identifier(template_id)
+        if provider_id is not None:
+            identifier(provider_id)
+        with self.connection(write=True) as db:
+            old = db.execute('SELECT * FROM users WHERE id=? AND enabled=1', (principal.user_id,)).fetchone()
+            session = db.execute('SELECT * FROM sessions WHERE token_hash=?', (principal.token_hash,)).fetchone()
+            if (not old or not session or session['user_id'] != principal.user_id or session['expires'] <= time.time() or
+                    session['auth_version'] != old['auth_version'] or principal.auth_version != old['auth_version']):
+                raise PolicyError('Session expired')
+            access = read(db, old)
+            if template_id not in access['template_ids']:
+                raise PolicyError('Profile is not assigned to this account')
+            template = db.execute('SELECT document FROM templates WHERE id=? AND enabled=1', (template_id,)).fetchone()
+            if not template:
+                raise PolicyError('Profile is unavailable')
+            base_provider = json.loads(template['document'])['provider_id']
+            selected = provider_id or base_provider
+            if selected not in access['provider_ids'] or not db.execute('SELECT 1 FROM providers WHERE id=? AND enabled=1', (selected,)).fetchone():
+                raise PolicyError('Provider is not assigned to this account')
+            provider_id = None if selected == base_provider else selected
+            if old['template_id'] == template_id and old['provider_id'] == provider_id:
+                return False
+            db.execute('UPDATE users SET template_id=?,provider_id=?,auth_version=auth_version+1 WHERE id=?',
+                       (template_id, provider_id, principal.user_id))
+            db.execute('DELETE FROM sessions WHERE user_id=?', (principal.user_id,))
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',
+                       (principal.token_hash, principal.user_id, session['csrf'], session['expires'], old['auth_version'] + 1))
+            db.execute("UPDATE runtimes SET state='switching' WHERE user_id=?", (principal.user_id,))
+            self._event(db, 'user.selection_changed', principal.user_id, principal.user_id)
+        return True
 
     def put_tool(self, name, description, filename, content, *, tool_id=None, enabled=True):
         if not isinstance(name, str) or not 1 <= len(name) <= 80 or not TOOL_NAME.fullmatch(filename):

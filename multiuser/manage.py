@@ -47,7 +47,7 @@ def upgrade(settings, backup):
         store.initialize()
     finally:
         store.path.chmod(mode)
-    return {'schema_version': 3, 'backup': str(backup), 'existing_accounts_preserved': True}
+    return {'schema_version': 4, 'backup': str(backup), 'existing_accounts_preserved': True}
 
 
 def migrate(settings, args):

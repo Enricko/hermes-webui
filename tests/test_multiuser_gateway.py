@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import secrets
@@ -188,6 +189,48 @@ async def test_streaming_revalidates_session_without_affecting_another_user(gate
     assert users[2]['id'].encode() in await asyncio.wait_for(stream_b.content.readuntil(b'\n\n'), 2)
     stream_a.close()
     stream_b.close()
+
+
+@pytest.mark.asyncio
+async def test_independent_grants_self_selection_and_old_stream_generation_are_enforced(gateway):
+    settings, store, server, login, users, _received = gateway
+    pa = store.put_provider('Provider A', 'http://127.0.0.1:1/v1', 'fixture-key-a')
+    pb = store.put_provider('Provider B', 'http://127.0.0.1:2/v1', 'fixture-key-b')
+    ta = store.put_template('Profile A', {'provider_id':pa, 'model':'a'})
+    tb = store.put_template('Profile B', {'provider_id':pb, 'model':'b'})
+    admin, csrf = await login('administrator')
+    for account, profiles, providers in [(users[1], [ta, tb], [pa]), (users[2], [ta], [pa, pb])]:
+        async with admin.post(server.make_url('/multiuser/api/users/' + account['id']), json={
+            'template_ids': profiles, 'provider_ids': providers, 'template_id':ta},
+            headers={'Origin':settings.origin, 'X-Hermes-CSRF-Token':csrf}) as response:
+            assert response.status == 200
+    alice, a_csrf = await login('alice'); bob, _ = await login('bobby')
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        me = await response.json()
+        assert {p['id'] for p in me['choices']['profiles']} == {ta, tb}
+        assert [p['id'] for p in me['choices']['providers']] == [pa]
+        assert 'fixture-key' not in json.dumps(me)
+    headers = {'Origin':settings.origin, 'X-Hermes-CSRF-Token':a_csrf}
+    for body in [{'template_id':tb, 'provider_id':pb}, {'template_id':'f'*32, 'provider_id':pa},
+                 {'template_id':ta, 'provider_id':pa, 'user_id':users[2]['id']},
+                 {'template_id':ta, 'provider_id':pa, 'provider_ids':[pa,pb]}]:
+        async with alice.post(server.make_url('/multiuser/api/selection'), json=body, headers=headers) as response:
+            assert response.status == 400
+    stream_a = await alice.get(server.make_url('/api/stream'))
+    stream_b = await bob.get(server.make_url('/api/stream'))
+    await stream_a.content.readuntil(b'\n\n'); await stream_b.content.readuntil(b'\n\n')
+    async with alice.post(server.make_url('/multiuser/api/selection'), json={'template_id':tb, 'provider_id':pa}, headers=headers) as response:
+        assert response.status == 200 and (await response.json())['changed']
+    await asyncio.wait_for(stream_a.content.read(), 2)
+    assert users[2]['id'].encode() in await asyncio.wait_for(stream_b.content.readuntil(b'\n\n'), 2)
+    async with alice.get(server.make_url('/multiuser/api/me')) as response:
+        assert response.status == 200
+        me = await response.json()
+        assert me['profile']['id'] == tb and me['provider']['id'] == pa
+    async with alice.get(server.make_url('/api/sessions')) as response:
+        assert response.status == 503  # No admission of the previous active runtime.
+    assert store.user(users[2]['id'])['template_id'] == ta
+    stream_a.close(); stream_b.close()
 
 
 @pytest.mark.asyncio

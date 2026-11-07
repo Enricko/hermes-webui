@@ -254,6 +254,60 @@ async def test_same_existing_profile_with_distinct_providers_and_read_only_share
         await lab.login('bobby', fresh=True)
 
 
+async def test_independent_multi_profile_provider_grants_in_real_workers(lab):
+    first = lab.provider; second = lab.connections[1]['provider_id']
+    rows = [('alice', [lab.template, lab.discovered_template], [first]),
+            ('bobby', [lab.template], [first, second])]
+    try:
+        for name, profiles, providers in rows:
+            status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users[name]['id'], {
+                'template_ids':profiles, 'provider_ids':providers, 'template_id':lab.template, 'provider_id':first})
+            assert status == 200
+        await lab.ready(['alice', 'bobby'])
+        for name in ['alice', 'bobby']:
+            await lab.login(name, fresh=True)
+        async def broker_code(name, pid):
+            return await lab.execute(name, 'import urllib.request,urllib.error;'
+                '\ntry:\n r=urllib.request.urlopen("http://127.0.0.1:8000/providers/' + pid + '/v1/models");print(r.status)'
+                '\nexcept urllib.error.HTTPError as e:print(e.code)')
+        assert (await broker_code('alice', first)).strip() == '200'
+        assert (await broker_code('alice', second)).strip() == '403'
+        assert (await broker_code('bobby', second)).strip() == '200'
+        status, me = await lab.api('alice', '/multiuser/api/me')
+        assert status == 200 and len(me['choices']['profiles']) == 2 and len(me['choices']['providers']) == 1
+        status, _ = await lab.api('bobby', '/multiuser/api/selection', {'template_id':lab.discovered_template, 'provider_id':first})
+        assert status == 400
+        await lab.execute('alice', 'from pathlib import Path;Path("/workspace/multi-access-canary").write_text("private A")')
+        status, _ = await lab.api('alice', '/multiuser/api/selection', {'template_id':lab.discovered_template, 'provider_id':first})
+        assert status == 200
+        await lab.ready(['alice'])
+        status, me = await lab.api('alice', '/multiuser/api/me')
+        assert status == 200 and me['profile']['id'] == lab.discovered_template and me['provider']['id'] == first
+        assert 'Original named writer profile' in await lab.execute('alice', 'from pathlib import Path;'
+            'assert Path("/workspace/multi-access-canary").read_text()=="private A";print(Path("/state/hermes/SOUL.md").read_text())')
+        status, _ = await lab.api('bobby', '/multiuser/api/selection', {'template_id':lab.template, 'provider_id':second})
+        assert status == 200
+        await lab.ready(['bobby'])
+        sid = await lab.session('bobby')
+        stream = await lab.start_chat('bobby', sid, 'Use my second assigned provider')
+        assert any(event == 'done' for event, _ in await lab.events('bobby', stream))
+        assert any(r['user_id'] == lab.users['bobby']['id'] for r in lab.named_models['Router Two'].requests)
+        status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users['bobby']['id'],
+                                  {'provider_ids':[first]})
+        assert status == 200
+        # The old worker is still running here. Its former URL is immediately
+        # denied by the broker, before the trusted reconciler stops it.
+        assert (await broker_code('bobby', second)).strip() == '403'
+        lab.results['independent_profile_provider_grants_real_model_routing_and_immediate_revocation'] = True
+    finally:
+        for name in ['alice', 'bobby']:
+            await lab.api('administrator', '/multiuser/api/users/' + lab.users[name]['id'],
+                          {'template_id':lab.template, 'provider_id':None})
+        await lab.ready(['alice', 'bobby'])
+        for name in ['alice', 'bobby']:
+            await lab.login(name, fresh=True)
+
+
 async def test_private_state_survives_restart_and_disable_stops_only_its_jobs(lab):
     await lab.execute('alice', 'from pathlib import Path;Path("/state/hermes/memories").mkdir(exist_ok=True);'
         'Path("/state/hermes/memories/MEMORY.md").write_text("alice-private-memory");'

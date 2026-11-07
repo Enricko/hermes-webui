@@ -39,6 +39,24 @@ the immutable bundle is mounted read-only at `/shared/skills`. Hermes's official
 `skills.external_dirs` loads these alongside private learned skills. Capability
 reuse updates the existing template in place without importing private history.
 
+An admin may explicitly grant several base profiles and an independent list of
+providers to each account. Schema v4 stores these grants separately from the
+active profile/provider selection. The worker receives only its account's
+allowed provider routes, and the same grants authorize every broker request;
+removing a provider denies an old worker's URL before container reconciliation.
+Provider-owned model metadata may supply that provider's default model, but
+another profile's instructions, skills and private state never supply account
+capabilities. Existing accounts retain inherited single-profile behavior until
+an admin explicitly saves an access list.
+
+Self-service activation is an atomic server-side choice within current grants,
+bound to the authenticated session. It increments the account generation, closes
+old streams, revokes other sessions and retains only the initiating session's
+existing expiry/CSRF. Proxy admission closes while that account's runtime is
+reconciled. Concurrent admin revocation cannot be undone by a stale selection.
+Profiles are reusable capabilities; private saved state stays with the account
+when changing its active base profile. No original source-home history is copied.
+
 Model access may use an explicit allowlist (the compatibility default) or the
 live catalog of the account's assigned provider. In provider-catalog mode the
 same validated, bounded catalog authorizes inference and feeds discovery.

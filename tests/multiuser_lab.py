@@ -242,9 +242,8 @@ class Lab:
                 event.set()
         for client in self.clients.values():
             await client.close()
-        for name in self.users:
-            with contextlib.suppress(Exception):
-                await self.operator('stop-runtime', '--user', self.users[name]['id'])
+        with contextlib.suppress(Exception):
+            await self.operator('stop-all-runtimes')
         for runner in reversed(self.runners):
             await runner.cleanup()
         self.evidence.mkdir(parents=True, exist_ok=True)
