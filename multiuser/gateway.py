@@ -291,6 +291,10 @@ class Gateway:
         tid = self.store.put_template(body['name'], body['document'], template_id=body.get('id'), enabled=body.get('enabled', True))
         return json_response({'id': tid})
 
+    async def discovered_profiles(self, request):
+        self.require(request, admin=True)
+        return json_response({'profiles': self.store.discovered_profiles()})
+
     async def tools(self, request):
         principal = self.require(request)
         if request.method in ('GET', 'HEAD'):
@@ -526,6 +530,7 @@ def create_app(settings):
     app.router.add_get('/multiuser/api/users', gateway.users)
     app.router.add_post('/multiuser/api/users', gateway.users)
     app.router.add_post('/multiuser/api/users/{uid}', gateway.update_user)
+    app.router.add_get('/multiuser/api/hermes-profiles', gateway.discovered_profiles)
     for path, handler in [('/multiuser/api/providers', gateway.providers),
                           ('/multiuser/api/templates', gateway.templates),
                           ('/multiuser/api/tools', gateway.tools)]:

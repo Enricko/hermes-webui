@@ -114,7 +114,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.connection() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise PolicyError("Unsupported control database schema")
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
@@ -159,10 +159,16 @@ class Store:
                     id INTEGER PRIMARY KEY, created REAL NOT NULL, actor TEXT,
                     action TEXT NOT NULL, subject TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS discovered_profiles (
+                    source_id TEXT NOT NULL, profile_key TEXT NOT NULL,
+                    name TEXT NOT NULL, template_id TEXT REFERENCES templates(id),
+                    status TEXT NOT NULL, message TEXT NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(source_id,profile_key)
+                );
             """)
             if 'provider_id' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
                 db.execute('ALTER TABLE users ADD COLUMN provider_id TEXT REFERENCES providers(id)')
-            db.execute('PRAGMA user_version=2')
+            db.execute('PRAGMA user_version=3')
         self.path.chmod(0o600)
 
     @staticmethod
@@ -367,6 +373,11 @@ class Store:
     def templates(self):
         with self.connection() as db:
             return [{**dict(r), "document": json.loads(r["document"])} for r in db.execute("SELECT * FROM templates ORDER BY name")]
+
+    def discovered_profiles(self):
+        """Presentation only: source paths and sync authority never enter this DB."""
+        with self.connection() as db:
+            return [dict(row) for row in db.execute('SELECT * FROM discovered_profiles ORDER BY name')]
 
     def template(self, tid):
         from multiuser.templates import validate_template

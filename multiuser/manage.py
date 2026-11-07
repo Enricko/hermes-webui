@@ -47,7 +47,7 @@ def upgrade(settings, backup):
         store.initialize()
     finally:
         store.path.chmod(mode)
-    return {'schema_version': 2, 'backup': str(backup), 'existing_accounts_preserved': True}
+    return {'schema_version': 3, 'backup': str(backup), 'existing_accounts_preserved': True}
 
 
 def migrate(settings, args):
@@ -110,6 +110,18 @@ def main(argv=None):
     init.add_argument('--worker-uid', type=int, default=10001)
     init.add_argument('--relay-uid', type=int, default=10002)
     init.add_argument('--images', type=Path)
+    setup = sub.add_parser('setup', help='Initialize opt-in multi-user mode, bootstrap an admin and connect existing Hermes profiles')
+    setup.add_argument('--public-url', required=True)
+    setup.add_argument('--port', type=int, default=8799)
+    setup.add_argument('--gateway-uid', type=int, default=10000)
+    setup.add_argument('--worker-uid', type=int, default=10001)
+    setup.add_argument('--relay-uid', type=int, default=10002)
+    setup.add_argument('--images', type=Path, required=True)
+    setup.add_argument('--hermes-home', type=Path)
+    setup.add_argument('--name', default='Hermes')
+    setup.add_argument('--backup-root', type=Path, default=Path('/var/backups/hermes-profiles'))
+    setup.add_argument('--username', default='administrator')
+    setup.add_argument('--password-stdin', action='store_true')
     images = sub.add_parser('set-images')
     images.add_argument('--images', type=Path, required=True)
     migration = sub.add_parser('upgrade', help='Back up and upgrade the account schema without recreating accounts')
@@ -179,9 +191,48 @@ def main(argv=None):
     connections.add_argument('--name', action='append', required=True)
     connections.add_argument('--backup', type=Path, required=True)
     connections.add_argument('--reuse-provider', action='append', default=[], help='NAME=existing provider ID; retain that endpoint')
+    discover = sub.add_parser('discover-profiles', help='Inspect an existing Hermes installation without importing private data')
+    discover.add_argument('--hermes-home', type=Path)
+    register = sub.add_parser('connect-hermes', help='Register a trusted existing Hermes home and import assignable capabilities')
+    register.add_argument('--hermes-home', type=Path)
+    register.add_argument('--name', default='Hermes')
+    register.add_argument('--backup-root', type=Path, required=True)
+    register.add_argument('--adopt-template', action='append', default=[], help='PROFILE_KEY=existing template ID; explicit one-time adoption')
+    sub.add_parser('sync-profiles', help='Synchronize only operator-registered Hermes sources')
+    resolve_source = sub.add_parser('resolve-profile-sync', help='Explicitly resolve a source/admin capability conflict')
+    resolve_source.add_argument('--source-id', required=True)
+    resolve_source.add_argument('--profile', required=True)
+    choice = resolve_source.add_mutually_exclusive_group(required=True)
+    choice.add_argument('--keep-admin', action='store_true')
+    choice.add_argument('--use-source', action='store_true')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'init':
+        if args.command == 'setup':
+            from multiuser.discovery import connect
+            from multiuser.provision import initialize, require_operator
+            if (args.root / 'settings.json').exists():
+                settings = Settings.load(args.root)
+                require_operator(settings)
+                if settings.public_url != args.public_url.rstrip('/'):
+                    raise PolicyError('Existing public URL differs; setup never silently replaces installation settings')
+            else:
+                values = json.loads(args.images.read_text())
+                settings = Settings(root=args.root.absolute(), public_url=args.public_url.rstrip('/'), port=args.port,
+                    gateway_uid=args.gateway_uid, worker_uid=args.worker_uid, relay_uid=args.relay_uid,
+                    runtime_image=values['worker_image'], relay_image=values['relay_image'])
+                settings.validate(images=True)
+                initialize(settings)
+            store = settings.store()
+            created = None
+            if not store.users():
+                created = store.create_user(args.username, password(args), role='admin', bootstrap=True)
+            result = connect(settings, args.hermes_home, args.name, args.backup_root)
+            if created:
+                main = next((p for p in result['profiles'] if p['profile'].endswith(' / default') and p['status'] == 'ready'), None)
+                if main:
+                    store.update_user(created['id'], template_id=main['template_id'], assign_template=True)
+            result['admin_created'] = created is not None
+        elif args.command == 'init':
             from multiuser.provision import initialize
             values = json.loads(args.images.read_text()) if args.images else {}
             settings = Settings(root=args.root.absolute(), public_url=args.public_url.rstrip('/'), port=args.port,
@@ -270,6 +321,19 @@ def main(argv=None):
                 from multiuser.connections import import_connections
                 reused = dict(value.split('=', 1) for value in args.reuse_provider)
                 result = import_connections(settings, args.source, args.name, args.template, args.backup, reused)
+            elif args.command in ('discover-profiles', 'connect-hermes', 'sync-profiles', 'resolve-profile-sync'):
+                from multiuser.discovery import connect, discover, resolve, sync
+                if args.command == 'discover-profiles':
+                    from multiuser.provision import require_operator
+                    require_operator(settings)
+                    result = discover(args.hermes_home)
+                elif args.command == 'connect-hermes':
+                    result = connect(settings, args.hermes_home, args.name, args.backup_root,
+                                     dict(value.split('=', 1) for value in args.adopt_template))
+                elif args.command == 'resolve-profile-sync':
+                    result = resolve(settings, args.source_id, args.profile, keep_admin=args.keep_admin)
+                else:
+                    result = sync(settings)
             else:
                 raise PolicyError('Unsupported command')
         print(json.dumps(result, indent=2))

@@ -149,7 +149,7 @@ def test_version_one_upgrade_preserves_accounts_sessions_and_profile(accounts, t
         db.execute('PRAGMA user_version=1')
     backup = tmp_path.with_name(tmp_path.name + '-upgrade-backup')
     settings = Settings(root=store.path.parent.parent)
-    assert upgrade(settings, backup)['schema_version'] == 2
+    assert upgrade(settings, backup)['schema_version'] == 3
     assert store.session(token).user_id == admin['id']
     assert store.user(admin['id'])['provider_id'] is None
     with sqlite3.connect(backup / 'accounts-before.sqlite') as db:

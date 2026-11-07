@@ -68,8 +68,16 @@ Authorities and lifecycle invariants:
 - Shared tools are versioned once and mounted read-only. Work happens under each
   user's workspace/tmp. Template updates preserve personally modified files and
   report conflicts; they never overwrite memory or learned skills.
-- No existing single-user home is adopted or copied automatically. Migration
-  requires an explicit source, private backup and capability allowlist.
+- No existing single-user home is adopted merely by starting the gateway.
+  Operator `setup`/`connect-hermes` explicitly registers a source in a private
+  root-owned registry outside gateway-writable storage. Main and named profiles
+  become assignable sanitized capabilities; personal state is never migrated.
+  A separate optional root oneshot sync has read-only source access, no network
+  or Docker access, and publishes only schema-validated capability/provider data.
+  The DB discovery catalog is presentation, never host-path authority. Stable
+  template/provider identities survive ordinary syncs; unchanged publications
+  leave runtime generations intact. Admin changes conflict rather than being
+  overwritten. Missing sources preserve accounts and runtime state.
 
 Acceptance evidence must include actual Docker filesystem/process tests,
 real HTTP/API ownership and concurrent streaming/cancellation, persistence after

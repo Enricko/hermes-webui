@@ -116,9 +116,16 @@ async def test_server_session_selects_backend_despite_identity_profile_and_id_sp
 async def test_admin_api_and_csrf_are_backend_enforced(gateway):
     settings, _store, server, login, users, _received = gateway
     alice, csrf = await login('alice')
-    for route in ['users', 'providers', 'templates']:
+    for route in ['users', 'providers', 'templates', 'hermes-profiles']:
         async with alice.get(server.make_url('/multiuser/api/' + route), headers={'X-Admin': '1'}) as response:
             assert response.status == 403
+    admin_client, admin_csrf = await login('administrator')
+    async with admin_client.get(server.make_url('/multiuser/api/hermes-profiles')) as response:
+        assert response.status == 200 and (await response.json()) == {'profiles': []}
+    async with admin_client.post(server.make_url('/multiuser/api/hermes-profiles'),
+        json={'hermes_home': '/root/.hermes', 'source_id': 'f' * 32},
+        headers={'Origin': settings.origin, 'X-Hermes-CSRF-Token': admin_csrf}) as response:
+        assert response.status == 403
     async with alice.post(server.make_url('/multiuser/api/users/' + users[1]['id']),
                           json={'provider_id': 'f' * 32},
                           headers={'Origin': settings.origin, 'X-Hermes-CSRF-Token': csrf}) as response:
