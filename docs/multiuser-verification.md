@@ -152,3 +152,30 @@ trusted operator can register source authority.
 The deterministic external model fixture remains separate from the real Agent,
 WebUI and containers. These results do not claim automatic migration of native
 OAuth providers, stateful external integrations, or personal historical data.
+
+## Independent access lists and checkbox editor — 2026-11-07
+
+- **50 host tests passed**, covering account/auth, independent grants, gateway,
+  broker, catalog, discovery, policy and connection imports. Schema v4 migration
+  retains legacy accounts and inherited connections until explicitly saved.
+- **10 real Docker tests passed**. The added gate configures A with profiles A+B
+  and provider A, and B with profile A and providers A+B. It executes actual
+  broker requests from both workers, rejects A's direct provider-B route, switches
+  A to its other assigned profile without losing workspace data, performs real
+  Agent inference using B's second provider, and proves immediate revocation
+  against B's old worker before reconciliation.
+- **2 real root setup tests passed**, using new `/tmp` and `/srv` data roots.
+- Chromium passed at **1440, 760 and 390 px** with no uncaught JavaScript or HTTP
+  errors. It creates/edits both assignment patterns using checkboxes, chooses
+  defaults without unchecking other grants, searches accounts, disables/enables
+  an account, verifies chat/uploads/account isolation and activates an assigned
+  profile through the user's real switcher. The initiating browser remains
+  signed in after the worker restart, and its saved workspace canary survives.
+- HTTP regressions reject forged identity/grant fields and unassigned choices.
+  Active streams from an older account generation close even when the initiating
+  browser's session token is retained; another user's stream continues.
+- Ruff, runtime JavaScript lint, JavaScript syntax and whitespace checks pass.
+
+Before/after screenshots and JSON results are stored in the operator-selected
+evidence directory. The user-facing controls remain native HTML with the
+existing Hermes theme; no frontend framework or additional dependency is used.

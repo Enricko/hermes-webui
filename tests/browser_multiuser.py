@@ -72,35 +72,59 @@ async def run():
                     await page.screenshot(path=str(evidence / (label + '-discovered-profiles.png')))
                     await dialog.get_by_role('button', name='Accounts', exact=True).click()
                     assert await dialog.evaluate('(node)=>node.getBoundingClientRect().right <= innerWidth')
+                    await dialog.locator(f'.mu-person[data-user="{lab.users["alice"]["id"]}"]').click()
+                    form = dialog.locator('.mu-account-editor')
+                    await form.locator(f'[name=template_ids][value="{lab.discovered_template}"]').check()
+                    for connection in lab.connections[1:]:
+                        await form.locator(f'[name=provider_ids][value="{connection["provider_id"]}"]').uncheck()
+                    assert await form.locator('[name=template_ids]:checked').count() == 2
+                    assert await form.locator('[name=provider_ids]:checked').count() == 1
+                    assert await form.locator('select').count() == 0
+                    await form.locator(f'[name=template_ids_default][value="{lab.discovered_template}"]').check()
+                    assert await form.locator('[name=template_ids]:checked').count() == 2
+                    await page.screenshot(path=str(evidence / (label + '-multi-access.png')))
                     if label == 'desktop':
-                        form = dialog.locator('form')
+                        await dialog.get_by_role('button', name='New account', exact=True).click()
+                        form = dialog.locator('.mu-account-editor')
                         await form.locator('[name=username]').fill('ui-created')
                         await form.locator('[name=password]').fill(secrets.token_urlsafe(24))
-                        await form.locator('[name=template_id]').select_option(lab.template)
+                        await form.locator(f'[name=template_ids][value="{lab.template}"]').check()
+                        await form.locator(f'[name=template_ids][value="{lab.discovered_template}"]').check()
                         await form.get_by_role('button', name='Create account', exact=True).click()
                         await dialog.get_by_text('ui-created', exact=True).wait_for()
-                        record = dialog.locator('.mu-record').filter(has=page.get_by_text('ui-created', exact=True))
-                        await record.get_by_role('button', name='Disable', exact=True).click()
-                        await record.get_by_role('button', name='Enable', exact=True).wait_for()
-                        independent = lab.store.put_provider('Independent account provider',
-                            lab.store.provider(lab.provider)['base_url'], lab.provider_secret)
-                        await dialog.get_by_role('button', name='Close', exact=True).click()
-                        await page.get_by_role('button', name='Accounts', exact=True).click()
-                        record = dialog.locator('.mu-record').filter(has=page.get_by_text('ui-created', exact=True))
-                        await record.locator('[name=assigned-provider]').select_option(independent)
+                        created = next(u for u in lab.store.users() if u['username'] == 'ui-created')
+                        assert set(created['template_ids']) == {lab.template, lab.discovered_template}
+                        assert created['provider_ids'] == [lab.provider]
+                        await form.locator('summary').click()
+                        await form.get_by_role('button', name='Disable account', exact=True).click()
+                        await form.get_by_role('button', name='Enable account', exact=True, include_hidden=True).wait_for(state='attached')
+                        await form.locator('summary').click()
+                        await form.get_by_role('button', name='Enable account', exact=True).click()
+                        await form.get_by_role('button', name='Disable account', exact=True, include_hidden=True).wait_for(state='attached')
+                        independent = lab.connections[1]['provider_id']
+                        await form.locator(f'[name=template_ids][value="{lab.discovered_template}"]').uncheck()
+                        await form.locator(f'[name=provider_ids][value="{independent}"]').check()
+                        await form.locator(f'[name=provider_ids_default][value="{independent}"]').check()
                         async with page.expect_response(lambda response: '/multiuser/api/users/' in response.url and response.request.method == 'POST') as assigned:
-                            await record.get_by_role('button', name='Assign provider', exact=True).click()
+                            await form.get_by_role('button', name='Save access', exact=True).click()
                         assert (await assigned.value).status == 200
+                        await dialog.get_by_text('Saved. Access changes are applied to the private workspace.', exact=True).wait_for()
                         created = next(user for user in lab.store.users() if user['username'] == 'ui-created')
                         assert created['template_id'] == lab.template and created['provider_id'] == independent
+                        assert created['template_ids'] == [lab.template] and set(created['provider_ids']) == {lab.provider, independent}
                         await page.screenshot(path=str(evidence / 'desktop-account-provider.png'))
+                        await dialog.locator('[name=account-search]').fill('ui-created')
+                        assert await dialog.locator('.mu-person:visible').count() == 1
+                        await dialog.locator('[name=account-search]').fill('')
+                        await form.locator('summary').click()
+                        await form.get_by_role('button', name='Disable account', exact=True).click()
                         for tab in ['Providers', 'Templates', 'Shared tools']:
                             await dialog.get_by_role('button', name=tab, exact=True).click()
                             await dialog.locator('form button[type=submit]').wait_for()
                     await dialog.get_by_role('button', name='Close', exact=True).click()
                     await page.goto(lab.origin + '/')
                     await page.locator('#mu-account').wait_for(state='attached')
-                    await page.wait_for_function('typeof S !== "undefined" && S._bootReady')
+                    await page.wait_for_function('() => typeof S !== "undefined" && S._bootReady')
                     sidebar_closed = await page.evaluate('innerWidth <= 640 ? !document.querySelector(".sidebar").classList.contains("mobile-open") : document.querySelector(".layout").classList.contains("sidebar-collapsed")')
                     if sidebar_closed and await page.locator('#btnHamburger').is_visible():
                         await page.locator('#btnHamburger').click()
@@ -195,6 +219,38 @@ async def run():
                 assert 'A private browser task' not in private['body']
                 await page.screenshot(path=str(evidence / 'same-profile-user-switch.png'))
                 await context.close()
+                # Prove the user's concrete independent-grants example, then
+                # switch an assigned profile through the actual browser UI.
+                for name, profiles, providers in [('alice', [lab.template, lab.discovered_template], [lab.provider]),
+                    ('bobby', [lab.template], [lab.provider, lab.connections[1]['provider_id']])]:
+                    status, _ = await lab.api('administrator', '/multiuser/api/users/' + lab.users[name]['id'],
+                        {'template_ids':profiles, 'provider_ids':providers, 'template_id':lab.template, 'provider_id':lab.provider})
+                    assert status == 200
+                await lab.ready(['alice', 'bobby'])
+                await lab.execute('alice', 'from pathlib import Path;Path("/workspace/profile-switch-canary").write_text("my saved work")')
+                context = await browser.new_context(viewport={'width':1440, 'height':1000})
+                page = await context.new_page()
+                page.on('pageerror', lambda error: failures.append(str(error)))
+                await page.goto(lab.origin + '/login')
+                await page.locator('#mu-username').fill('alice'); await page.locator('#mu-password').fill(lab.passwords['alice'])
+                await page.locator('#mu-sign-in').click(); await page.wait_for_url(lab.origin + '/')
+                await page.get_by_role('button', name='Profile & provider', exact=True).click()
+                switcher = page.locator('.mu-selection-dialog')
+                await switcher.wait_for(state='visible')
+                assert await switcher.locator('[name=active-profile]').count() == 2
+                assert await switcher.locator('[name=active-provider]').count() == 1
+                await switcher.locator(f'[name=active-profile][value="{lab.discovered_template}"]').check()
+                await page.screenshot(path=str(evidence / 'regular-user-assigned-switcher.png'))
+                async with page.expect_response(lambda r: '/multiuser/api/selection' in r.url) as switched:
+                    await switcher.get_by_role('button', name='Use selection', exact=True).click()
+                assert (await switched.value).status == 200
+                await lab.ready(['alice'])
+                await page.wait_for_function('() => Boolean(document.querySelector("#mu-base-profile")?.textContent.includes("Installed Hermes / writer"))', timeout=60000)
+                await page.locator('#msg').wait_for(state='visible')
+                assert '/login' not in page.url
+                assert 'my saved work' in await lab.execute('alice', 'from pathlib import Path;print(Path("/workspace/profile-switch-canary").read_text())')
+                await page.screenshot(path=str(evidence / 'regular-user-switched-profile.png'))
+                await context.close()
                 assert not failures, failures
                 assert not statuses, statuses
             finally:
@@ -208,6 +264,7 @@ async def run():
             'same_profile_user_switch_seconds': switch_seconds,
             'shared_base_profile_and_independent_account_provider_ui': True,
             'profile_shared_skill_counts_and_complete_provider_catalog': True,
+            'independent_multiple_profile_provider_assignments_and_self_switch': True,
             'before_reference': 'same upstream chrome with only the additive account bar visually hidden'}, indent=2) + '\n')
     finally:
         await lab.close()

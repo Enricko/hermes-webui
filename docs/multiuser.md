@@ -99,14 +99,35 @@ endpoint aliases and connection defaults. Further syncs retain those choices
 while the corresponding source setting is unchanged. Ordinary new setups do not
 need adoption IDs or a JSON template document.
 
-In the WebUI, open **Accounts → Hermes profiles** to see the discovered profiles
-and status. Open **Accounts**, create a username/password, and choose its **Base
-profile**. For an existing account, select the profile and click **Assign
-profile**. Several users may share a base profile, and an optional provider
-override selects a different primary connection per account. The **Providers**
-tab manages gateway-held credentials; the advanced **Templates** editor remains
-available for custom capability policies. Regular users cannot see either
-control catalog or provider secrets.
+In the WebUI, open **Accounts → Hermes profiles** to see discovered profiles and
+status. In **Accounts**, click **New account** or choose someone from the
+searchable People list. Check every **Profile** and **AI provider** they may use,
+choose one **Default** in each group, and click **Create account** or **Save
+access**. The cards support keyboard checkboxes/radios and Select all/Clear;
+there are no assignment dropdowns or resource IDs to type. Password reset and
+account enable/disable are under **Password & account status**.
+
+The two access lists are independent. For example, Alice may have profiles A+B
+and only provider A, while Bob has only profile A and providers A+B. A provider
+listed in the source profile is not automatically authorized for an account
+with an explicit access list. Defaults choose the initial setup, rather than
+granting access to an unchecked option. Removing a provider immediately blocks
+its broker route, including requests from an old worker awaiting reconciliation.
+
+Users click **Profile & provider** in the sidebar to activate any assigned
+combination. This restarts only their own runtime, preserves their saved chats,
+memory and workspace, and keeps the initiating browser signed in. Other sessions
+and streams for that account close. Source profiles are shared capabilities;
+switching them does not import original personal state or create a different
+tenant. Personal config edits remain protected by the existing conflict policy.
+
+The **Providers** tab manages gateway-held credentials; the advanced **Templates**
+editor remains available for custom capability policies. Regular users see only
+their assigned choices and cannot manage accounts or provider secrets. Existing
+accounts keep inherited access until an admin explicitly saves an access list.
+Schema v4 is additive; use `upgrade --backup /private/new-path` before launching
+this release against an existing installation. Passwords, account IDs, active
+selections and existing data remain unchanged by migration.
 
 Discovery imports model/response/Agent parameters, SOUL instructions and reusable
 skills, including `skills.external_dirs` located **inside the registered Hermes
@@ -174,8 +195,14 @@ ownership, then restart the prior reviewed release. With all DB writers stopped,
 remove stale SQLite `-wal`/`-shm` sidecars belonging to that DB before replacing
 it. Never remove user data or original Hermes homes. Disable the timer before
 rolling back to code that predates discovery. Source-only rollback can leave the
-additive schema v3 table in place; the old release must not run its older schema
-initializer against v3. See the existing deployment rollback procedure below.
+additive discovery tables in place. For schema v4, prefer a **frontend-only
+rollback** that keeps the current grant-enforcing backend and database. Backends
+predating v4 do not understand explicit profile/provider restrictions and must
+not serve restricted accounts using the new database. A full release rollback
+requires reviewing new accounts/permission changes and restoring a matching
+pre-upgrade control snapshot, or keeping affected accounts disabled. Never run
+an older schema initializer against v4. See the existing deployment rollback
+procedure below.
 
 ## Install an independent release
 

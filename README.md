@@ -7,8 +7,8 @@ Full parity with the CLI experience - everything you can do from a terminal, you
 
 **Multi-user fork:** [set up local accounts using an existing Hermes installation](docs/multiuser.md#connect-an-existing-hermes-installation).
 The opt-in setup discovers the main and named Hermes profiles and their compatible
-provider connections. Admins select a base profile when creating or assigning an
-account. Each account runs an isolated WebUI/Agent with private conversations,
+provider connections. Admins check the profiles and providers each account may
+use; users can switch between their assigned choices. Each account runs an isolated WebUI/Agent with private conversations,
 memory and workspace. No server-specific usernames, profile IDs or router URLs
 are required. The original single-user quick start remains available below.
 
